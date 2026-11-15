@@ -17,3 +17,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 python3
       - name: kernel tests
         run: bash ./rudra/scripts/test.sh
+      - name: boot image
+        run: bash ./rudra/scripts/build.sh
+      - name: smoke
+        timeout-minutes: 15
+        env:
+          # Полный прогон локально — SMOKE_HELLOS=40. В CI восемь: TCG без kvm
+          # не обязан крутить сорок exec за пару минут. Таймаут шага — 15 минут.
+          SMOKE_HELLOS: "8"
+          SMOKE_GAP: "0.12"
+        run: python3 rudra/scripts/smoke.py

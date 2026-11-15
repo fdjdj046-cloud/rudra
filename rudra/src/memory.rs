@@ -12,11 +12,15 @@ pub fn init_frame_allocator(memory_regions: &[MemoryRegion]) {
 
 /// Выполнить `f` с mutable-доступом к глобальному allocator'у.
 pub fn with_frame_allocator<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -> R {
-    let mut guard = FRAME_ALLOCATOR
-        .get()
-        .expect("frame allocator not initialized")
-        .lock();
-    f(&mut guard)
+    // syscall_entry включает прерывания. Лок берём с выключенным IF:
+    // обработчик, который тоже возьмёт allocator, иначе крутит его вечно.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = FRAME_ALLOCATOR
+            .get()
+            .expect("frame allocator not initialized")
+            .lock();
+        f(&mut guard)
+    })
 }
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{

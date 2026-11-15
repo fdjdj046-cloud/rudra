@@ -167,9 +167,8 @@ fn free_user_space(l4: PhysFrame, fa: &mut BootInfoFrameAllocator) {
     let child = unsafe {
         let table = &mut *l4_ptr;
         let entry = &table[0];
-        let child = if entry.flags().contains(PageTableFlags::PRESENT)
-            && !entry.flags().contains(PageTableFlags::HUGE_PAGE)
-        {
+        // У записи L4 бит 7 — не PS. Каталог пользователя освобождаем целиком.
+        let child = if entry.flags().contains(PageTableFlags::PRESENT) {
             PhysFrame::from_start_address(entry.addr()).ok()
         } else {
             None
@@ -190,9 +189,10 @@ fn free_table(frame: PhysFrame, level: u8, fa: &mut BootInfoFrameAllocator) {
         let table = &*ptr;
         for i in 0..512 {
             let entry = &table[i];
-            if entry.flags().contains(PageTableFlags::PRESENT)
-                && !entry.flags().contains(PageTableFlags::HUGE_PAGE)
-            {
+            // В PTE (level == 1) бит 7 — это PAT, не размер страницы.
+            // PS (huge) стоит только в каталогах, level > 1.
+            let huge = level > 1 && entry.flags().contains(PageTableFlags::HUGE_PAGE);
+            if entry.flags().contains(PageTableFlags::PRESENT) && !huge {
                 kids[i] = PhysFrame::from_start_address(entry.addr()).ok();
             }
         }
@@ -276,7 +276,8 @@ fn translate_user(addr: u64, write: bool) -> Option<u64> {
         if write && !flags.contains(PageTableFlags::WRITABLE) {
             return None;
         }
-        if flags.contains(PageTableFlags::HUGE_PAGE) {
+        // PDPTE/PDE: бит 7 = PS. В конечном PTE тот же бит — PAT, не huge.
+        if (level == 1 || level == 2) && flags.contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
         let next = PhysFrame::from_start_address(entry.addr()).ok()?;
@@ -368,7 +369,7 @@ fn copy_user_space(
             if !e.flags().contains(PageTableFlags::PRESENT) {
                 continue;
             }
-            if e.flags().contains(PageTableFlags::HUGE_PAGE) {
+            if level > 1 && e.flags().contains(PageTableFlags::HUGE_PAGE) {
                 serial_println!("[task] copy_user_space: huge page unsupported");
                 return Err(MapToError::FrameAllocationFailed);
             }
@@ -479,6 +480,13 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 static CURRENT: AtomicIsize = AtomicIsize::new(-1);
 static SCHED_INITED: AtomicBool = AtomicBool::new(false);
 
+/// `TASKS` и `timer_switch` живут на одном ядре. Syscall входит с `sti`,
+/// поэтому лок берём только при выключенных прерываниях: иначе таймер
+/// застаёт лок занятым и крутит его вечно.
+fn with_tasks<R>(f: impl FnOnce(&mut [Option<Task>; MAX_TASKS]) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut TASKS.lock()))
+}
+
 /// User-программы, собранные крейтом `user` (build.sh собирает их до ядра).
 /// После монтирования FS копируются в /bin и запускаются оттуда по пути.
 static SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
@@ -550,23 +558,19 @@ pub fn spawn_path(name: &str) -> u64 {
     };
     let argv = alloc::vec![String::from(name)];
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let slot = {
-            let mut tasks = TASKS.lock();
-            match alloc_slot(&mut tasks) {
-                Some(s) => s,
-                None => return u64::MAX,
-            }
+        let slot = with_tasks(|tasks| alloc_slot(tasks));
+        let Some(slot) = slot else {
+            return u64::MAX;
         };
         let built = crate::memory::with_frame_allocator(|fa| build_task(&elf, &argv, &[], name, fa));
         match built {
             Ok(t) => {
-                let old = {
-                    let mut tasks = TASKS.lock();
+                let old = with_tasks(|tasks| {
                     let old = tasks[slot].replace(t);
                     let count = TASK_COUNT.load(Ordering::Acquire);
                     TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
                     old
-                };
+                });
                 drop(old);
                 serial_println!("[task] spawned {} in slot {}", name, slot);
                 NEXT_TID.load(Ordering::Relaxed) - 1
@@ -883,7 +887,7 @@ pub fn current_tid() -> u64 {
     if cur < 0 {
         return 0;
     }
-    TASKS.lock()[cur as usize].as_ref().map(|t| t.tid).unwrap_or(0)
+    with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.tid).unwrap_or(0))
 }
 
 /// Доступ к текущей задаче под TASKS-локом.
@@ -892,27 +896,23 @@ pub fn with_current_task<R>(f: impl FnOnce(&mut Task) -> R) -> Option<R> {
     if cur < 0 {
         return None;
     }
-    let mut tasks = TASKS.lock();
-    tasks[cur as usize].as_mut().map(f)
+    with_tasks(|tasks| tasks[cur as usize].as_mut().map(f))
 }
 
 /// Доступ к любой задаче по tid.
 pub fn with_task<R>(tid: u64, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
-    let mut tasks = TASKS.lock();
-    tasks.iter_mut().flatten().find(|t| t.tid == tid).map(f)
+    with_tasks(|tasks| tasks.iter_mut().flatten().find(|t| t.tid == tid).map(f))
 }
 
 /// Доступ к задаче по слоту (для getppid и отладки).
 pub fn with_task_at<R>(slot: usize, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
-    let mut tasks = TASKS.lock();
-    tasks.get_mut(slot).and_then(|t| t.as_mut()).map(f)
+    with_tasks(|tasks| tasks.get_mut(slot).and_then(|t| t.as_mut()).map(f))
 }
 
 /// Найти завершившегося потомка tid'а (parent == tid). Возвращает
 /// (child_tid, exit_code) и освобождает слот.
 pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
-    let taken = {
-        let mut tasks = TASKS.lock();
+    let taken = with_tasks(|tasks| {
         let count = TASK_COUNT.load(Ordering::Acquire);
         let mut found = None;
         for i in 0..count.min(MAX_TASKS) {
@@ -934,7 +934,7 @@ pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
             }
         }
         found
-    };
+    });
     taken.map(|t| {
         let result = (t.tid, t.exit_code);
         drop(t);
@@ -944,14 +944,15 @@ pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
 
 /// Количество живых потомков (для wait4 ECHILD).
 pub fn has_children(parent_tid: u64) -> bool {
-    let tasks = TASKS.lock();
-    tasks.iter().flatten().any(|t| {
+    with_tasks(|tasks| {
+        tasks.iter().flatten().any(|t| {
         t.parent >= 0
             && tasks[t.parent as usize]
                 .as_ref()
                 .map(|p| p.tid)
-                .unwrap_or(u64::MAX)
-                == parent_tid
+                    .unwrap_or(u64::MAX)
+                    == parent_tid
+        })
     })
 }
 
@@ -976,27 +977,33 @@ pub fn sys_clone(
         if cur < 0 {
             return u64::MAX;
         }
-        let slot = {
-            let mut tasks = TASKS.lock();
-            match alloc_slot(&mut tasks) {
-                Some(s) => s,
-                None => return u64::MAX,
-            }
+        let slot = with_tasks(|tasks| alloc_slot(tasks));
+        let Some(slot) = slot else {
+            return u64::MAX;
         };
 
-        let (parent_as, parent_cr3, parent_fs, parent_cwd, parent_umask, parent_fds, parent_name, parent_tid);
-        {
-            let tasks = TASKS.lock();
+        let (
+            parent_as,
+            parent_cr3,
+            parent_fs,
+            parent_cwd,
+            parent_umask,
+            parent_fds,
+            parent_name,
+            parent_tid,
+        ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
-            parent_as = p.aspace.clone();
-            parent_cr3 = p.cr3;
-            parent_fs = p.fs_base;
-            parent_cwd = p.cwd.clone();
-            parent_umask = p.umask;
-            parent_fds = p.fds.clone();
-            parent_name = p.name;
-            parent_tid = p.tid;
-        }
+            (
+                p.aspace.clone(),
+                p.cr3,
+                p.fs_base,
+                p.cwd.clone(),
+                p.umask,
+                p.fds.clone(),
+                p.name,
+                p.tid,
+            )
+        });
 
         let child_as = if flags & CLONE_VM != 0 {
             parent_as.clone()
@@ -1107,16 +1114,13 @@ pub fn sys_clone(
         }
         let _ = parent_tid;
 
-        {
-            let old = {
-                let mut tasks = TASKS.lock();
-                let old = tasks[slot].replace(task);
-                let count = TASK_COUNT.load(Ordering::Acquire);
-                TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
-                old
-            };
-            drop(old);
-        }
+        let old = with_tasks(|tasks| {
+            let old = tasks[slot].replace(task);
+            let count = TASK_COUNT.load(Ordering::Acquire);
+            TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+            old
+        });
+        drop(old);
         crate::serial_println!(
             "[clone] parent slot {} → child tid {} slot {} flags {:#x} cr3 {:?}",
             cur, child_tid, slot, flags, child_l4
@@ -1289,10 +1293,7 @@ pub fn sys_brk(addr: u64) -> u64 {
     }
     // brk в shared АП: мутируем под локом АП.
     let (l4, brk_base, old_brk);
-    let aspace = {
-        let tasks = TASKS.lock();
-        tasks[cur as usize].as_ref().unwrap().aspace.clone()
-    };
+    let aspace = with_tasks(|tasks| tasks[cur as usize].as_ref().unwrap().aspace.clone());
     {
         let mut a = aspace.lock();
         l4 = a.l4;
@@ -1350,10 +1351,7 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
     if cur < 0 {
         return ENOMEM;
     }
-    let aspace = {
-        let tasks = TASKS.lock();
-        tasks[cur as usize].as_ref().unwrap().aspace.clone()
-    };
+    let aspace = with_tasks(|tasks| tasks[cur as usize].as_ref().unwrap().aspace.clone());
     let pages = (len + 0xFFF) / 0x1000;
     let base = {
         let mut a = aspace.lock();
@@ -1412,10 +1410,7 @@ pub fn alloc_thread_stack() -> Option<u64> {
     if cur < 0 {
         return None;
     }
-    let aspace = {
-        let tasks = TASKS.lock();
-        tasks[cur as usize].as_ref()?.aspace.clone()
-    };
+    let aspace = with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.aspace.clone()))?;
     let (l4, idx) = {
         let mut a = aspace.lock();
         if a.thread_stacks >= MAX_THREADS_PER_PROC {
@@ -1441,10 +1436,9 @@ pub fn alloc_thread_stack() -> Option<u64> {
 
 /// Пометить текущую задачу завершённой. Планировщик больше в неё не вернётся.
 pub fn exit_current() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    with_tasks(|tasks| {
         let cur = CURRENT.load(Ordering::Relaxed);
         if cur >= 0 {
-            let mut tasks = TASKS.lock();
             // Детей отцепляем: слот родителя может достаться новой задаче.
             for t in tasks.iter_mut().flatten() {
                 if t.parent == cur {
@@ -1482,7 +1476,7 @@ pub fn sys_exit(code: u64) -> ! {
 
 /// Дамп задач (serial + экран) для команды `ps`.
 pub fn debug_dump() {
-    let tasks = TASKS.lock();
+    with_tasks(|tasks| {
     let count = TASK_COUNT.load(Ordering::Acquire);
     crate::serial_println!("  TID  SLOT STATE   PARENT NAME");
     crate::framebuffer::_print_screen(core::format_args!(
@@ -1513,6 +1507,7 @@ pub fn debug_dump() {
             ));
         }
     }
+    });
 }
 
 /// Переключение контекста из обработчика таймера (вызывается из asm).
@@ -1537,8 +1532,7 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
 
     let prev = CURRENT.load(Ordering::Relaxed);
 
-    let next = {
-        let tasks = TASKS.lock();
+    let next = with_tasks(|tasks| {
         // Ищем следующую Runnable задачу, пропуская Exited и пустые слоты.
         let mut found = None;
         for k in 1..=count {
@@ -1556,16 +1550,14 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
             }
         }
         found
-    };
+    });
 
     let next = match next {
         Some(n) => n,
         None => return current_rsp, // некому переключаться
     };
 
-    let (next_rsp, next_kstack_top, next_cr3, next_fs);
-    {
-        let mut tasks = TASKS.lock();
+    let (next_rsp, next_kstack_top, next_cr3, next_fs) = with_tasks(|tasks| {
         if prev >= 0 {
             if let Some(t) = tasks[prev as usize].as_mut() {
                 t.kernel_rsp = current_rsp;
@@ -1580,11 +1572,8 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
             }
         }
         let task = tasks[next].as_ref().expect("runnable task disappeared");
-        next_rsp = task.kernel_rsp;
-        next_kstack_top = task.kstack_top;
-        next_cr3 = task.cr3;
-        next_fs = task.fs_base;
-    }
+        (task.kernel_rsp, task.kstack_top, task.cr3, task.fs_base)
+    });
 
     CURRENT.store(next as isize, Ordering::Relaxed);
 

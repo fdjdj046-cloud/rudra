@@ -44,3 +44,9 @@ impl InputQueue {
 }
 
 pub static INPUT_QUEUE: Mutex<InputQueue> = Mutex::new(InputQueue::new());
+
+/// Очередь трогают и IRQ клавиатуры, и syscall read/poll. IF на время лока
+/// выключен, иначе IRQ крутит тот же спин на этом ядре.
+pub fn with_input<R>(f: impl FnOnce(&mut InputQueue) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut INPUT_QUEUE.lock()))
+}

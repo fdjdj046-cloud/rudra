@@ -149,11 +149,14 @@ fn block_size(layout: Layout) -> (usize, usize) {
 
 unsafe impl GlobalAlloc for Locked<HeapAllocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.lock().alloc_inner(layout)
+        // Прерывание не должно аллоцировать, пока syscall держит кучу.
+        x86_64::instructions::interrupts::without_interrupts(|| self.lock().alloc_inner(layout))
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.lock().dealloc_inner(ptr, layout);
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            self.lock().dealloc_inner(ptr, layout);
+        })
     }
 }
 
@@ -204,7 +207,9 @@ pub fn init_heap(
     }
 
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
+        });
     }
     Ok(())
 }

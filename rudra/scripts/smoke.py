@@ -145,7 +145,8 @@ def main():
         except socket.timeout:
             pass
 
-        text = wait_prompts(mon, 1, 25)
+        # TCG в GitHub Actions без kvm грузит debug-ядро дольше локального KVM.
+        text = wait_prompts(mon, 1, 90)
         if "rudra:/$" not in text:
             raise SystemExit("no shell prompt\n" + text[-2000:])
         if "[root] ext2 on virtio-blk" not in text:
@@ -171,14 +172,14 @@ def main():
         base = text.count("rudra:/$")
         for i, cmd in enumerate(commands, 1):
             send_line(mon, cmd)
-            text = wait_prompts(mon, base + i, 40)
+            text = wait_prompts(mon, base + i, 90)
             if text.count("rudra:/$") < base + i:
                 raise SystemExit("timeout after %s\n%s" % (cmd, text[-2000:]))
             print("ok", cmd)
 
         send_line(mon, "reboot")
         # Новый prompt после повторной загрузки, плюс строка reboot.
-        text = wait_prompts(mon, base + len(commands) + 1, 40)
+        text = wait_prompts(mon, base + len(commands) + 1, 90)
         if "[ext2] mounted" not in text.split("[reboot]")[-1] and text.count("[ext2] mounted") < 2:
             # reboot мог не сработать: проверим лог целиком ниже
             pass
@@ -187,7 +188,7 @@ def main():
         print("reboot ok")
         n = text.count("rudra:/$")
         send_line(mon, "cat /keep.txt")
-        text = wait_prompts(mon, n + 1, 20)
+        text = wait_prompts(mon, n + 1, 40)
         if "persist-ok" not in text:
             raise SystemExit("keep.txt missing after reboot\n" + text[-2000:])
         bad = []

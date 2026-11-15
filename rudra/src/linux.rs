@@ -282,8 +282,9 @@ fn console_write(bytes: &[u8]) -> u64 {
 /// клавиатура пополняет очередь.
 fn console_read_byte() -> u8 {
     loop {
-        let b = crate::input::INPUT_QUEUE.lock().pop();
-        if let Some(b) = b {
+        // Лок только на pop: спин с занятой очередью не дал бы IRQ клавиатуры
+        // положить байт, если бы IF оставался включён внутри лока.
+        if let Some(b) = crate::input::with_input(|q| q.pop()) {
             return b;
         }
         core::hint::spin_loop();
@@ -1434,7 +1435,7 @@ fn poll_ready(fd: u64, events: i16) -> i16 {
     let _ = with_fd(fd, |f| {
         match f {
             Fd::Console { writable } => {
-                if !*writable && events & POLLIN != 0 && crate::input::INPUT_QUEUE.lock().len() > 0 {
+                if !*writable && events & POLLIN != 0 && crate::input::with_input(|q| q.len() > 0) {
                     revents |= POLLIN;
                 }
                 if *writable && events & POLLOUT != 0 {

@@ -126,11 +126,19 @@ extern "x86-interrupt" fn page_fault_handler(
     if crate::task::current_slot() >= 0 {
         if let Ok(addr) = accessed {
             if addr.as_u64() < crate::task::USER_TOP {
+                // Убиваем задачу, чтобы шелл жил. Это может прятать баг ядра:
+                // fault случился в ring 0, а не в коде пользователя.
                 serial_println!(
-                    "[task {}] kernel PAGE FAULT on user pointer {:?} code {:?} — killing task",
+                    "[task {}] KERNEL PAGE FAULT below 4GiB in ring 0 — killing task (may hide a kernel bug)",
                     crate::task::current_slot(),
+                );
+                serial_println!(
+                    "  CR2 {:?} code {:?} rip {:#x} rsp {:#x} cs {:#x}",
                     addr,
                     error_code,
+                    stack_frame.instruction_pointer.as_u64(),
+                    stack_frame.stack_pointer.as_u64(),
+                    stack_frame.code_segment.0,
                 );
                 kill_user_and_yield();
             }
@@ -257,7 +265,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                 // (шелл). В serial больше не дублируем, чтобы не смешивать
                 // отладочный вывод с сессией шелла.
                 DecodedKey::Unicode(c) => {
-                    crate::input::INPUT_QUEUE.lock().push(c as u8);
+                    crate::input::with_input(|q| q.push(c as u8));
                 }
                 DecodedKey::RawKey(_) => {}
             }
