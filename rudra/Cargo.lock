@@ -92,7 +92,7 @@ checksum = "49f4c2ef60a76c1858ef43c30b6b95c2f5ee4d7c4f9bc47409c3a8dc8910adb9"
 
 [[package]]
 name = "builder"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "bootloader",
  "rudra",
@@ -401,7 +401,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
 name = "rudra"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "bootloader_api",
  "embedded-graphics",
@@ -585,7 +585,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "user"
-version = "0.1.0"
+version = "1.0.1"
 
 [[package]]
 name = "uuid"

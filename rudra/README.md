@@ -30,6 +30,10 @@
 
 Шина PCI 0 читается (`pci.rs`): в QEMU видны мост i440FX, PIIX IDE, VGA и e1000.
 
+## 1.0.1
+
+Текущий образ — `target/images/rudra-1.0.1.img`. Поверх 1.0.0: проверка пользовательских указателей в syscall (`EFAULT`, ядро не паникует), возврат кадров и блоков кучи, `e2fsck -fn` чистый, `scripts/test.sh` и `scripts/smoke.py` без зашитого пути QEMU. Тесты ядра гоняет `.github/workflows/ci.yml`. Тег `v1.0.0` остаётся на прежнем коммите.
+
 ## 1.0.0: ext2 read-write — это корень
 
 Research OS. Не ставьте образ на единственный диск с данными. Контракт, whitelist и `ENOSYS` — в [RELEASE_NOTES.md](../RELEASE_NOTES.md).

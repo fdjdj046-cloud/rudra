@@ -2,7 +2,7 @@
 # Запуск rudra в QEMU (BIOS, serial -> stdout).
 set -e
 cd "$(dirname "$0")/.."
-REL="target/images/rudra-1.0.0.img"
+REL="target/images/rudra-1.0.1.img"
 [ -f "$REL" ] || ./scripts/build.sh
 # Один диск: загрузчик в начале, ext2 с 16 МиБ. BIOS грузит его с virtio-blk.
 exec "/c/Program Files/qemu/qemu-system-x86_64.exe" \

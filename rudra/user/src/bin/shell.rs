@@ -13,7 +13,7 @@ use rudra::{print, println};
 const BB_PATH: &str = "/bin/busybox";
 
 fn main() {
-    println!("rudra shell v1.0.0 (Linux ABI). 'help' — список команд.");
+    println!("rudra shell v1.0.1 (Linux ABI). 'help' — список команд.");
     let motd_buf = &mut [0u8; 512];
     let n = rudra::read_file("/motd.txt", motd_buf);
     if n > 0 {

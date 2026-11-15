@@ -9,12 +9,12 @@
 ![QEMU](https://img.shields.io/badge/runs%20on-QEMU%2011-green)
 ![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-lightgrey)
 
-**rudra 1.0.0 — research OS. Не ставьте образ на единственный диск с данными.**
+**rudra 1.0.1 — research OS. Не ставьте образ на единственный диск с данными.**
 
-Релиз — один raw-образ, не ISO: `rudra-1.0.0.img`. Корень — ext2 на том же virtio-blk, с которого идёт загрузка. Файлы живы после reboot. Ramdisk RFS2 остаётся только если диска нет. Контракт, команды и `ENOSYS` — в [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Релиз — один raw-образ, не ISO: `rudra-1.0.1.img`. Корень — ext2 на том же virtio-blk, с которого идёт загрузка. Файлы живы после reboot. Ramdisk RFS2 остаётся только если диска нет. Контракт, команды и `ENOSYS` — в [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```
-qemu-system-x86_64 -m 256M -serial stdio -drive if=none,id=vd0,format=raw,file=rudra-1.0.0.img -device virtio-blk-pci,drive=vd0,disable-modern=on,bootindex=0
+qemu-system-x86_64 -m 256M -serial stdio -drive if=none,id=vd0,format=raw,file=rudra-1.0.1.img -device virtio-blk-pci,drive=vd0,disable-modern=on,bootindex=0
 ```
 
 ---
@@ -115,7 +115,7 @@ rudra/
 │   └── user.ld         # линковка по 0x400000
 ├── rootfs/             # то, что pack_rfs.py кладёт в RFS2 (bin/busybox, motd)
 ├── scripts/
-│   ├── build.sh        # user → kernel → rudra-1.0.0.img
+│   ├── build.sh        # user → kernel → rudra-1.0.1.img
 │   ├── run-bios.sh     # QEMU, один virtio-blk, serial → stdout
 │   ├── run-uefi.sh     # QEMU + OVMF (q35), не релизный образ
 │   ├── pack_rfs.py     # rootfs/ → recovery-ramdisk RFS2
@@ -243,6 +243,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] Каталоги RFS2 — отдельные записи (`mkdir` / `rmdir` / `rename`), не префиксы
 - [x] VirtIO-blk (legacy, одна очередь) и ext2 read-write как корень
 - [x] 1.0.0: один raw-образ, reboot сохраняет файлы, smoke и заметки релиза
+- [x] 1.0.1: проверка указателей syscall, возврат кадров и кучи, e2fsck, CI
 - [ ] SMP: APIC, startup IPI, второй CPU
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра

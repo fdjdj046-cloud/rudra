@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke rudra 1.0.0: boot, записать файл, reboot, прочитать его обратно.
+"""Smoke rudra 1.0.1: boot, записать файл, много hello.elf, reboot, прочитать обратно.
 
 Образ не портится: работа идёт на копии. QEMU — один virtio-blk, bootindex=0.
+QEMU берётся из переменной QEMU, из PATH или из стандартного пути Windows.
+Число запусков hello — SMOKE_HELLOS (по умолчанию 40). Пауза клавиш — SMOKE_GAP.
 """
 import os
 import shutil
@@ -11,11 +13,12 @@ import sys
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-QEMU = r"C:\Program Files\qemu\qemu-system-x86_64.exe"
-SRC = os.path.join(ROOT, "target", "images", "rudra-1.0.0.img")
+SRC = os.path.join(ROOT, "target", "images", "rudra-1.0.1.img")
 COPY = os.path.join(ROOT, "target", "images", "rudra-smoke.img")
 SERIAL = os.path.join(ROOT, "target", "images", "smoke-serial.log")
-MONITOR = 44555
+MONITOR = int(os.environ.get("SMOKE_MONITOR", "44555"))
+HELLO_N = int(os.environ.get("SMOKE_HELLOS", "40"))
+KEY_GAP = float(os.environ.get("SMOKE_GAP", "0.08"))
 
 KEYS = {
     " ": "spc",
@@ -27,7 +30,40 @@ KEYS = {
 }
 
 
+def find_qemu():
+    env = os.environ.get("QEMU")
+    if env:
+        return env
+    found = shutil.which("qemu-system-x86_64") or shutil.which("qemu-system-x86_64.exe")
+    if found:
+        return found
+    for candidate in (
+        r"C:\Program Files\qemu\qemu-system-x86_64.exe",
+        "/usr/bin/qemu-system-x86_64",
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    raise SystemExit("qemu-system-x86_64 not found; set QEMU=")
+
+
+def kill_qemu():
+    if os.name != "nt":
+        return
+    subprocess.run(
+        ["taskkill", "/F", "/IM", "qemu-system-x86_64.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def read_serial():
+    try:
+        with open(SERIAL, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        pass
+    if os.name != "nt":
+        return ""
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
@@ -37,17 +73,16 @@ def read_serial():
         if handle == -1 or handle == 0xFFFFFFFF:
             return ""
         size = kernel32.GetFileSize(handle, None)
+        if size in (0, 0xFFFFFFFF):
+            kernel32.CloseHandle(handle)
+            return ""
         buf = ctypes.create_string_buffer(size)
         n = ctypes.c_uint(0)
         kernel32.ReadFile(handle, buf, size, ctypes.byref(n), None)
         kernel32.CloseHandle(handle)
         return buf.raw[: n.value].decode("utf-8", "replace")
     except Exception:
-        try:
-            with open(SERIAL, "rb") as f:
-                return f.read().decode("utf-8", "replace")
-        except Exception:
-            return ""
+        return ""
 
 
 def wait_prompts(mon, need, timeout):
@@ -62,7 +97,9 @@ def wait_prompts(mon, need, timeout):
     return read_serial()
 
 
-def send_line(mon, line, gap=0.12):
+def send_line(mon, line, gap=None):
+    if gap is None:
+        gap = KEY_GAP
     for ch in line:
         key = KEYS.get(ch, ch)
         mon.sendall(("sendkey %s\n" % key).encode())
@@ -77,14 +114,11 @@ def main():
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
     shutil.copyfile(SRC, COPY)
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "qemu-system-x86_64.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    kill_qemu()
+    qemu = find_qemu()
     proc = subprocess.Popen(
         [
-            QEMU,
+            qemu,
             "-m", "256M",
             "-display", "none",
             "-serial", "file:" + SERIAL,
@@ -129,8 +163,10 @@ def main():
             "true",
             "wc -c /motd.txt",
             "ls /",
+            "run /bin/counter.elf",
+            "run /bin/fizzbuzz.elf",
         ]
-        for _ in range(8):
+        for _ in range(HELLO_N):
             commands.append("run /bin/hello.elf")
         base = text.count("rudra:/$")
         for i, cmd in enumerate(commands, 1):
@@ -168,13 +204,17 @@ def main():
             "reboot: refused",
             "mkdir:",
             "rm:",
+            "rmdir:",
+            "Bad address",
         ):
             if needle in text:
                 bad.append(needle)
         if bad:
             raise SystemExit("faults: %s\n%s" % (bad, text[-2500:]))
-        if "1.0.0" not in text:
-            raise SystemExit("uname did not show 1.0.0\n" + text[-1500:])
+        if "1.0.1" not in text:
+            raise SystemExit("uname did not show 1.0.1\n" + text[-1500:])
+        if "203 /motd.txt" not in text and "203  /motd.txt" not in text:
+            raise SystemExit("wc did not print 203 for motd\n" + text[-1500:])
         print("SMOKE PASS")
         print("--- tail ---")
         print(text[-1800:])
@@ -189,11 +229,7 @@ def main():
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "qemu-system-x86_64.exe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        kill_qemu()
         err = b""
         if proc.stderr:
             try:
@@ -208,9 +244,5 @@ if __name__ == "__main__":
     try:
         main()
     except SystemExit:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "qemu-system-x86_64.exe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        kill_qemu()
         raise

@@ -120,6 +120,22 @@ extern "x86-interrupt" fn page_fault_handler(
         );
         kill_user_and_yield();
     }
+    // Копирование указателя syscall идёт в режиме ядра. Несмапленный
+    // пользовательский адрес не должен ронять ядро: задача умирает, шелл жив.
+    // Адрес ядра (выше USER_TOP) по-прежнему паника — это баг ядра.
+    if crate::task::current_slot() >= 0 {
+        if let Ok(addr) = accessed {
+            if addr.as_u64() < crate::task::USER_TOP {
+                serial_println!(
+                    "[task {}] kernel PAGE FAULT on user pointer {:?} code {:?} — killing task",
+                    crate::task::current_slot(),
+                    addr,
+                    error_code,
+                );
+                kill_user_and_yield();
+            }
+        }
+    }
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("  accessed address (CR2): {:?}", accessed);
     serial_println!("  error code: {:?}", error_code);

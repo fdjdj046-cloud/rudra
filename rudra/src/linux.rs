@@ -39,6 +39,33 @@ errno! {
     E2BIG = 7, ENOEXEC = 8,
 }
 
+/// Больше этого за один read/write не копируем: иначе длина из syscall
+/// заставляет ядро выделить гигантский буфер.
+const MAX_IO: usize = 8 * 1024 * 1024;
+
+fn u_read(addr: u64, buf: &mut [u8]) -> bool {
+    task::user_read(addr, buf)
+}
+
+fn u_write(addr: u64, buf: &[u8]) -> bool {
+    task::user_write(addr, buf)
+}
+
+fn copy_from_user(addr: u64, len: usize) -> Option<Vec<u8>> {
+    if len > MAX_IO {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return None;
+    }
+    buf.resize(len, 0);
+    if !u_read(addr, &mut buf) {
+        return None;
+    }
+    Some(buf)
+}
+
 // ---- Дескрипторы файлов ----
 
 /// Дескриптор открытого файла задачи.
@@ -302,32 +329,26 @@ fn fake_ino(name: &str) -> u64 {
     h >> 16 | 1
 }
 
-/// struct stat x86_64 (144 байта) в user-буфер.
-fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) {
+/// struct stat x86_64 (144 байта) в user-буфер. `false` — битый указатель.
+fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
     if buf == 0 {
-        return;
+        return false;
     }
-    let now = (crate::interrupts::uptime_ms() / 1000) as i64;
-    let st = [0u8; 144];
-    let p = buf as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(st.as_ptr(), p, 144);
-        let wr64 = |off: usize, v: u64| ((p.add(off)) as *mut u64).write_unaligned(v.to_le());
-        let wr32 = |off: usize, v: u32| ((p.add(off)) as *mut u32).write_unaligned(v.to_le());
-        wr64(0, 8); // st_dev
-        wr64(8, fake_ino("stat")); // st_ino (единый для простоты)
-        wr64(16, nlink);
-        wr32(24, mode);
-        wr32(28, 1000); // uid
-        wr32(32, 1000); // gid
-        wr64(40, 0); // rdev
-        wr64(48, size);
-        wr64(56, 4096); // blksize
-        wr64(64, (size + 511) / 512); // blocks
-        for off in [72, 88, 104] {
-            wr64(off, now as u64); // atime/mtime/ctime sec
-        }
+    let now = (crate::interrupts::uptime_ms() / 1000) as u64;
+    let mut st = [0u8; 144];
+    st[0..8].copy_from_slice(&8u64.to_le_bytes());
+    st[8..16].copy_from_slice(&fake_ino("stat").to_le_bytes());
+    st[16..24].copy_from_slice(&nlink.to_le_bytes());
+    st[24..28].copy_from_slice(&mode.to_le_bytes());
+    st[28..32].copy_from_slice(&1000u32.to_le_bytes());
+    st[32..36].copy_from_slice(&1000u32.to_le_bytes());
+    st[48..56].copy_from_slice(&size.to_le_bytes());
+    st[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    st[64..72].copy_from_slice(&((size + 511) / 512).to_le_bytes());
+    for off in [72, 88, 104] {
+        st[off..off + 8].copy_from_slice(&now.to_le_bytes());
     }
+    u_write(buf, &st)
 }
 
 fn stat_of(path: &str) -> Option<(u64, u32, u64)> {
@@ -343,7 +364,7 @@ fn stat_of(path: &str) -> Option<(u64, u32, u64)> {
 
 /// Консоль stat: char device.
 fn write_console_stat(buf: u64) {
-    write_stat(buf, 0, S_IFCHR | 0o620, 1);
+    let _ = write_stat(buf, 0, S_IFCHR | 0o620, 1);
 }
 
 // ---- Диспетчер ----
@@ -366,7 +387,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
             match stat_of(&canon) {
                 Some((sz, mode, nlink)) => {
-                    write_stat(a2, sz, mode, nlink);
+                    if !write_stat(a2, sz, mode, nlink) {
+                        return EFAULT;
+                    }
                     0
                 }
                 None => ENOENT,
@@ -401,8 +424,12 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         33 => sys_dup2(a1, a2),
         35 | 230 => {
             // nanosleep / clock_nanosleep
-            let sec = unsafe { (a1 as *const u64).read_unaligned() };
-            let nsec = unsafe { (a1 as *const u64).add(1).read_unaligned() };
+            let mut raw = [0u8; 16];
+            if !u_read(a1, &mut raw) {
+                return EFAULT;
+            }
+            let sec = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+            let nsec = u64::from_le_bytes(raw[8..16].try_into().unwrap());
             sleep_ms(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000));
             0
         }
@@ -455,9 +482,10 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             if a2 < bytes.len() as u64 + 1 {
                 return ERANGE;
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), a1 as *mut u8, bytes.len());
-                ((a1 as *mut u8).add(bytes.len()) as *mut u8).write(0);
+            let mut tmp = alloc::vec![0u8; bytes.len() + 1];
+            tmp[..bytes.len()].copy_from_slice(bytes);
+            if !u_write(a1, &tmp) {
+                return EFAULT;
             }
             (bytes.len() + 1) as u64
         }
@@ -551,7 +579,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             match crate::fs::read_canon(&canon) {
                 Some(data) => {
                     let n = data.len().min(a3 as usize);
-                    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), a2 as *mut u8, n) };
+                    if n > 0 && !u_write(a2, &data[..n]) {
+                        return EFAULT;
+                    }
                     n as u64
                 }
                 None => EINVAL,
@@ -565,27 +595,29 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             old as u64
         }
         96 => {
-            // gettimeofday
+            // gettimeofday. NULL tv — успех без записи.
+            if a1 == 0 {
+                return 0;
+            }
             let ms = crate::interrupts::uptime_ms();
-            unsafe {
-                (a1 as *mut u64).write_unaligned((ms / 1000).to_le());
-                ((a1 as *mut u64).add(1)).write_unaligned(((ms % 1000) * 1_000_000).to_le());
+            let mut raw = [0u8; 16];
+            raw[0..8].copy_from_slice(&(ms / 1000).to_le_bytes());
+            raw[8..16].copy_from_slice(&(((ms % 1000) * 1_000_000).to_le_bytes()));
+            if !u_write(a1, &raw) {
+                return EFAULT;
             }
             0
         }
         97 | 302 => {
             // getrlimit / prlimit64: всё безлимитно
-            if nr == 97 && a2 != 0 {
-                unsafe {
-                    (a2 as *mut u64).write_unaligned(u64::MAX);
-                    ((a2 as *mut u64).add(1)).write_unaligned(u64::MAX);
-                }
+            let mut raw = [0u8; 16];
+            raw[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            raw[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+            if nr == 97 && a2 != 0 && !u_write(a2, &raw) {
+                return EFAULT;
             }
-            if nr == 302 && a4 != 0 {
-                unsafe {
-                    (a4 as *mut u64).write_unaligned(u64::MAX);
-                    ((a4 as *mut u64).add(1)).write_unaligned(u64::MAX);
-                }
+            if nr == 302 && a4 != 0 && !u_write(a4, &raw) {
+                return EFAULT;
             }
             0
         }
@@ -598,7 +630,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 buf[32..40].copy_from_slice(&(64u64 << 20).to_le_bytes()); // totalram
                 buf[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs
                 buf[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
-                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), a1 as *mut u8, 112) };
+                if !u_write(a1, &buf) {
+                    return EFAULT;
+                }
             }
             0
         }
@@ -622,8 +656,11 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 return EINVAL;
             }
             let n = (a2 as usize).min(128);
-            unsafe { core::ptr::write_bytes(a3 as *mut u8, 0, n) };
-            unsafe { (a3 as *mut u8).write(1) };
+            let mut tmp = [0u8; 128];
+            tmp[0] = 1;
+            if !u_write(a3, &tmp[..n]) {
+                return EFAULT;
+            }
             8
         }
         218 => {
@@ -634,9 +671,11 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         228 => {
             // clock_gettime
             let ms = crate::interrupts::uptime_ms();
-            unsafe {
-                (a2 as *mut u64).write_unaligned((ms / 1000).to_le());
-                ((a2 as *mut u64).add(1)).write_unaligned(((ms % 1000) * 1_000_000).to_le());
+            let mut raw = [0u8; 16];
+            raw[0..8].copy_from_slice(&(ms / 1000).to_le_bytes());
+            raw[8..16].copy_from_slice(&(((ms % 1000) * 1_000_000).to_le_bytes()));
+            if !u_write(a2, &raw) {
+                return EFAULT;
             }
             0
         }
@@ -648,12 +687,25 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             if a1 == 0 || a2 == 0 {
                 return EINVAL;
             }
+            if a2 as usize > MAX_IO {
+                return EFAULT;
+            }
             let mut s = unsafe { core::arch::x86_64::_rdtsc() } | 1;
-            for i in 0..a2 as usize {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                unsafe { (a1 as *mut u8).add(i).write(s as u8) };
+            let mut done = 0usize;
+            let total = a2 as usize;
+            while done < total {
+                let n = (total - done).min(256);
+                let mut tmp = [0u8; 256];
+                for b in tmp.iter_mut().take(n) {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    *b = s as u8;
+                }
+                if !u_write(a1 + done as u64, &tmp[..n]) {
+                    return EFAULT;
+                }
+                done += n;
             }
             a2
         }
@@ -697,6 +749,9 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if buf == 0 || len == 0 {
         return 0;
     }
+    if len as usize > MAX_IO {
+        return EFAULT;
+    }
     // Определяем вид fd коротко под локом, читаем без удержания лока
     // (консоль/pipe блокируются — их ждущие циклы не должны держать таблицу).
     enum Kind {
@@ -722,8 +777,8 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         Ok(Kind::Pipe(id)) => {
             let mut tmp = alloc::vec![0u8; len as usize];
             let n = pipe_read(id, &mut tmp);
-            if n as i64 >= 0 {
-                unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n as usize) };
+            if n as i64 >= 0 && n > 0 && !u_write(buf, &tmp[..n as usize]) {
+                return EFAULT;
             }
             n
         }
@@ -747,13 +802,9 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
                 if n == 0 {
                     break;
                 }
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        tmp.as_ptr(),
-                        (buf as *mut u8).add(written as usize),
-                        n,
-                    )
-                };
+                if !u_write(buf + written, &tmp[..n]) {
+                    return if written == 0 { EFAULT } else { written };
+                }
                 pos += n as u64;
                 written += n as u64;
                 if (n as u64) < chunk as u64 {
@@ -776,7 +827,9 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 fn console_read(buf: u64, len: u64) -> u64 {
     for i in 0..len {
         let b = console_read_byte();
-        unsafe { (buf as *mut u8).add(i as usize).write(b) };
+        if !u_write(buf + i, &[b]) {
+            return if i == 0 { EFAULT } else { i };
+        }
     }
     len
 }
@@ -785,7 +838,9 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if buf == 0 || len == 0 {
         return 0;
     }
-    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let Some(bytes) = copy_from_user(buf, len as usize) else {
+        return EFAULT;
+    };
     // Консоль/pipe пишем без удержания лока таблицы (pipe может блокировать).
     enum Kind {
         Console,
@@ -800,21 +855,21 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         _ => Kind::Bad,
     });
     match kind {
-        Ok(Kind::Console) => console_write(bytes),
-        Ok(Kind::Pipe(id)) => pipe_write(id, bytes),
+        Ok(Kind::Console) => console_write(&bytes),
+        Ok(Kind::Pipe(id)) => pipe_write(id, &bytes),
         Ok(Kind::File) => {
             // Запись в буфер dirty (сброс при close) — под локом fd.
             with_fd(fd, |f| match f {
                 Fd::File { offset, accmode, append, dirty, .. } if *accmode != 0 => {
                     let data = dirty.get_or_insert_with(Vec::new);
                     if *append {
-                        data.extend_from_slice(bytes);
+                        data.extend_from_slice(&bytes);
                     } else {
                         let pos = *offset as usize;
                         if data.len() < pos + bytes.len() {
                             data.resize(pos + bytes.len(), 0);
                         }
-                        data[pos..pos + bytes.len()].copy_from_slice(bytes);
+                        data[pos..pos + bytes.len()].copy_from_slice(&bytes);
                         *offset += bytes.len() as u64;
                     }
                     bytes.len() as u64
@@ -961,7 +1016,9 @@ fn sys_fstat(fd: u64, buf: u64) -> u64 {
     });
     match st {
         Ok(Some((sz, mode, nlink))) => {
-            write_stat(buf, sz, mode, nlink);
+            if !write_stat(buf, sz, mode, nlink) {
+                return EFAULT;
+            }
             0
         }
         Ok(None) => EBADF,
@@ -1004,7 +1061,9 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> u64 {
     };
     match stat_of(&canon) {
         Some((sz, mode, nlink)) => {
-            write_stat(buf, sz, mode, nlink);
+            if !write_stat(buf, sz, mode, nlink) {
+                return EFAULT;
+            }
             0
         }
         None => ENOENT,
@@ -1037,38 +1096,30 @@ fn sys_statx(dirfd: u64, path_ptr: u64, _flags: u64, _mask: u64, buf: u64) -> u6
         }
         None => return EFAULT,
     };
-    unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 256) };
+    let mut raw = [0u8; 256];
     match st {
         Some((sz, mode, nlink)) => {
-            let p = buf as *mut u8;
-            let wr32 = |off: usize, v: u32| unsafe {
-                ((p.add(off)) as *mut u32).write_unaligned(v.to_le())
-            };
-            let wr64 = |off: usize, v: u64| unsafe {
-                ((p.add(off)) as *mut u64).write_unaligned(v.to_le())
-            };
             let now = crate::interrupts::uptime_ms();
-            wr32(0, 0x7ff); // stx_mask
-            wr32(4, 4096); // blksize
-            wr32(16, nlink as u32);
-            wr32(20, 1000);
-            wr32(24, 1000);
-            wr16(p, 28, mode as u16);
-            wr64(32, fake_ino("statx"));
-            wr64(40, sz);
-            wr64(48, (sz + 511) / 512);
+            raw[0..4].copy_from_slice(&0x7ffu32.to_le_bytes());
+            raw[4..8].copy_from_slice(&4096u32.to_le_bytes());
+            raw[16..20].copy_from_slice(&(nlink as u32).to_le_bytes());
+            raw[20..24].copy_from_slice(&1000u32.to_le_bytes());
+            raw[24..28].copy_from_slice(&1000u32.to_le_bytes());
+            raw[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
+            raw[32..40].copy_from_slice(&fake_ino("statx").to_le_bytes());
+            raw[40..48].copy_from_slice(&sz.to_le_bytes());
+            raw[48..56].copy_from_slice(&((sz + 511) / 512).to_le_bytes());
             for off in [64, 96, 112] {
-                wr64(off, now / 1000);
-                wr64(off + 8, (now % 1000) * 1_000_000);
+                raw[off..off + 8].copy_from_slice(&(now / 1000).to_le_bytes());
+                raw[off + 8..off + 16].copy_from_slice(&(((now % 1000) * 1_000_000).to_le_bytes()));
+            }
+            if !u_write(buf, &raw) {
+                return EFAULT;
             }
             0
         }
         None => ENOENT,
     }
-}
-
-fn wr16(p: *mut u8, off: usize, v: u16) {
-    unsafe { ((p.add(off)) as *mut u16).write_unaligned(v.to_le()) };
 }
 
 fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
@@ -1124,6 +1175,9 @@ fn sys_pread_full(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
     if buf == 0 || len == 0 {
         return 0;
     }
+    if len as usize > MAX_IO {
+        return EFAULT;
+    }
     let r = with_fd(fd, |f| match f {
         Fd::File { name, dirty, .. } => {
             let data = dirty.clone();
@@ -1133,19 +1187,17 @@ fn sys_pread_full(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
                     0
                 } else {
                     let n = (d.len() - pos as usize).min(len as usize);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            d.as_ptr().add(pos as usize),
-                            buf as *mut u8,
-                            n,
-                        )
-                    };
+                    if n > 0 && !u_write(buf, &d[pos as usize..pos as usize + n]) {
+                        return EFAULT;
+                    }
                     n
                 }
             } else {
                 let mut tmp = alloc::vec![0u8; len as usize];
                 let n = crate::fs::read_at(&name, pos, &mut tmp).max(0) as usize;
-                unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n) };
+                if n > 0 && !u_write(buf, &tmp[..n]) {
+                    return EFAULT;
+                }
                 n
             };
             n as u64
@@ -1170,8 +1222,12 @@ fn sys_rwv(fd: u64, iov: u64, iovcnt: u64, write: bool) -> u64 {
     }
     let mut total = 0u64;
     for i in 0..iovcnt {
-        let base = unsafe { (iov as *const u64).add(i as usize * 2).read_unaligned() };
-        let len = unsafe { (iov as *const u64).add(i as usize * 2 + 1).read_unaligned() };
+        let mut raw = [0u8; 16];
+        if !u_read(iov + i * 16, &mut raw) {
+            return if total > 0 { total } else { EFAULT };
+        }
+        let base = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
         if len == 0 {
             continue;
         }
@@ -1295,14 +1351,14 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
                     format!("{}/{}", prefix, name)
                 };
                 let d_type = if crate::fs::is_dir(&full) { 4u8 } else { 8u8 }; // DT_DIR / DT_REG
-                let p = unsafe { (buf as *mut u8).add(written as usize) };
-                unsafe {
-                    (p as *mut u64).write_unaligned(fake_ino(&full));
-                    ((p as *mut u64).add(1)).write_unaligned((i + 1) as u64); // d_off
-                    (p.add(16) as *mut u16).write_unaligned(reclen as u16);
-                    *p.add(18) = d_type;
-                    core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), p.add(19), name.len());
-                    core::ptr::write_bytes(p.add(19 + name.len()), 0, reclen - 19 - name.len());
+                let mut ent = [0u8; 288];
+                ent[0..8].copy_from_slice(&fake_ino(&full).to_le_bytes());
+                ent[8..16].copy_from_slice(&((i as u64) + 1).to_le_bytes());
+                ent[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                ent[18] = d_type;
+                ent[19..19 + name.len()].copy_from_slice(name.as_bytes());
+                if !u_write(buf + written, &ent[..reclen]) {
+                    return if written == 0 { EFAULT } else { written };
                 }
                 written += reclen as u64;
                 i += 1;
@@ -1323,9 +1379,11 @@ fn sys_pipe(fds_ptr: u64) -> u64 {
         return EFAULT;
     }
     let (r, w) = new_pipe();
-    unsafe {
-        (fds_ptr as *mut u32).write(r as u32);
-        ((fds_ptr as *mut u32).add(1)).write(w as u32);
+    let mut raw = [0u8; 8];
+    raw[0..4].copy_from_slice(&(r as u32).to_le_bytes());
+    raw[4..8].copy_from_slice(&(w as u32).to_le_bytes());
+    if !u_write(fds_ptr, &raw) {
+        return EFAULT;
     }
     0
 }
@@ -1342,14 +1400,19 @@ fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
     loop {
         let mut ready = 0u64;
         for i in 0..nfds {
-            let p = unsafe { fds as *mut u8 }.wrapping_add(i as usize * 8);
-            let fd = unsafe { (p as *const i32).read() };
-            let events = unsafe { ((p.add(4)) as *const i16).read() };
+            let mut raw = [0u8; 8];
+            if !u_read(fds + i * 8, &mut raw) {
+                return EFAULT;
+            }
+            let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(raw[4..6].try_into().unwrap());
             if fd < 0 {
                 continue;
             }
             let revents = poll_ready(fd as u64, events);
-            unsafe { ((p.add(6)) as *mut i16).write(revents) };
+            if !u_write(fds + i * 8 + 6, &revents.to_le_bytes()) {
+                return EFAULT;
+            }
             if revents != 0 {
                 ready += 1;
             }
@@ -1408,17 +1471,19 @@ fn sys_select(nfds: u64, readfds: u64, _writefds: u64, _exceptfds: u64, timeout:
         let mut ready = 0u64;
         for fd in 0..nfds.min(1024) {
             if readfds != 0 {
-                let bit = unsafe {
-                    ((readfds as *const u8).add((fd / 8) as usize).read() >> (fd % 8)) & 1
-                };
+                let mut byte = [0u8; 1];
+                if !u_read(readfds + fd / 8, &mut byte) {
+                    return EFAULT;
+                }
+                let bit = (byte[0] >> (fd % 8)) & 1;
                 if bit == 1 {
                     let r = poll_ready(fd, 1);
                     if r & 1 != 0 {
                         ready += 1;
-                    } else if readfds != 0 {
-                        unsafe {
-                            let byte = (readfds as *mut u8).add((fd / 8) as usize);
-                            *byte &= !(1 << (fd % 8));
+                    } else {
+                        byte[0] &= !(1 << (fd % 8));
+                        if !u_write(readfds + fd / 8, &byte) {
+                            return EFAULT;
                         }
                     }
                 }
@@ -1478,16 +1543,14 @@ fn sys_uname(buf: u64) -> u64 {
     if buf == 0 {
         return EFAULT;
     }
-    let fields = ["rudra", "rudra", "1.0.0", "#1 rudra 1.0.0", "x86_64", "(none)"];
-    unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 6 * 65) };
+    let fields = ["rudra", "rudra", "1.0.1", "#1 rudra 1.0.1", "x86_64", "(none)"];
+    let mut raw = [0u8; 6 * 65];
     for (i, f) in fields.iter().enumerate() {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                f.as_bytes().as_ptr(),
-                (buf as *mut u8).add(i * 65),
-                f.len(),
-            )
-        };
+        let start = i * 65;
+        raw[start..start + f.len()].copy_from_slice(f.as_bytes());
+    }
+    if !u_write(buf, &raw) {
+        return EFAULT;
     }
     0
 }
@@ -1500,7 +1563,10 @@ fn sys_wait4(pid: u64, status: u64, options: u64) -> u64 {
         if let Some((tid, code)) = task::reap_child(me, want) {
             if status != 0 {
                 // W_EXITCODE(code, 0)
-                unsafe { (status as *mut i32).write_unaligned(((code as i32) << 8) & 0xFF00) };
+                let word = (((code as i32) << 8) & 0xFF00).to_le_bytes();
+                if !u_write(status, &word) {
+                    return EFAULT;
+                }
             }
             return tid;
         }
@@ -1536,11 +1602,14 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
             }
             // struct termios (36 байт в kernel ABI): iflag/oflag/cflag/lflag +
             // line + cc[32]. Канонический режим + эхо, как у нормального tty.
-            unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 36) };
-            unsafe { (arg as *mut u32).add(0).write_unaligned(0x500) }; // iflag: ICRNL|IXON
-            unsafe { ((arg as *mut u32).add(1)).write_unaligned(0x5) }; // oflag: OPOST|ONLCR
-            unsafe { ((arg as *mut u32).add(2)).write_unaligned(0xBF) }; // cflag: 9600 8N1
-            unsafe { ((arg as *mut u32).add(3)).write_unaligned(0x8A3B) }; // lflag: ISIG|ICANON|ECHO|...
+            let mut raw = [0u8; 36];
+            raw[0..4].copy_from_slice(&0x500u32.to_le_bytes());
+            raw[4..8].copy_from_slice(&0x5u32.to_le_bytes());
+            raw[8..12].copy_from_slice(&0xBFu32.to_le_bytes());
+            raw[12..16].copy_from_slice(&0x8A3Bu32.to_le_bytes());
+            if !u_write(arg, &raw) {
+                return EFAULT;
+            }
             0
         }
         TCSETS | TCSETSW | TCSETSF => 0, // принимаем, игнорируем (raw-mode no-op)
@@ -1550,10 +1619,12 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
             }
             // winsize: rows, cols, xpixels, ypixels (u16 x4).
             let vals = [61u16, 160u16, 1280u16, 800u16];
+            let mut raw = [0u8; 8];
             for (i, v) in vals.iter().enumerate() {
-                unsafe {
-                    ((arg as *mut u16).add(i)).write_unaligned(v.to_le())
-                };
+                raw[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            if !u_write(arg, &raw) {
+                return EFAULT;
             }
             0
         }
@@ -1572,7 +1643,11 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
             // Спин с hlt: писатель изменит значение в userspace, таймер
             // разбудит нас для перепроверки. Одноядерно корректно.
             loop {
-                let cur = unsafe { (uaddr as *const u32).read_unaligned() };
+                let mut raw = [0u8; 4];
+                if !u_read(uaddr, &mut raw) {
+                    return EFAULT;
+                }
+                let cur = u32::from_le_bytes(raw);
                 if cur != val as u32 {
                     return 0;
                 }

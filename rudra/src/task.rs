@@ -38,6 +38,10 @@ use crate::{serial_println, syscall};
 
 pub const USER_STACK_TOP: u64 = 0x4000_0000;
 pub const USER_STACK_SIZE: u64 = 256 * 1024;
+/// Пользовательские адреса строго ниже этой границы.
+/// Куча ядра (`0x4444_4444_0000`) и physmap выше, поэтому адрес ядра
+/// в аргументе syscall сюда не попадает.
+pub const USER_TOP: u64 = 0x1_0000_0000;
 pub const BRK_BASE: u64 = 0x1000_0000;
 pub const BRK_MAX: u64 = 0x5000_0000;
 pub const MMAP_BASE: u64 = 0x5000_0000;
@@ -146,8 +150,142 @@ impl AddressSpace {
     }
 }
 
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        let l4 = self.l4;
+        // Не держим этот кадр как CR3: execve переключает CR3 до drop.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::memory::with_frame_allocator(|fa| free_user_space(l4, fa));
+        });
+    }
+}
+
+/// Освобождает только пользовательское поддерево L4[0] и сам кадр L4.
+/// Записи L4[1..] — общие таблицы ядра, их кадры не наши.
+fn free_user_space(l4: PhysFrame, fa: &mut BootInfoFrameAllocator) {
+    let l4_ptr = (phys_offset() + l4.start_address().as_u64()).as_mut_ptr::<PageTable>();
+    let child = unsafe {
+        let table = &mut *l4_ptr;
+        let entry = &table[0];
+        let child = if entry.flags().contains(PageTableFlags::PRESENT)
+            && !entry.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            PhysFrame::from_start_address(entry.addr()).ok()
+        } else {
+            None
+        };
+        table[0].set_unused();
+        child
+    };
+    if let Some(l3) = child {
+        free_table(l3, 3, fa);
+    }
+    fa.deallocate_frame(l4);
+}
+
+fn free_table(frame: PhysFrame, level: u8, fa: &mut BootInfoFrameAllocator) {
+    let ptr = (phys_offset() + frame.start_address().as_u64()).as_mut_ptr::<PageTable>();
+    let mut kids = [None; 512];
+    unsafe {
+        let table = &*ptr;
+        for i in 0..512 {
+            let entry = &table[i];
+            if entry.flags().contains(PageTableFlags::PRESENT)
+                && !entry.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                kids[i] = PhysFrame::from_start_address(entry.addr()).ok();
+            }
+        }
+    }
+    if level > 1 {
+        for kid in kids.into_iter().flatten() {
+            free_table(kid, level - 1, fa);
+        }
+    } else {
+        for kid in kids.into_iter().flatten() {
+            fa.deallocate_frame(kid);
+        }
+    }
+    fa.deallocate_frame(frame);
+}
+
 fn phys_offset() -> VirtAddr {
     VirtAddr::new(crate::PHYS_OFFSET.load(Ordering::Relaxed))
+}
+
+/// Прочитать байты пользователя через physmap. Виртуальный адрес задачи
+/// не разыменовывается: нет ядра #PF на несмапленной странице и нет чтения
+/// памяти ядра по адресу из syscall.
+pub fn user_read(addr: u64, dst: &mut [u8]) -> bool {
+    user_copy(addr, dst.as_mut_ptr(), dst.len(), false)
+}
+
+/// Записать байты в память задачи через physmap. Страница должна быть
+/// present, user и writable. Иначе `false` (для syscall это `EFAULT`).
+pub fn user_write(addr: u64, src: &[u8]) -> bool {
+    user_copy(addr, src.as_ptr() as *mut u8, src.len(), true)
+}
+
+fn user_copy(addr: u64, buf: *mut u8, len: usize, write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = addr.checked_add(len as u64) else {
+        return false;
+    };
+    if addr < 0x1000 || end > USER_TOP {
+        return false;
+    }
+    let mut done = 0usize;
+    while done < len {
+        let at = addr + done as u64;
+        let Some(phys) = translate_user(at, write) else {
+            return false;
+        };
+        let page_off = (at & 0xFFF) as usize;
+        let n = (4096 - page_off).min(len - done);
+        let mapped = (crate::PHYS_OFFSET.load(Ordering::Relaxed) + phys) as *mut u8;
+        unsafe {
+            if write {
+                core::ptr::copy_nonoverlapping(buf.add(done), mapped, n);
+            } else {
+                core::ptr::copy_nonoverlapping(mapped, buf.add(done), n);
+            }
+        }
+        done += n;
+    }
+    true
+}
+
+fn translate_user(addr: u64, write: bool) -> Option<u64> {
+    let (mut frame, _) = Cr3::read();
+    let off = crate::PHYS_OFFSET.load(Ordering::Relaxed);
+    for level in 0..4 {
+        let table = unsafe {
+            &*((off.wrapping_add(frame.start_address().as_u64())) as *const PageTable)
+        };
+        let shift = 39 - level * 9;
+        let idx = ((addr >> shift) & 0x1ff) as usize;
+        let entry = &table[idx];
+        let flags = entry.flags();
+        if !flags.contains(PageTableFlags::PRESENT)
+            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        {
+            return None;
+        }
+        if write && !flags.contains(PageTableFlags::WRITABLE) {
+            return None;
+        }
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        let next = PhysFrame::from_start_address(entry.addr()).ok()?;
+        if level == 3 {
+            return Some(next.start_address().as_u64() + (addr & 0xfff));
+        }
+        frame = next;
+    }
+    None
 }
 
 /// Свежая L4-таблица: kernel-маппинги (индексы 1..512) копируются,
@@ -312,6 +450,9 @@ pub struct Task {
     pub kernel_rsp: u64,
     /// Вершина kernel-стека: для TSS (прерывания из ring 3) и syscall.
     pub kstack_top: u64,
+    /// База kernel-стека. Drop возвращает эти 64 КиБ в кучу.
+    /// Ноль — стека нет (не освобождать).
+    kstack_base: u64,
     pub state: TaskState,
     pub exit_code: i64,
     /// Слот родителя (-1 = родитель не отслеживается).
@@ -419,9 +560,14 @@ pub fn spawn_path(name: &str) -> u64 {
         let built = crate::memory::with_frame_allocator(|fa| build_task(&elf, &argv, &[], name, fa));
         match built {
             Ok(t) => {
-                TASKS.lock()[slot] = Some(t);
-                let count = TASK_COUNT.load(Ordering::Acquire);
-                TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+                let old = {
+                    let mut tasks = TASKS.lock();
+                    let old = tasks[slot].replace(t);
+                    let count = TASK_COUNT.load(Ordering::Acquire);
+                    TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+                    old
+                };
+                drop(old);
                 serial_println!("[task] spawned {} in slot {}", name, slot);
                 NEXT_TID.load(Ordering::Relaxed) - 1
             }
@@ -646,6 +792,31 @@ pub fn load_elf_image(
     Ok(LoadedImage { entry, user_rsp: sp })
 }
 
+/// Kernel-стек в куче. База запоминается в задаче и освобождается в Drop.
+fn alloc_kernel_stack() -> (u64, u64) {
+    let kstack: Box<[u8]> = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
+    let base = kstack.as_ptr() as u64;
+    let top = base + KERNEL_STACK_SIZE as u64;
+    core::mem::forget(kstack);
+    (base, top)
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        if self.kstack_base == 0 {
+            return;
+        }
+        let ptr = self.kstack_base as *mut u8;
+        self.kstack_base = 0;
+        unsafe {
+            drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                ptr,
+                KERNEL_STACK_SIZE,
+            )));
+        }
+    }
+}
+
 /// Завершает создание задачи: kernel-стек + начальный iret-фрейм.
 fn finish_task(
     aspace: Arc<Mutex<AddressSpace>>,
@@ -656,9 +827,7 @@ fn finish_task(
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
     // Kernel-стек задачи (в kernel-адресном пространстве, виден при любом CR3).
-    let mut kstack: Box<[u8]> = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
-    let kstack_top = kstack.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64;
-    core::mem::forget(kstack);
+    let (kstack_base, kstack_top) = alloc_kernel_stack();
 
     // Начальный «фрейм прерывания» на kernel-стеке: iretq в ring 3.
     // Порядок слотов совпадает с pop-последовательностью timer_entry.
@@ -688,6 +857,7 @@ fn finish_task(
         cr3: l4,
         kernel_rsp: rsp,
         kstack_top,
+        kstack_base,
         state: TaskState::Runnable,
         exit_code: 0,
         parent: -1,
@@ -741,27 +911,35 @@ pub fn with_task_at<R>(slot: usize, f: impl FnOnce(&mut Task) -> R) -> Option<R>
 /// Найти завершившегося потомка tid'а (parent == tid). Возвращает
 /// (child_tid, exit_code) и освобождает слот.
 pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
-    let mut tasks = TASKS.lock();
-    let count = TASK_COUNT.load(Ordering::Acquire);
-    for i in 0..count.min(MAX_TASKS) {
-        let matched = match &tasks[i] {
-            Some(t) if t.state == TaskState::Exited => {
-                let parent_ok = t.parent >= 0
-                    && tasks
-                        .get(t.parent as usize)
-                        .and_then(|p| p.as_ref())
-                        .map(|p| p.tid)
-                        == Some(parent_tid);
-                parent_ok && (want == 0 || want == u64::MAX || t.tid == want)
+    let taken = {
+        let mut tasks = TASKS.lock();
+        let count = TASK_COUNT.load(Ordering::Acquire);
+        let mut found = None;
+        for i in 0..count.min(MAX_TASKS) {
+            let matched = match &tasks[i] {
+                Some(t) if t.state == TaskState::Exited => {
+                    let parent_ok = t.parent >= 0
+                        && tasks
+                            .get(t.parent as usize)
+                            .and_then(|p| p.as_ref())
+                            .map(|p| p.tid)
+                            == Some(parent_tid);
+                    parent_ok && (want == 0 || want == u64::MAX || t.tid == want)
+                }
+                _ => false,
+            };
+            if matched {
+                found = tasks[i].take();
+                break;
             }
-            _ => false,
-        };
-        if matched {
-            let t = tasks[i].take().expect("checked above");
-            return Some((t.tid, t.exit_code));
         }
-    }
-    None
+        found
+    };
+    taken.map(|t| {
+        let result = (t.tid, t.exit_code);
+        drop(t);
+        result
+    })
 }
 
 /// Количество живых потомков (для wait4 ECHILD).
@@ -851,9 +1029,7 @@ pub fn sys_clone(
         // Kernel-стек ребёнка + контекст: копия фрейма родителя с rax=0.
         // Фрейм — на 2 глубже вершины: верхние ~160 байт стека затирает
         // первое же аппаратное прерывание (см. finish_task).
-        let mut kstack: Box<[u8]> = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
-        let kstack_top = kstack.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64;
-        core::mem::forget(kstack);
+        let (kstack_base, kstack_top) = alloc_kernel_stack();
         let rsp = kstack_top - 2 * (15u64 + 5) * 8;
         let (user_data, user_code) = gdt::user_segments();
         unsafe {
@@ -908,6 +1084,7 @@ pub fn sys_clone(
             cr3: child_l4,
             kernel_rsp: rsp,
             kstack_top,
+            kstack_base,
             state: TaskState::Runnable,
             exit_code: 0,
             parent: cur as isize,
@@ -930,9 +1107,16 @@ pub fn sys_clone(
         }
         let _ = parent_tid;
 
-        TASKS.lock()[slot] = Some(task);
-        let count = TASK_COUNT.load(Ordering::Acquire);
-        TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+        {
+            let old = {
+                let mut tasks = TASKS.lock();
+                let old = tasks[slot].replace(task);
+                let count = TASK_COUNT.load(Ordering::Acquire);
+                TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+                old
+            };
+            drop(old);
+        }
         crate::serial_println!(
             "[clone] parent slot {} → child tid {} slot {} flags {:#x} cr3 {:?}",
             cur, child_tid, slot, flags, child_l4
@@ -1008,9 +1192,11 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
 
     // 4) Переключиться на новое АП и переписать фрейм syscall:
     //    sysret уйдёт в точку входа нового образа.
+    //    CR3 меняется ДО drop старого АП: иначе освободим таблицу,
+    //    на которую ещё указывает CR3.
     let l4 = aspace.lock().l4;
-    with_current_task(|t| {
-        t.aspace = aspace;
+    let Some(old) = with_current_task(|t| {
+        let old = core::mem::replace(&mut t.aspace, aspace);
         t.cr3 = l4;
         t.fs_base = 0;
         let nb = canon.as_bytes();
@@ -1019,7 +1205,10 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         t.name[..n].copy_from_slice(&nb[..n]);
         // Старые xmm предыдущего образа новому процессу не принадлежат.
         crate::fpu::forget(&mut t.fx);
-    });
+        old
+    }) else {
+        return ENOEXEC;
+    };
     crate::fpu::reset_cpu();
     unsafe {
         Cr3::write(l4, Cr3Flags::empty());
@@ -1042,6 +1231,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         *f.add(FRAME::RIP) = img.entry;
         *f.add(FRAME::RSP) = img.user_rsp;
     }
+    drop(old);
     0
 }
 
@@ -1049,18 +1239,27 @@ pub fn copy_user_cstr(ptr: u64, max: usize) -> Option<String> {
     if ptr == 0 {
         return Some(String::new());
     }
+    // Не читать дальше текущей страницы, пока не встретился NUL.
+    // Аргументы exec лежат сразу под USER_STACK_TOP: чтение «с запасом»
+    // за NUL попадает в несмапленную страницу и даёт ложный EFAULT.
     let mut bytes = Vec::new();
-    for i in 0..max {
-        let b = unsafe { (ptr as *const u8).add(i).read() };
-        if b == 0 {
-            break;
+    let mut off = 0usize;
+    while off < max {
+        let at = ptr + off as u64;
+        let page_left = 4096 - (at & 0xFFF) as usize;
+        let n = (max - off).min(page_left).min(256);
+        let mut chunk = [0u8; 256];
+        if !user_read(at, &mut chunk[..n]) {
+            return None;
         }
-        bytes.push(b);
+        if let Some(i) = chunk[..n].iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..i]);
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        off += n;
     }
-    if bytes.len() >= max {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    None
 }
 
 fn copy_ptr_array(ptr: u64, max: usize) -> Option<Vec<String>> {
@@ -1069,7 +1268,11 @@ fn copy_ptr_array(ptr: u64, max: usize) -> Option<Vec<String>> {
     }
     let mut out = Vec::new();
     for i in 0..max {
-        let p = unsafe { (ptr as *const u64).add(i).read() };
+        let mut raw = [0u8; 8];
+        if !user_read(ptr + (i as u64) * 8, &mut raw) {
+            return None;
+        }
+        let p = u64::from_le_bytes(raw);
         if p == 0 {
             return Some(out);
         }
@@ -1251,8 +1454,8 @@ pub fn exit_current() {
             if let Some(t) = tasks[cur as usize].as_mut() {
                 // CLONE_CHILD_CLEARTID: pthread join ждёт обнуления.
                 if t.clear_tid != 0 {
-                    let p = t.clear_tid as *mut u32;
-                    unsafe { p.write_volatile(0) };
+                    let zero = 0u32.to_le_bytes();
+                    let _ = user_write(t.clear_tid, &zero);
                 }
                 t.state = TaskState::Exited;
             }
@@ -1446,4 +1649,70 @@ extern "C" {
 pub fn timer_handler_addr() -> u64 {
     let f: unsafe extern "C" fn() = timer_entry;
     f as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{serial_print, serial_println};
+
+    #[test_case]
+    fn user_pointer_rejects_kernel_and_holes() {
+        serial_print!("test user_pointer_rejects_kernel_and_holes... ");
+        let mut buf = [0u8; 16];
+        assert!(!user_read(0, &mut buf));
+        assert!(!user_read(0x4444_4444_0000, &mut buf));
+        assert!(!user_read(0x2000, &mut buf));
+        assert!(!user_read(0xFFFF_FFF0, &mut buf));
+        assert!(!user_write(0x4444_4444_0000, &[1, 2, 3, 4]));
+        assert!(!user_write(0x2000, &[1, 2, 3, 4]));
+        assert!(copy_user_cstr(0x4444_4444_0000, 32).is_none());
+        serial_println!("[ok]");
+    }
+
+    /// NUL в последних байтах страницы. Следующая страница не user.
+    /// Раньше чтение фиксированными 64 байтами перешагивало границу и
+    /// отказывало, хотя строка целиком лежала в смапленной странице.
+    #[test_case]
+    fn user_cstr_stops_at_nul_on_page_edge() {
+        serial_print!("test user_cstr_stops_at_nul_on_page_edge... ");
+        const PAGE: u64 = 0x7FFF_F000;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(PAGE));
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE;
+        let phys_off = VirtAddr::new(crate::PHYS_OFFSET.load(Ordering::Relaxed));
+        let frame = crate::memory::with_frame_allocator(|fa| {
+            let mut mapper = unsafe { crate::memory::init(phys_off) };
+            let frame = fa.allocate_frame().expect("frame");
+            unsafe {
+                mapper
+                    .map_to(page, frame, flags, fa)
+                    .expect("map page edge")
+                    .flush();
+            }
+            let dst = (phys_off.as_u64() + frame.start_address().as_u64()) as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(dst, 0xA5, 4096);
+                *dst.add(4093) = b'o';
+                *dst.add(4094) = b'k';
+                *dst.add(4095) = 0;
+            }
+            frame
+        });
+        match copy_user_cstr(PAGE + 4093, 32) {
+            Some(s) => assert_eq!(s.as_str(), "ok"),
+            None => panic!("cstr at page edge"),
+        }
+        let mut spill = [0u8; 8];
+        assert!(!user_read(PAGE + 4092, &mut spill));
+        crate::memory::with_frame_allocator(|fa| {
+            let mut mapper = unsafe { crate::memory::init(phys_off) };
+            let (got, flush) = mapper.unmap(page).expect("unmap");
+            flush.flush();
+            assert_eq!(got.start_address(), frame.start_address());
+            fa.deallocate_frame(got);
+        });
+        serial_println!("[ok]");
+    }
 }
