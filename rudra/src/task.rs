@@ -9,6 +9,7 @@
 //!
 //! Раскладка userspace (всё в L4[0], 0..0x80_0000_0000):
 //!   0x400000        ELF-образ (PT_LOAD)
+//!   0x800000        ELF интерпретатора, если у программы есть PT_INTERP
 //!   0x600000        резерв (раньше — страница аргумента)
 //!   0x40000000      main-стек (растёт вниз от USER_STACK_TOP)
 //!   0x10000000      brk-heap (растёт вверх до BRK_MAX)
@@ -69,6 +70,27 @@ struct LoadSeg {
     mem_size: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElfKind {
+    Exec,
+    Dyn,
+}
+
+struct RelaRel {
+    offset: u64,
+    addend: u64,
+}
+
+struct ElfParsed {
+    kind: ElfKind,
+    entry: u64,
+    phdr_vaddr: u64,
+    phnum: u64,
+    segments: Vec<LoadSeg>,
+    interp: Option<String>,
+    relative: Vec<RelaRel>,
+}
+
 fn rd16(b: &[u8], off: usize) -> u64 {
     u16::from_le_bytes(b[off..off + 2].try_into().unwrap()) as u64
 }
@@ -79,49 +101,204 @@ fn rd64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
 
-/// (entry, phdr_vaddr, phnum, сегменты LOAD) или None, если не ELF64.
-fn parse_elf64(elf: &[u8]) -> Option<(u64, u64, u64, Vec<LoadSeg>)> {
+/// ELF64 x86_64, ET_EXEC или ET_DYN. PT_INTERP запоминается, а не отвергается.
+/// Из релокаций жив только `R_X86_64_RELATIVE`. Любая другая — отказ.
+fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
     }
-    if elf[16] != 2 || elf[18] != 62 {
-        // ET_EXEC и EM_X86_64; динамические бинарники (ET_DYN/PIE) не грузим.
+    let etype = rd16(elf, 16);
+    let machine = rd16(elf, 18);
+    let kind = match etype {
+        2 => ElfKind::Exec,
+        3 => ElfKind::Dyn,
+        _ => return None,
+    };
+    if machine != 62 {
         return None;
     }
     let entry = rd64(elf, 24);
     let phoff = rd64(elf, 32);
     let phentsize = rd16(elf, 54) as usize;
     let phnum = rd16(elf, 56) as usize;
-    if phentsize < 56 {
+    if phentsize < 56 || phnum == 0 || phnum > 64 {
         return None;
     }
     let mut segs = Vec::new();
     let mut phdr_vaddr = 0u64;
+    let mut interp: Option<String> = None;
+    let mut dyn_span: Option<(usize, usize)> = None;
     for i in 0..phnum {
-        let base = (phoff as usize).checked_add(i * phentsize)?;
+        let base = (phoff as usize).checked_add(i.checked_mul(phentsize)?)?;
         if base + 56 > elf.len() {
-            break;
-        }
-        let p_type = rd32(elf, base);
-        if p_type == 3 {
-            // PT_INTERP: динамический бинарник — у нас нет ld.so.
             return None;
         }
-        if p_type == 1 {
+        let p_type = rd32(elf, base);
+        let off = rd64(elf, base + 8);
+        let vaddr = rd64(elf, base + 16);
+        let file_size = rd64(elf, base + 32);
+        let mem_size = rd64(elf, base + 40);
+        if p_type == 3 {
+            if interp.is_some() || file_size == 0 || file_size > 128 {
+                return None;
+            }
+            let start = off as usize;
+            let end = start.checked_add(file_size as usize)?;
+            if end > elf.len() {
+                return None;
+            }
+            let raw = &elf[start..end];
+            let n = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+            let text = core::str::from_utf8(&raw[..n]).ok()?;
+            if text.is_empty() || !text.starts_with('/') {
+                return None;
+            }
+            interp = Some(String::from(text));
+        } else if p_type == 2 {
+            let start = off as usize;
+            let end = start.checked_add(file_size as usize)?;
+            if end > elf.len() || file_size > 1 << 20 {
+                return None;
+            }
+            dyn_span = Some((start, end));
+        } else if p_type == 1 {
             let seg = LoadSeg {
-                offset: rd64(elf, base + 8),
-                vaddr: rd64(elf, base + 16),
-                file_size: rd64(elf, base + 32),
-                mem_size: rd64(elf, base + 40),
+                offset: off,
+                vaddr,
+                file_size,
+                mem_size,
             };
-            // Программные заголовки лежат в этом сегменте → AT_PHDR.
             if phdr_vaddr == 0 && phoff >= seg.offset && phoff < seg.offset + seg.file_size {
                 phdr_vaddr = seg.vaddr + (phoff - seg.offset);
             }
             segs.push(seg);
         }
     }
-    Some((entry, phdr_vaddr, phnum as u64, segs))
+    if segs.is_empty() {
+        return None;
+    }
+    let relative = match dyn_span {
+        Some((start, end)) => parse_relative(elf, &segs, &elf[start..end])?,
+        None => Vec::new(),
+    };
+    Some(ElfParsed {
+        kind,
+        entry,
+        phdr_vaddr,
+        phnum: phnum as u64,
+        segments: segs,
+        interp,
+        relative,
+    })
+}
+
+fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<RelaRel>> {
+    const DT_NULL: u64 = 0;
+    const DT_RELA: u64 = 7;
+    const DT_RELASZ: u64 = 8;
+    const DT_RELAENT: u64 = 9;
+    const R_RELATIVE: u64 = 8;
+    let mut rela_addr = 0u64;
+    let mut rela_sz = 0u64;
+    let mut rela_ent = 24u64;
+    let mut saw_rela = false;
+    let mut i = 0;
+    while i + 16 <= dynamic.len() {
+        let tag = rd64(dynamic, i);
+        let val = rd64(dynamic, i + 8);
+        i += 16;
+        if tag == DT_NULL {
+            break;
+        } else if tag == DT_RELA {
+            rela_addr = val;
+            saw_rela = true;
+        } else if tag == DT_RELASZ {
+            rela_sz = val;
+        } else if tag == DT_RELAENT {
+            rela_ent = val;
+        }
+    }
+    if !saw_rela || rela_sz == 0 {
+        return Some(Vec::new());
+    }
+    if rela_ent != 24 || rela_sz % 24 != 0 || rela_sz > 8192 * 24 {
+        return None;
+    }
+    let file_off = vaddr_file_off(segs, rela_addr)?;
+    let start = file_off as usize;
+    let end = start.checked_add(rela_sz as usize)?;
+    if end > elf.len() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut at = start;
+    while at + 24 <= end {
+        let offset = rd64(elf, at);
+        let info = rd64(elf, at + 8);
+        let addend = rd64(elf, at + 16);
+        let typ = info & 0xffff_ffff;
+        if typ == 0 {
+            at += 24;
+            continue;
+        }
+        if typ != R_RELATIVE {
+            return None;
+        }
+        out.push(RelaRel { offset, addend });
+        at += 24;
+    }
+    Some(out)
+}
+
+fn vaddr_file_off(segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
+    for seg in segs {
+        if vaddr >= seg.vaddr && vaddr - seg.vaddr < seg.file_size {
+            return Some(seg.offset + (vaddr - seg.vaddr));
+        }
+    }
+    None
+}
+
+fn load_bias(img: &ElfParsed, interpreter: bool) -> u64 {
+    if img.kind == ElfKind::Exec {
+        return 0;
+    }
+    let min_v = img.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    let base: u64 = if interpreter { 0x800000 } else { 0x400000 };
+    base.wrapping_sub(min_v & !0xFFF)
+}
+
+fn seg_span(seg: &LoadSeg, bias: u64) -> Option<(u64, u64)> {
+    if seg.mem_size == 0 {
+        return None;
+    }
+    let start = seg.vaddr.checked_add(bias)?;
+    let end = start.checked_add(seg.mem_size)?;
+    Some((start, end))
+}
+
+fn ranges_hit(a: &[LoadSeg], ab: u64, b: &[LoadSeg], bb: u64) -> bool {
+    for sa in a {
+        let Some((a0, a1)) = seg_span(sa, ab) else { continue };
+        for sb in b {
+            let Some((b0, b1)) = seg_span(sb, bb) else { continue };
+            if a0 < b1 && b0 < a1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn hits_stack(segs: &[LoadSeg], bias: u64) -> bool {
+    let stack0 = USER_STACK_TOP - USER_STACK_SIZE;
+    for seg in segs {
+        let Some((a0, a1)) = seg_span(seg, bias) else { continue };
+        if a0 < USER_STACK_TOP && stack0 < a1 {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- Адресное пространство ----
@@ -502,11 +679,13 @@ static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
 static SIGNAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/signal.elf"));
 static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
+static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"));
+static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 7] = [
+    const BINS: [(&str, &[u8]); 9] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -514,6 +693,8 @@ pub fn init() {
         ("/bin/threads.elf", THREADS_ELF),
         ("/bin/signal.elf", SIGNAL_ELF),
         ("/bin/epoll.elf", EPOLL_ELF),
+        ("/bin/interp.elf", INTERP_ELF),
+        ("/bin/dyn.elf", DYN_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -629,33 +810,29 @@ fn build_task(
     finish_task(aspace, img, name)
 }
 
-/// Загрузить ELF в АП l4 и построить начальный стек (argc/argv/envp/auxv).
-/// Возвращает (entry, user_rsp).
-pub fn load_elf_image(
+fn map_and_copy(
     l4: PhysFrame,
     elf_bytes: &[u8],
-    argv: &[String],
-    envp: &[String],
-    stack_top: u64,
+    segments: &[LoadSeg],
+    bias: u64,
     frame_allocator: &mut BootInfoFrameAllocator,
-) -> Result<LoadedImage, MapToError<Size4KiB>> {
-    let (entry, phdr_vaddr, phnum, segments) = match parse_elf64(elf_bytes) {
-        Some(p) => p,
-        None => {
-            serial_println!("[task] bad ELF image (need static ET_EXEC x86_64)");
-            return Err(MapToError::FrameAllocationFailed);
-        }
-    };
-
-    // Маппим все уникальные страницы сегментов (сегменты могут делить
-    // страницы — сначала маппинг, потом копия данных).
+) -> Result<(), MapToError<Size4KiB>> {
     let mut mapped_pages: Vec<u64> = Vec::new();
-    for seg in &segments {
+    for seg in segments {
         if seg.mem_size == 0 {
             continue;
         }
-        let seg_end = seg.vaddr + seg.mem_size;
-        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg.vaddr));
+        let seg_va = seg
+            .vaddr
+            .checked_add(bias)
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        let seg_end = seg_va
+            .checked_add(seg.mem_size)
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        if seg_va < 0x1000 || seg_end > USER_TOP {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_va));
         let last_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_end - 1));
         for page in Page::range_inclusive(first_page, last_page) {
             let start = page.start_address().as_u64();
@@ -666,15 +843,18 @@ pub fn load_elf_image(
             mapped_pages.push(start);
         }
     }
-    // Копируем данные сегментов в их страницы (фрейм находим через translate).
     let mut mapper = unsafe { mapper_for(l4) };
-    for seg in &segments {
+    for seg in segments {
         if seg.file_size == 0 || seg.offset as usize + seg.file_size as usize > elf_bytes.len() {
             continue;
         }
         let data = &elf_bytes[seg.offset as usize..(seg.offset + seg.file_size) as usize];
-        let seg_end = seg.vaddr + seg.mem_size;
-        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg.vaddr));
+        let seg_va = seg.vaddr + bias;
+        let seg_end = seg_va + seg.mem_size;
+        if seg.mem_size == 0 {
+            continue;
+        }
+        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_va));
         let last_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_end - 1));
         for page in Page::range_inclusive(first_page, last_page) {
             let page_start = page.start_address().as_u64();
@@ -682,15 +862,94 @@ pub fn load_elf_image(
                 .translate_addr(page.start_address())
                 .ok_or(MapToError::FrameAllocationFailed)?;
             let frame_virt = phys_offset() + frame_phys.as_u64();
-            let copy_start = seg.vaddr.max(page_start);
-            let copy_end = (seg.vaddr + data.len() as u64).min(page_start + 4096);
+            let copy_start = seg_va.max(page_start);
+            let copy_end = (seg_va + data.len() as u64).min(page_start + 4096);
             if copy_start < copy_end {
-                let src = &data[(copy_start - seg.vaddr) as usize..(copy_end - seg.vaddr) as usize];
+                let src = &data[(copy_start - seg_va) as usize..(copy_end - seg_va) as usize];
                 let dst = (frame_virt.as_u64() + (copy_start - page_start)) as *mut u8;
                 unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
             }
         }
     }
+    Ok(())
+}
+
+fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapToError<Size4KiB>> {
+    for rel in rels {
+        let addr = rel
+            .offset
+            .checked_add(bias)
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        let val = rel.addend.wrapping_add(bias);
+        write_user(l4, addr, &val.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Загрузить ELF в АП l4 и построить начальный стек (argc/argv/envp/auxv).
+/// Если есть `PT_INTERP`, вход — в интерпретатор, а `AT_ENTRY` остаётся
+/// входом основной программы. Возвращает (entry, user_rsp).
+pub fn load_elf_image(
+    l4: PhysFrame,
+    elf_bytes: &[u8],
+    argv: &[String],
+    envp: &[String],
+    stack_top: u64,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> Result<LoadedImage, MapToError<Size4KiB>> {
+    let main = match parse_elf64(elf_bytes) {
+        Some(p) => p,
+        None => {
+            serial_println!("[task] bad ELF image (need ET_EXEC/ET_DYN x86_64)");
+            return Err(MapToError::FrameAllocationFailed);
+        }
+    };
+    let main_bias = load_bias(&main, false);
+    map_and_copy(l4, elf_bytes, &main.segments, main_bias, frame_allocator)?;
+    apply_relative(l4, &main.relative, main_bias)?;
+
+    let phdr_vaddr = main.phdr_vaddr.wrapping_add(main_bias);
+    let phnum = main.phnum;
+    let at_entry = main.entry.wrapping_add(main_bias);
+    let (entry, at_base) = if let Some(path) = main.interp.as_deref() {
+        let Some(canon) = crate::fs::resolve("/", path) else {
+            serial_println!("[task] PT_INTERP path too long: {}", path);
+            return Err(MapToError::FrameAllocationFailed);
+        };
+        let Some(ibytes) = crate::fs::read_canon(&canon) else {
+            serial_println!("[task] PT_INTERP missing {}", canon);
+            return Err(MapToError::FrameAllocationFailed);
+        };
+        let interp = match parse_elf64(&ibytes) {
+            Some(p) => p,
+            None => {
+                serial_println!("[task] PT_INTERP bad ELF {}", canon);
+                return Err(MapToError::FrameAllocationFailed);
+            }
+        };
+        if interp.interp.is_some() {
+            serial_println!("[task] nested PT_INTERP refused");
+            return Err(MapToError::FrameAllocationFailed);
+        }
+        let ibias = load_bias(&interp, true);
+        if ranges_hit(&main.segments, main_bias, &interp.segments, ibias) || hits_stack(&interp.segments, ibias)
+        {
+            serial_println!("[task] PT_INTERP overlaps the program or the stack");
+            return Err(MapToError::FrameAllocationFailed);
+        }
+        map_and_copy(l4, &ibytes, &interp.segments, ibias, frame_allocator)?;
+        apply_relative(l4, &interp.relative, ibias)?;
+        let base = if interp.kind == ElfKind::Dyn { ibias } else { 0 };
+        serial_println!(
+            "[task] PT_INTERP {} entry {:#x} AT_BASE {:#x}",
+            canon,
+            interp.entry.wrapping_add(ibias),
+            base
+        );
+        (interp.entry.wrapping_add(ibias), base)
+    } else {
+        (at_entry, 0)
+    };
 
     // ---- Начальный стек ----
     // Все строки, потом (выравнивание 16) auxv, envp[], argv[], argc наверху.
@@ -763,9 +1022,9 @@ pub fn load_elf_image(
         AT_PHENT, 56,
         AT_PHNUM, phnum,
         AT_PAGESZ, 4096,
-        AT_BASE, 0,
+        AT_BASE, at_base,
         AT_FLAGS, 0,
-        AT_ENTRY, entry,
+        AT_ENTRY, at_entry,
         AT_UID, 1000,
         AT_EUID, 1000,
         AT_GID, 1000,
@@ -1849,6 +2108,21 @@ pub fn lapic_timer_handler_addr() -> u64 {
 mod tests {
     use super::*;
     use crate::{serial_print, serial_println};
+
+    #[test_case]
+    fn pt_interp_names_the_interpreter() {
+        serial_print!("test pt_interp_names_the_interpreter... ");
+        let main = parse_elf64(DYN_ELF).expect("dyn.elf");
+        assert_eq!(main.interp.as_deref(), Some("/bin/interp.elf"));
+        assert!(main.kind == ElfKind::Exec);
+        assert_eq!(main.entry, 0x4000c0);
+        assert!(main.relative.is_empty());
+        let interp = parse_elf64(INTERP_ELF).expect("interp.elf");
+        assert!(interp.interp.is_none());
+        assert_eq!(interp.entry, 0x800078);
+        assert_eq!(load_bias(&interp, true), 0);
+        serial_println!("[ok]");
+    }
 
     #[test_case]
     fn rseq_needs_a_task() {
