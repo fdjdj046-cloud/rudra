@@ -10,6 +10,7 @@
 
 rootfs каталог рекурсивно упаковывается в полные пути:
   rootfs/bin/busybox -> "/bin/busybox", rootfs/motd.txt -> "/motd.txt".
+Каталоги — отдельные записи: старший бит offset (0x80000000), размер 0.
 """
 import os
 import struct
@@ -22,46 +23,58 @@ ENTRY_SIZE = 72
 TABLE_OFF = 12
 DATA_OFF = 16 * 1024
 IMG_SIZE = 8 * 1024 * 1024
+DIR_BIT = 0x80000000
 
 
 def main():
     src_dir, out_path = sys.argv[1], sys.argv[2]
-    entries = []
-    data = bytearray()
+    files = []
+    dirs = set()
 
-    for root, _dirs, files in os.walk(src_dir):
-        for fname in sorted(files):
+    for root, dirnames, filenames in os.walk(src_dir):
+        rel_root = os.path.relpath(root, src_dir).replace(os.sep, "/")
+        if rel_root != ".":
+            dirs.add("/" + rel_root)
+        for fname in sorted(filenames):
             path = os.path.join(root, fname)
             rel = os.path.relpath(path, src_dir).replace(os.sep, "/")
             fs_name = "/" + rel
             if len(fs_name) >= NAME_LEN:
                 print(f"skip (name too long): {fs_name}", file=sys.stderr)
                 continue
-            payload = open(path, "rb").read()
-            entries.append((fs_name, len(data), len(payload)))
-            data += payload
-            if len(entries) >= MAX_FILES:
-                break
-        if len(entries) >= MAX_FILES:
+            files.append(fs_name)
+            parent = fs_name
+            while True:
+                parent = parent.rsplit("/", 1)[0]
+                if not parent:
+                    break
+                dirs.add(parent)
+        if len(files) >= MAX_FILES:
             break
 
-    entries.sort(key=lambda e: e[0])
-    # offset'ы считались до сортировки — пересобираем данные в порядке имён
+    files.sort()
     data = bytearray()
     packed = []
-    for name, _off, size in entries:
+    for name in files:
         path = os.path.join(src_dir, name[1:].replace("/", os.sep))
         payload = open(path, "rb").read()
-        packed.append((name, len(data), size))
+        packed.append((name, len(data), len(payload)))
         data += payload
 
     if DATA_OFF + len(data) > IMG_SIZE:
         print("rootfs does not fit into image", file=sys.stderr)
         sys.exit(1)
 
+    dir_entries = sorted(d for d in dirs if 0 < len(d) < NAME_LEN)
+    records = [(name, DIR_BIT, 0) for name in dir_entries]
+    records.extend(packed)
+    if len(records) > MAX_FILES:
+        print("too many files and directories", file=sys.stderr)
+        sys.exit(1)
+
     img = bytearray(IMG_SIZE)
-    struct.pack_into("<III", img, 0, MAGIC, len(packed), len(data))
-    for i, (name, off, size) in enumerate(packed):
+    struct.pack_into("<III", img, 0, MAGIC, len(records), len(data))
+    for i, (name, off, size) in enumerate(records):
         base = TABLE_OFF + i * ENTRY_SIZE
         nb = name.encode()
         img[base : base + len(nb)] = nb
@@ -69,7 +82,10 @@ def main():
 
     img[DATA_OFF : DATA_OFF + len(data)] = data
     open(out_path, "wb").write(img)
-    print(f"rfs image: {len(packed)} files, {len(data)} bytes data -> {out_path}")
+    print(
+        f"rfs image: {len(dir_entries)} dirs, {len(packed)} files, "
+        f"{len(data)} bytes data -> {out_path}"
+    )
 
 
 if __name__ == "__main__":

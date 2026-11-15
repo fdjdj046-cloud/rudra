@@ -215,6 +215,16 @@ pub fn write_file(path: &str, data: &[u8]) -> isize {
     n
 }
 
+pub fn mkdir(path: &str) -> i64 {
+    let mut p = [0u8; 128];
+    let pb = path.as_bytes();
+    if pb.len() >= p.len() {
+        return -1;
+    }
+    p[..pb.len()].copy_from_slice(pb);
+    unsafe { syscall6(83, p.as_ptr() as u64, 0, 0, 0, 0, 0) as i64 }
+}
+
 pub fn delete(path: &str) -> bool {
     // unlink == syscall 87
     let mut p = [0u8; 128];

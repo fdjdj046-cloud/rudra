@@ -70,8 +70,8 @@
   смена CR3 + TSS.rsp0 + syscall-стека, `iretq`.
   Корректно работает и при вложенном прерывании внутри syscall
 - **Ramdisk-ФС** (RFS2, 8 МиБ в куче): полные пути до 64 байт, read / write /
-  create-or-replace / delete / list. Каталоги пока синтетические — это префикс
-  имени (`/bin/shell.elf` лежит плоско, `ls /bin` режет по префиксу).
+  create-or-replace / delete / list. Каталог — отдельная запись (`mkdir` / `rmdir`),
+  файл создаётся только внутри существующего родителя. Имя по-прежнему полный путь.
   Образ `rootfs/` собирается `scripts/pack_rfs.py` и вшивается в ядро
   (`include_bytes!`, не ramdisk bootloader'а)
 - **Тесты прямо в ядре**: `cargo test` собирает тестовый бинарь ядра и гоняет его
@@ -80,7 +80,7 @@
 ### Шелл и команды (ring 3)
 
 ```
-ls [путь]                 список (каталоги — префиксы имён)
+ls [путь]                 список каталога (mkdir создаёт запись)
 cat <файл>                напечатать файл
 echo <текст>              напечатать текст
 pwd / cd / mkdir / rm
@@ -115,7 +115,7 @@ rudra/
     ├── syscall.rs      # EFER/LSTAR/STAR/SFMask, asm entry, Linux-dispatch
     ├── linux.rs        # номера syscall'ов Linux x86_64
     ├── task.rs         # ELF, fork/clone/execve, адресные пространства, round-robin
-    ├── fs.rs           # RFS2, 8 МиБ, синтетические каталоги
+    ├── fs.rs           # RFS2, 8 МиБ, каталоги — отдельные записи
     ├── memory.rs       # OffsetPageTable, frame allocator (глобальный, один)
     ├── allocator.rs    # bump-аллокатор кучи (48 МиБ)
     ├── framebuffer.rs  # DrawTarget + текстовый писатель (baseline-семантика!)
@@ -221,7 +221,8 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] Ramdisk-ФС: ls/cat/echo/rm/run, программы как файлы /bin/*.elf, загрузка ELF из ФС
 - [x] Linux x86_64 ABI, fork/clone/execve/wait4, pipe, brk/mmap, статический busybox
 - [x] SSE/FXSAVE на задачу, `threads.elf` (clone + общий счётчик)
-- [ ] Настоящие каталоги вместо префиксов путей, VirtIO-blk, ext2 read-only
+- [x] Каталоги RFS2 — отдельные записи (`mkdir` / `rmdir` / `rename`), не префиксы
+- [ ] VirtIO-blk, ext2 read-only
 - [ ] SMP: APIC, startup IPI, второй CPU
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра

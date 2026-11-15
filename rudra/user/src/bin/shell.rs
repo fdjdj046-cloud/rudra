@@ -127,8 +127,16 @@ fn run_command(line: &str) {
             }
         }
         "mkdir" => {
-            // Каталоги неявные — просто успех.
-            println!("ok (каталоги в rudra неявные)");
+            if args.is_empty() {
+                println!("mkdir: нужен каталог");
+                return;
+            }
+            for d in args {
+                let r = rudra::mkdir(d);
+                if r != 0 {
+                    println!("mkdir: {}: {}", d, r);
+                }
+            }
         }
         "ps" => {
             unsafe { rudra::syscall6(rudra::SYS_DEBUG_TASKS, 0, 0, 0, 0, 0, 0) };
@@ -196,7 +204,7 @@ fn ls(path: &str) {
                 .unwrap_or(0);
             let name = core::str::from_utf8(unsafe { core::slice::from_raw_parts(p.add(19), name_len) })
                 .unwrap_or("?");
-            let d_type = unsafe { *p.add(reclen - 1) };
+            let d_type = unsafe { *p.add(18) };
             if d_type == 4 {
                 println!("{}/", name);
             } else {

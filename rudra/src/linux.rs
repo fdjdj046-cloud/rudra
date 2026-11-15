@@ -269,6 +269,20 @@ fn task_resolve(path: &str) -> Option<String> {
     crate::fs::resolve(&cwd, path)
 }
 
+fn fs_err(e: crate::fs::FsError) -> u64 {
+    use crate::fs::FsError::*;
+    match e {
+        NoEnt => ENOENT,
+        Exist => EEXIST,
+        NotDir => ENOTDIR,
+        IsDir => EISDIR,
+        NotEmpty => ENOTEMPTY,
+        NoSpc => ENOSPC,
+        Inval => EINVAL,
+        Perm => EPERM,
+    }
+}
+
 // ---- stat ----
 
 const S_IFMT: u32 = 0o170000;
@@ -467,31 +481,27 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let (Some(o), Some(n)) = (task_resolve(&old), task_resolve(&new)) else {
                 return ENAMETOOLONG;
             };
-            match crate::fs::read_canon(&o) {
-                Some(data) => {
-                    if crate::fs::write_canon(&n, &data) < 0 {
-                        ENOSPC
-                    } else {
-                        crate::fs::delete_canon(&o);
-                        0
-                    }
-                }
-                None => ENOENT,
+            match crate::fs::fs_lock().rename(&o, &n) {
+                Ok(()) => 0,
+                Err(e) => fs_err(e),
             }
         }
-        83 => 0, // mkdir: каталоги неявные, притворяемся
-        84 => {
-            // rmdir: пуст ли (нет детей)?
+        83 => {
+            // mkdir
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            let f = crate::fs::fs_lock();
-            let children = f.list_dir(&canon);
-            if !f.is_dir(&canon) {
-                ENOENT
-            } else if !children.is_empty() {
-                ENOTEMPTY
-            } else {
-                0
+            match crate::fs::fs_lock().mkdir(&canon) {
+                Ok(()) => 0,
+                Err(e) => fs_err(e),
+            }
+        }
+        84 => {
+            // rmdir
+            let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
+            let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
+            match crate::fs::fs_lock().rmdir(&canon) {
+                Ok(()) => 0,
+                Err(e) => fs_err(e),
             }
         }
         85 => {
@@ -505,6 +515,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let (Some(o), Some(n)) = (task_resolve(&old), task_resolve(&new)) else {
                 return ENAMETOOLONG;
             };
+            if crate::fs::fs_lock().is_dir(&o) {
+                return EPERM;
+            }
             match crate::fs::read_canon(&o) {
                 Some(data) if crate::fs::write_canon(&n, &data) >= 0 => 0,
                 Some(_) => ENOSPC,
@@ -514,10 +527,10 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         87 => {
             // unlink
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
-            match task_resolve(&path).map(|c| crate::fs::delete_canon(&c)) {
-                Some(true) => 0,
-                Some(false) => ENOENT,
-                None => ENAMETOOLONG,
+            let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
+            match crate::fs::fs_lock().unlink(&canon) {
+                Ok(()) => 0,
+                Err(e) => fs_err(e),
             }
         }
         88 => {
@@ -905,6 +918,9 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
         if flags & O_CREAT == 0 {
             return ENOENT;
         }
+        if let Err(e) = crate::fs::fs_lock().parent_ok(&canon) {
+            return fs_err(e);
+        }
         let mut slot = Some(Fd::File {
             name: canon,
             offset: 0,
@@ -1268,11 +1284,13 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
             let mut i = *idx;
             while i < names.len() {
                 let name = &names[i];
-                let reclen = ((19 + name.len() + 1) + 7) & !7;
+                // linux_dirent64: ino u64, off u64, reclen u16, type u8, name[] NUL.
+                // Тип стоит в байте 18, сразу перед именем. NUL после имени
+                // нельзя класть в тот же байт, иначе короткое имя теряет конец.
+                let reclen = (19 + name.len() + 1 + 7) & !7;
                 if written + reclen as u64 > len {
                     break;
                 }
-                // Тип: дирктория ли дочерний элемент.
                 let full = if is_root {
                     format!("/{}", name)
                 } else {
@@ -1283,11 +1301,10 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
                 unsafe {
                     (p as *mut u64).write_unaligned(fake_ino(&full));
                     ((p as *mut u64).add(1)).write_unaligned((i + 1) as u64); // d_off
-                    ((p.add(16)) as *mut u16).write_unaligned(reclen as u16);
+                    (p.add(16) as *mut u16).write_unaligned(reclen as u16);
+                    *p.add(18) = d_type;
                     core::ptr::copy_nonoverlapping(name.as_bytes().as_ptr(), p.add(19), name.len());
                     core::ptr::write_bytes(p.add(19 + name.len()), 0, reclen - 19 - name.len());
-                    // d_type — последний байт записи (стандартная уловка).
-                    *(p.offset((reclen - 1) as isize)) = d_type;
                 }
                 written += reclen as u64;
                 i += 1;

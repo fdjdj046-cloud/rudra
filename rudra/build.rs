@@ -24,6 +24,7 @@ fn main() {
         .status()
         .expect("run pack_rfs.py (python not in PATH?)");
     assert!(status.success(), "pack_rfs.py failed");
+    println!("cargo:rerun-if-changed=scripts/pack_rfs.py");
     println!("cargo:rerun-if-changed=rootfs");
     for entry in std::fs::read_dir("rootfs").unwrap() {
         let p = entry.unwrap().path();

@@ -1,8 +1,13 @@
 //! Ramdisk-файловая система rudra (RFS2).
 //!
-//! Плоское хранилище полных путей ("/bin/shell.elf"), каталоги эмулируются
-//! синтетически: "/bin" — это префикс имён. Запись — create-or-replace с
-//! bump-аллокацией (старые данные текут, это учебная FS).
+//! Каждая запись — полный путь ("/bin/busybox" или "/bin"). Каталог — отдельная
+//! запись: старший бит `offset` установлен, данных нет. Префикс файла каталогом
+//! не считается. Новый файл можно создать только в существующем каталоге.
+//! Запись файла — create-or-replace с bump-аллокацией (старые данные текут).
+//!
+//! При монтировании недостающие родители уже лежащих в образе файлов
+//! достраиваются один раз: старый образ без записей каталогов продолжает
+//! грузиться. Дальше `mkdir` / `rmdir` обязательны.
 //!
 //! Регион живёт в kernel heap (Box утекает), поэтому FS доступна при любом
 //! CR3 задач. Все операции под глобальным мьютексом, короткие.
@@ -21,6 +26,20 @@ const ENTRY_SIZE: usize = 72; // name[64] + offset u32 + size u32
 const TABLE_OFF: usize = 12; // magic + num_files + data_used
 const DATA_OFF: usize = 16 * 1024;
 pub const DISK_SIZE: usize = 8 * 1024 * 1024;
+/// Старший бит offset: запись — каталог, поле size не используется.
+const DIR_BIT: u32 = 0x8000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsError {
+    NoEnt,
+    Exist,
+    NotDir,
+    IsDir,
+    NotEmpty,
+    NoSpc,
+    Inval,
+    Perm,
+}
 
 /// Базовый образ ramdisk, собранный pack_rfs.py из rootfs при сборке ядра.
 static BASE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rfs.img"));
@@ -56,7 +75,17 @@ pub fn init_from(base_image: &[u8]) {
         }
         wr32(&mut storage, 0, MAGIC);
     }
-    let _ = FS.call_once(|| Mutex::new(RamFs { storage }));
+    let mut ram = RamFs { storage };
+    ram.materialize_parents();
+    let _ = FS.call_once(|| Mutex::new(ram));
+}
+
+/// Родитель канонического пути. У `"/"` и у `"foo"` родитель — `"/"`.
+pub fn parent(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
 }
 
 fn fs() -> spin::MutexGuard<'static, RamFs> {
@@ -113,6 +142,49 @@ impl RamFs {
         (rd32(&self.storage, base + NAME_LEN), rd32(&self.storage, base + NAME_LEN + 4))
     }
 
+    fn is_dir_slot(&self, slot: usize) -> bool {
+        self.entry(slot).0 & DIR_BIT != 0
+    }
+
+    fn set_name(&mut self, slot: usize, name: &str) {
+        let base = TABLE_OFF + slot * ENTRY_SIZE;
+        for b in &mut self.storage[base..base + NAME_LEN] {
+            *b = 0;
+        }
+        self.storage[base..base + name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    fn clear_slot(&mut self, slot: usize) {
+        let base = TABLE_OFF + slot * ENTRY_SIZE;
+        self.storage[base] = 0;
+    }
+
+    /// Свободный слот: дырка от удаления или новый в конце таблицы.
+    fn alloc_slot(&mut self) -> Result<usize, FsError> {
+        let count = self.num_files().min(MAX_FILES);
+        for i in 0..count {
+            if self.storage[TABLE_OFF + i * ENTRY_SIZE] == 0 {
+                return Ok(i);
+            }
+        }
+        if count >= MAX_FILES {
+            return Err(FsError::NoSpc);
+        }
+        self.set_num_files(count + 1);
+        Ok(count)
+    }
+
+    pub fn parent_ok(&self, name: &str) -> Result<(), FsError> {
+        let parent = parent(name);
+        if self.is_dir(parent) {
+            Ok(())
+        } else if self.find_slot(parent).is_some() {
+            Err(FsError::NotDir)
+        } else {
+            Err(FsError::NoEnt)
+        }
+    }
+
     pub fn read(&self, name: &str, buf: &mut [u8]) -> isize {
         self.read_at(name, 0, buf)
     }
@@ -126,6 +198,9 @@ impl RamFs {
             Some(s) => s,
             None => return -1,
         };
+        if self.is_dir_slot(slot) {
+            return -1;
+        }
         let (off, size) = self.entry(slot);
         if offset >= size as u64 {
             return 0;
@@ -141,46 +216,160 @@ impl RamFs {
         if name.is_empty() || name.len() >= NAME_LEN || name == "/" {
             return -1;
         }
-        let count = self.num_files().min(MAX_FILES);
         let slot = match self.find_slot(name) {
+            Some(s) if self.is_dir_slot(s) => return -1,
             Some(s) => s,
             None => {
-                if count >= MAX_FILES {
+                if self.parent_ok(name).is_err() {
                     return -1;
                 }
-                count // новый слот
+                match self.alloc_slot() {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                }
             }
         };
         let used = self.data_used();
         if DATA_OFF + used + data.len() > DISK_SIZE {
             return -1; // не хватает места
         }
-        // Имя
+        self.set_name(slot, name);
         let base = TABLE_OFF + slot * ENTRY_SIZE;
-        for b in &mut self.storage[base..base + NAME_LEN] {
-            *b = 0;
-        }
-        self.storage[base..base + name.len()].copy_from_slice(name.as_bytes());
-        // Данные
         let start = DATA_OFF + used;
         self.storage[start..start + data.len()].copy_from_slice(data);
         wr32(&mut self.storage, base + NAME_LEN, used as u32);
         wr32(&mut self.storage, base + NAME_LEN + 4, data.len() as u32);
-        if slot >= count {
-            self.set_num_files(count + 1);
-        }
         self.set_data_used(used + data.len());
         data.len() as isize
     }
 
+    /// Удалить файл. Каталог не трогает.
     pub fn delete(&mut self, name: &str) -> bool {
+        self.unlink(name).is_ok()
+    }
+
+    /// unlink(2): каталог — ошибка, а не тихое «нет файла».
+    pub fn unlink(&mut self, name: &str) -> Result<(), FsError> {
         match self.find_slot(name) {
+            Some(slot) if self.is_dir_slot(slot) => Err(FsError::IsDir),
             Some(slot) => {
-                let base = TABLE_OFF + slot * ENTRY_SIZE;
-                self.storage[base] = 0;
-                true
+                self.clear_slot(slot);
+                Ok(())
             }
-            None => false,
+            None => Err(FsError::NoEnt),
+        }
+    }
+
+    /// Создать каталог. Родитель должен уже существовать.
+    pub fn mkdir(&mut self, name: &str) -> Result<(), FsError> {
+        if name.is_empty() || name == "/" || name.len() >= NAME_LEN || name.contains('\0') {
+            return Err(FsError::Inval);
+        }
+        if self.find_slot(name).is_some() {
+            return Err(FsError::Exist);
+        }
+        self.parent_ok(name)?;
+        let slot = self.alloc_slot()?;
+        self.set_name(slot, name);
+        let base = TABLE_OFF + slot * ENTRY_SIZE;
+        wr32(&mut self.storage, base + NAME_LEN, DIR_BIT);
+        wr32(&mut self.storage, base + NAME_LEN + 4, 0);
+        Ok(())
+    }
+
+    /// Удалить пустой каталог. Корень удалить нельзя.
+    pub fn rmdir(&mut self, name: &str) -> Result<(), FsError> {
+        if name == "/" {
+            return Err(FsError::Perm);
+        }
+        let slot = match self.find_slot(name) {
+            Some(s) if self.is_dir_slot(s) => s,
+            Some(_) => return Err(FsError::NotDir),
+            None => return Err(FsError::NoEnt),
+        };
+        if !self.list_dir(name).is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        self.clear_slot(slot);
+        Ok(())
+    }
+
+    /// Переименовать файл или каталог вместе с потомками. Данные не копируются.
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<(), FsError> {
+        if old == new {
+            return Ok(());
+        }
+        if old == "/" || new == "/" || new.len() >= NAME_LEN || old.is_empty() {
+            return Err(FsError::Inval);
+        }
+        let old_slot = self.find_slot(old).ok_or(FsError::NoEnt)?;
+        let old_is_dir = self.is_dir_slot(old_slot);
+        self.parent_ok(new)?;
+        let mut kids: Vec<(usize, String)> = Vec::new();
+        if old_is_dir {
+            let prefix = format!("{}/", old);
+            if new.starts_with(&prefix) {
+                return Err(FsError::Inval);
+            }
+            let count = self.num_files().min(MAX_FILES);
+            for i in 0..count {
+                if self.storage[TABLE_OFF + i * ENTRY_SIZE] == 0 {
+                    continue;
+                }
+                let n = self.entry_name(i);
+                if n.starts_with(&prefix) {
+                    let renamed = format!("{}{}", new, &n[old.len()..]);
+                    if renamed.len() >= NAME_LEN {
+                        return Err(FsError::Inval);
+                    }
+                    kids.push((i, renamed));
+                }
+            }
+        }
+        if let Some(dest) = self.find_slot(new) {
+            let dest_dir = self.is_dir_slot(dest);
+            if dest_dir && !old_is_dir {
+                return Err(FsError::IsDir);
+            }
+            if !dest_dir && old_is_dir {
+                return Err(FsError::NotDir);
+            }
+            if dest_dir && !self.list_dir(new).is_empty() {
+                return Err(FsError::NotEmpty);
+            }
+            self.clear_slot(dest);
+        }
+        for (i, renamed) in kids {
+            self.set_name(i, &renamed);
+        }
+        self.set_name(old_slot, new);
+        Ok(())
+    }
+
+    /// Достроить каталоги-родители для записей, уже лежащих в образе.
+    fn materialize_parents(&mut self) {
+        let count = self.num_files().min(MAX_FILES);
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..count {
+            if self.storage[TABLE_OFF + i * ENTRY_SIZE] == 0 {
+                continue;
+            }
+            names.push(String::from(self.entry_name(i)));
+        }
+        for name in names {
+            let mut missing: Vec<String> = Vec::new();
+            let mut cur = String::from(parent(&name));
+            while cur != "/" && !self.is_dir(&cur) {
+                if self.find_slot(&cur).is_some() {
+                    break;
+                }
+                let next = String::from(parent(&cur));
+                missing.push(cur);
+                cur = next;
+            }
+            for dir in missing.iter().rev() {
+                let _ = self.mkdir(dir);
+            }
         }
     }
 
@@ -207,8 +396,8 @@ impl RamFs {
     /// Размер файла (для ls -l).
     pub fn size_of(&self, name: &str) -> isize {
         match self.find_slot(name) {
-            Some(slot) => self.entry(slot).1 as isize,
-            None => -1,
+            Some(slot) if !self.is_dir_slot(slot) => self.entry(slot).1 as isize,
+            _ => -1,
         }
     }
 
@@ -216,28 +405,22 @@ impl RamFs {
         self.find_slot(name).is_some()
     }
 
-    /// Каталог ли путь (корень или префикс существующих файлов).
+    /// Каталог ли путь. Корень есть всегда. Префикс чужого имени — не каталог.
     pub fn is_dir(&self, name: &str) -> bool {
         if name == "/" {
             return true;
         }
-        let prefix = format!("{}/", name);
-        let count = self.num_files().min(MAX_FILES);
-        for i in 0..count {
-            let base = TABLE_OFF + i * ENTRY_SIZE;
-            if self.storage[base] == 0 {
-                continue;
-            }
-            if self.entry_name(i).starts_with(&prefix) {
-                return true;
-            }
-        }
-        false
+        self.find_slot(name)
+            .map(|s| self.is_dir_slot(s))
+            .unwrap_or(false)
     }
 
-    /// Прямые дети каталога (без вложенных компонентов).
+    /// Прямые дети каталога: только реальные записи, ровно на один компонент глубже.
     pub fn list_dir(&self, name: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        if name != "/" && !self.is_dir(name) {
+            return out;
+        }
         let count = self.num_files().min(MAX_FILES);
         for i in 0..count {
             let base = TABLE_OFF + i * ENTRY_SIZE;
@@ -245,19 +428,15 @@ impl RamFs {
                 continue;
             }
             let full = self.entry_name(i);
-            let rest = if name == "/" {
-                full.strip_prefix('/')
-            } else {
-                full.strip_prefix(name).and_then(|s| s.strip_prefix('/'))
+            if parent(full) != name {
+                continue;
+            }
+            let child = match full.rfind('/') {
+                Some(pos) => &full[pos + 1..],
+                None => full,
             };
-            if let Some(rest) = rest {
-                let child = match rest.find('/') {
-                    Some(p) => &rest[..p],
-                    None => rest,
-                };
-                if !child.is_empty() && !out.iter().any(|c| c == child) {
-                    out.push(String::from(child));
-                }
+            if !child.is_empty() && !out.iter().any(|c| c == child) {
+                out.push(String::from(child));
             }
         }
         out
@@ -411,17 +590,32 @@ mod tests {
     fn ramfs_dirs() {
         serial_print!("test ramfs_dirs... ");
         assert!(fs().is_dir("/"));
-        write_path(b"/a/b/f.txt", b"x");
-        assert!(fs().is_dir("/a"));
-        assert!(fs().is_dir("/a/b"));
-        assert!(!fs().is_dir("/a/b/f.txt"));
-        let kids = fs().list_dir("/a");
+        // Файл без родителей не создаёт каталоги и сам не появляется.
+        assert!(write_path(b"/zd/orphan.txt", b"no") < 0);
+        assert!(!fs().is_dir("/zd"));
+        assert!(fs().mkdir("/zd").is_ok());
+        assert!(fs().mkdir("/zd/sub").is_ok());
+        assert_eq!(fs().mkdir("/zd/sub"), Err(FsError::Exist));
+        assert!(write_path(b"/zd/sub/f.txt", b"x") > 0);
+        assert!(fs().is_dir("/zd"));
+        assert!(fs().is_dir("/zd/sub"));
+        assert!(!fs().is_dir("/zd/sub/f.txt"));
+        let kids = fs().list_dir("/zd");
         assert_eq!(kids.len(), 1);
-        assert_eq!(kids[0], "b");
-        let kids = fs().list_dir("/a/b");
+        assert_eq!(kids[0], "sub");
+        let kids = fs().list_dir("/zd/sub");
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0], "f.txt");
-        delete_path(b"/a/b/f.txt");
+        // Непустой каталог не удаляется. Файл — не каталог.
+        assert_eq!(fs().rmdir("/zd"), Err(FsError::NotEmpty));
+        assert_eq!(fs().rmdir("/zd/sub/f.txt"), Err(FsError::NotDir));
+        assert!(fs().rename("/zd/sub/f.txt", "/zd/g.txt").is_ok());
+        assert!(fs().list_dir("/zd/sub").is_empty());
+        assert_eq!(fs().list_dir("/zd").len(), 2);
+        assert!(delete_path(b"/zd/g.txt"));
+        assert!(fs().rmdir("/zd/sub").is_ok());
+        assert!(fs().rmdir("/zd").is_ok());
+        assert!(!fs().is_dir("/zd"));
         serial_println!("[ok]");
     }
 
