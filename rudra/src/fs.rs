@@ -480,7 +480,39 @@ fn ext2_on() -> bool {
     crate::ext2::mounted()
 }
 
+/// Синтетический `/proc`. Не пишется на диск: и при ext2, и на ramdisk.
+fn proc_root(name: &str) -> bool {
+    name == "/proc"
+}
+
+fn proc_body(name: &str) -> Option<String> {
+    match name {
+        "/proc/uptime" => {
+            let ns = crate::time::monotonic_ns();
+            let sec = ns / 1_000_000_000;
+            let cent = (ns / 10_000_000) % 100;
+            // Второе поле Linux — idle. Мы его не считаем, поэтому ноль.
+            Some(format!("{}.{:02} 0.00\n", sec, cent))
+        }
+        "/proc/cpuinfo" => Some(format!(
+            "processor\t: 0\nsiblings\t: {}\n",
+            crate::smp::cpu_count()
+        )),
+        _ => None,
+    }
+}
+
+fn proc_mut(name: &str) -> bool {
+    proc_root(name) || name.starts_with("/proc/")
+}
+
 pub fn is_dir(name: &str) -> bool {
+    if proc_root(name) {
+        return true;
+    }
+    if proc_body(name).is_some() {
+        return false;
+    }
     if ext2_on() {
         crate::ext2::is_dir(name)
     } else {
@@ -489,6 +521,9 @@ pub fn is_dir(name: &str) -> bool {
 }
 
 pub fn exists(name: &str) -> bool {
+    if proc_root(name) || proc_body(name).is_some() {
+        return true;
+    }
     if ext2_on() {
         crate::ext2::exists(name)
     } else {
@@ -497,6 +532,12 @@ pub fn exists(name: &str) -> bool {
 }
 
 pub fn size_of(name: &str) -> isize {
+    if let Some(text) = proc_body(name) {
+        return text.len() as isize;
+    }
+    if proc_root(name) {
+        return 0;
+    }
     if ext2_on() {
         crate::ext2::size_of(name)
     } else {
@@ -505,6 +546,12 @@ pub fn size_of(name: &str) -> isize {
 }
 
 pub fn nlink_of(name: &str) -> u64 {
+    if proc_root(name) {
+        return 2;
+    }
+    if proc_body(name).is_some() {
+        return 1;
+    }
     if ext2_on() {
         crate::ext2::nlink_of(name)
     } else if fs().is_dir(name) {
@@ -515,6 +562,16 @@ pub fn nlink_of(name: &str) -> u64 {
 }
 
 pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
+    if let Some(text) = proc_body(name) {
+        let bytes = text.as_bytes();
+        let start = offset as usize;
+        if start >= bytes.len() {
+            return 0;
+        }
+        let n = (bytes.len() - start).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        return n as isize;
+    }
     if ext2_on() {
         crate::ext2::read_at(name, offset, buf)
     } else {
@@ -523,11 +580,18 @@ pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
 }
 
 pub fn list_dir(name: &str) -> Vec<String> {
-    if ext2_on() {
+    if proc_root(name) {
+        return vec!["cpuinfo".into(), "uptime".into()];
+    }
+    let mut names = if ext2_on() {
         crate::ext2::list_dir(name)
     } else {
         fs().list_dir(name)
+    };
+    if name == "/" && !names.iter().any(|n| n == "proc") {
+        names.push("proc".into());
     }
+    names
 }
 
 pub fn parent_ok(name: &str) -> Result<(), FsError> {
@@ -539,6 +603,9 @@ pub fn parent_ok(name: &str) -> Result<(), FsError> {
 }
 
 pub fn mkdir(name: &str) -> Result<(), FsError> {
+    if proc_mut(name) {
+        return Err(if proc_root(name) { FsError::Exist } else { FsError::Perm });
+    }
     if ext2_on() {
         crate::ext2::mkdir(name)
     } else {
@@ -547,6 +614,12 @@ pub fn mkdir(name: &str) -> Result<(), FsError> {
 }
 
 pub fn rmdir(name: &str) -> Result<(), FsError> {
+    if proc_root(name) {
+        return Err(FsError::NotEmpty);
+    }
+    if proc_mut(name) {
+        return Err(FsError::NotDir);
+    }
     if ext2_on() {
         crate::ext2::rmdir(name)
     } else {
@@ -555,6 +628,9 @@ pub fn rmdir(name: &str) -> Result<(), FsError> {
 }
 
 pub fn unlink(name: &str) -> Result<(), FsError> {
+    if proc_mut(name) {
+        return Err(FsError::Perm);
+    }
     if ext2_on() {
         crate::ext2::unlink(name)
     } else {
@@ -563,6 +639,9 @@ pub fn unlink(name: &str) -> Result<(), FsError> {
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), FsError> {
+    if proc_mut(old) || proc_mut(new) {
+        return Err(FsError::Perm);
+    }
     if ext2_on() {
         crate::ext2::rename(old, new)
     } else {
@@ -641,6 +720,9 @@ pub fn read_file_to_vec(path: &[u8]) -> Option<Vec<u8>> {
 
 /// Прочитать файл по каноническому имени в Vec (для execve).
 pub fn read_canon(name: &str) -> Option<Vec<u8>> {
+    if let Some(text) = proc_body(name) {
+        return Some(text.into_bytes());
+    }
     if ext2_on() {
         return crate::ext2::read_file(name);
     }
@@ -662,6 +744,9 @@ pub fn delete_canon(name: &str) -> bool {
 
 /// Создать/перезаписать файл по каноническому имени.
 pub fn write_canon(name: &str, data: &[u8]) -> isize {
+    if proc_mut(name) {
+        return -1;
+    }
     if ext2_on() {
         crate::ext2::write_file(name, data)
     } else {
@@ -731,6 +816,27 @@ mod tests {
         assert_eq!(resolve("/bin", "..").unwrap(), "/");
         assert_eq!(resolve("/", ".").unwrap(), "/");
         assert_eq!(resolve("/a/b", "../../c").unwrap(), "/c");
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn proc_uptime_is_readable() {
+        serial_print!("test proc_uptime_is_readable... ");
+        assert!(is_dir("/proc"));
+        assert!(exists("/proc/uptime"));
+        assert!(!is_dir("/proc/uptime"));
+        let names = list_dir("/proc");
+        assert!(names.iter().any(|n| n == "uptime"));
+        assert!(names.iter().any(|n| n == "cpuinfo"));
+        assert!(list_dir("/").iter().any(|n| n == "proc"));
+        let mut buf = [0u8; 64];
+        let n = read_at("/proc/uptime", 0, &mut buf);
+        assert!(n > 2, "n {}", n);
+        assert!(buf[0].is_ascii_digit());
+        assert!(buf[..n as usize].contains(&b' '));
+        assert!(read_at("/proc/cpuinfo", 0, &mut buf) > 0);
+        assert_eq!(unlink("/proc/uptime"), Err(FsError::Perm));
+        assert!(write_canon("/proc/uptime", b"x") < 0);
         serial_println!("[ok]");
     }
 }

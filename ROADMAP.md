@@ -9,7 +9,7 @@
 | 1.0.0, 1.0.1 | ext2-корень, проверка указателей, возврат кадров | теги стоят, не двигаются |
 | 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; таймер BSP LAPIC ~250 Гц; AP паркуются и отвечают на IPI; RTC в `CLOCK_REALTIME`; `futex WAIT/WAKE`; `rseq` на вытеснении из ring 3. Нет очереди задач на AP, x2APIC, per-CPU TSS, `FUTEX_REQUEUE`/PI |
 | 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | начато: legacy virtio-net, DHCP и ARP в QEMU user-net, UDP `AF_INET` и петля `127.0.0.0/8`. Нет IPv6, TCP, netlink, проверки UDP-суммы |
-| 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | нет |
+| 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | начато: `/proc/uptime` и `/proc/cpuinfo` (idle в uptime — 0). Нет `PT_INTERP`, сигналов, epoll, `/sys` |
 | 1.4 | блочный слой, NVMe/AHCI, page cache, ext4 | нет |
 | 1.5 | PID1, пользователи, пакеты | нет |
 | 1.6 | только то из USB и консоли, без чего сервер в облаке не живёт. DRM/KMS и Wayland сюда не входят — это `desktop-3.x` | нет |
