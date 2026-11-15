@@ -29,6 +29,7 @@ pub fn _print(args: fmt::Arguments) {
 /// который сам управляет serial-выводом.
 #[doc(hidden)]
 pub fn _print_screen(args: fmt::Arguments) {
+    use core::fmt::Write;
     if let Some(writer) = WRITER.get() {
         writer.lock().write_fmt(args).ok();
     }
