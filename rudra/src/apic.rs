@@ -1,9 +1,9 @@
 //! Локальный APIC загрузочного процессора.
 //!
 //! Читаем базу из `IA32_APIC_BASE`, отображаем MMIO одной страницей и
-//! забираем id с version. Application processors не стартуют: это ещё не SMP.
-//! x2APIC не включаем. Если прошивка уже подняла x2APIC, id берём из MSR,
-//! потому что MMIO в этом режиме отключено.
+//! забираем id с version. x2APIC не включаем. Если прошивка уже подняла x2APIC,
+//! id берём из MSR, потому что MMIO в этом режиме отключено, и старт AP
+//! пропускается: IPI ниже ходят через xAPIC ICR.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::registers::model_specific::Msr;
@@ -44,6 +44,10 @@ pub fn timer_armed() -> bool {
 
 pub fn timer_hz() -> u64 {
     TIMER_HZ.load(Ordering::Relaxed)
+}
+
+pub fn mmio_ready() -> bool {
+    MMIO.load(Ordering::Relaxed)
 }
 
 pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Size4KiB>) {
@@ -96,7 +100,7 @@ pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Siz
     PRESENT.store(true, Ordering::Relaxed);
     MMIO.store(true, Ordering::Relaxed);
     crate::serial_println!(
-        "[apic] base {:#x} bsp {} id {} version {:#x} (APs not started)",
+        "[apic] base {:#x} bsp {} id {} version {:#x}",
         phys,
         bsp,
         id,
@@ -149,7 +153,7 @@ pub fn start_timer() {
     arm_periodic(initial as u32);
     TIMER_HZ.store(TIMER_TARGET_HZ, Ordering::Relaxed);
     crate::serial_println!(
-        "[apic] timer {} Hz, count {} (probe {} ns, pit irq0 masked, APs not started)",
+        "[apic] timer {} Hz, count {} (probe {} ns, pit irq0 masked)",
         TIMER_TARGET_HZ,
         initial,
         probed
@@ -219,6 +223,57 @@ fn arm_periodic(count: u32) {
 
 pub fn eoi() {
     write32(0xB0, 0);
+}
+
+/// Локальный APIC проснувшегося AP: программное включение, таймер и LINT маскированы.
+/// Звать только с того CPU, чей APIC надо настроить. BSP от этого замолчит.
+pub fn arm_ap() {
+    let svr = read32(0xF0);
+    write32(0xF0, (svr & !0x1FF) | 0x1FF);
+    for off in [0x320u64, 0x350, 0x360, 0x370] {
+        let v = read32(off);
+        write32(off, v | (1 << 16));
+    }
+}
+
+fn wait_icr() -> bool {
+    for _ in 0..1_000_000 {
+        if read32(0x300) & (1 << 12) == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// INIT IPI одному APIC id. xAPIC, destination в старшем байте ICR.
+pub fn send_init(dest: u32) -> bool {
+    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+        return false;
+    }
+    write32(0x310, dest << 24);
+    write32(0x300, 0x4500);
+    wait_icr()
+}
+
+/// SIPI. `vector` — физическая страница трамплина >> 12.
+pub fn send_startup(dest: u32, vector: u8) -> bool {
+    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+        return false;
+    }
+    write32(0x310, dest << 24);
+    write32(0x300, 0x4600 | u32::from(vector));
+    wait_icr()
+}
+
+/// Обычный IPI (fixed, physical, edge).
+pub fn send_fixed(dest: u32, vector: u8) -> bool {
+    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+        return false;
+    }
+    write32(0x310, dest << 24);
+    write32(0x300, u32::from(vector) | (1 << 14));
+    wait_icr()
 }
 
 fn read32(offset: u64) -> u32 {

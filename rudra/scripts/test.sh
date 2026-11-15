@@ -54,7 +54,7 @@ set +e
 timeout 90 "$QEMU" \
     -drive format=raw,file="$IMG" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-    -serial stdio -display none -m 256M
+    -serial stdio -display none -m 256M -smp 2
 CODE=$?
 set -e
 

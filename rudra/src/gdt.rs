@@ -85,6 +85,21 @@ pub fn init() {
     }
 }
 
+/// Тот же GDT, что у BSP, без TSS: у AP свой TSS ещё не заведён, прерывания
+/// планировщика на нём не включаются.
+pub fn load_ap() {
+    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
+
+    let gdt = GDT.get().expect("gdt not initialized");
+    gdt.0.load();
+    unsafe {
+        CS::set_reg(gdt.1.code);
+        SS::set_reg(gdt.1.data);
+        DS::set_reg(gdt.1.data);
+        ES::set_reg(gdt.1.data);
+    }
+}
+
 /// Селекторы ring 3 (с RPL=3) — для iretq/sysret.
 pub fn user_segments() -> (SegmentSelector, SegmentSelector) {
     let s = &GDT.get().expect("gdt not initialized").1;

@@ -10,7 +10,7 @@
 //! uname, reboot, getrandom и мелочь.
 //!
 //! Не поддержано: сокеты, доставка сигналов, файловые маппинги (mmap файла →
-//! ENODEV), настоящие блокировки (futex WAIT — spin с hlt; SMP нет).
+//! ENODEV). `futex WAIT/WAKE` будит ждущих на этом CPU; задачи крутит только BSP.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
 use alloc::boxed::Box;
@@ -36,7 +36,7 @@ errno! {
     EINVAL = 22, ENFILE = 23, EMFILE = 24, ENOTTY = 25, EFBIG = 27,
     ENOSPC = 28, ESPIPE = 29, EROFS = 30, EMLINK = 31, EPIPE = 32,
     ERANGE = 34, ENOSYS = 38, ENOTEMPTY = 39, ELOOP = 40, EWOULDBLOCK = 11,
-    E2BIG = 7, ENOEXEC = 8,
+    E2BIG = 7, ENOEXEC = 8, EAGAIN = 11,
 }
 
 /// Больше этого за один read/write не копируем: иначе длина из syscall
@@ -647,7 +647,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         202 => sys_futex(a1, a2, a3),
         203 => 0, // sched_setaffinity
         204 => {
-            // sched_getaffinity: 1 CPU
+            // sched_getaffinity: задачи исполняет только BSP, даже если AP подняты.
             if a2 == 0 || a3 == 0 {
                 return EINVAL;
             }
@@ -665,9 +665,12 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             task::current_tid()
         }
         228 => {
-            // clock_gettime. REALTIME и MONOTONIC — монотонный TSC с загрузки.
-            // Суток и RTC ещё нет: это не UTC.
-            let ns = crate::time::monotonic_ns();
+            // CLOCK_REALTIME (0) — UTC с RTC. Остальные id, которые мы принимаем, — TSC.
+            let ns = if a1 == 0 {
+                crate::time::realtime_ns()
+            } else {
+                crate::time::monotonic_ns()
+            };
             let mut raw = [0u8; 16];
             raw[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
             raw[8..16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
@@ -708,7 +711,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         }
         324 => 0, // membarrier
         332 => sys_statx(a1, a2, a3, a4, a5),
-        334 => ENOSYS, // rseq: glibc терпимо относится к ENOSYS
+        334 => task::sys_rseq(a1, a2, a3, a4),
         1000 => {
             // rudra-specific: дамп задач в serial+экран (команда ps).
             task::debug_dump();
@@ -1654,25 +1657,99 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
     match op & 0x7f {
-        FUTEX_WAIT => {
-            if uaddr == 0 {
-                return EFAULT;
-            }
-            // Спин с hlt: писатель изменит значение в userspace, таймер
-            // разбудит нас для перепроверки. Одноядерно корректно.
-            loop {
-                let mut raw = [0u8; 4];
-                if !u_read(uaddr, &mut raw) {
-                    return EFAULT;
-                }
-                let cur = u32::from_le_bytes(raw);
-                if cur != val as u32 {
-                    return 0;
-                }
-                x86_64::instructions::hlt();
-            }
-        }
-        FUTEX_WAKE => 0, // ждущих в квартире нет — все спинят сами
+        FUTEX_WAIT => futex_wait(uaddr, val as u32),
+        FUTEX_WAKE => futex_wake(uaddr, val as u32),
         _ => ENOSYS,
     }
+}
+
+struct FutexWait {
+    addr: u64,
+    woke: bool,
+}
+
+const FUTEX_SLOTS: usize = 32;
+static FUTEX_WAITERS: Mutex<[Option<FutexWait>; FUTEX_SLOTS]> = Mutex::new([
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+]);
+
+fn with_futex<R>(f: impl FnOnce(&mut [Option<FutexWait>; FUTEX_SLOTS]) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut FUTEX_WAITERS.lock()))
+}
+
+fn futex_word(addr: u64) -> Result<u32, u64> {
+    if addr == 0 || addr % 4 != 0 {
+        return Err(EINVAL);
+    }
+    let mut raw = [0u8; 4];
+    if !u_read(addr, &mut raw) {
+        return Err(EFAULT);
+    }
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn futex_wait(addr: u64, val: u32) -> u64 {
+    let slot = with_futex(|waiters| {
+        let cur = futex_word(addr)?;
+        if cur != val {
+            return Err(EAGAIN);
+        }
+        let idx = waiters.iter().position(|w| w.is_none());
+        let Some(idx) = idx else {
+            return Err(ENOMEM);
+        };
+        waiters[idx] = Some(FutexWait { addr, woke: false });
+        Ok(idx)
+    });
+    let idx = match slot {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    loop {
+        let done = with_futex(|waiters| {
+            let Some(w) = waiters[idx].as_mut() else {
+                return Some(0);
+            };
+            if w.woke {
+                waiters[idx] = None;
+                return Some(0);
+            }
+            match futex_word(addr) {
+                Ok(cur) if cur != val => {
+                    waiters[idx] = None;
+                    Some(EAGAIN)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    waiters[idx] = None;
+                    Some(e)
+                }
+            }
+        });
+        if let Some(rc) = done {
+            return rc;
+        }
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Разбудить до `n` ждущих на `addr`. Считает, скольких пометили.
+pub fn futex_wake(addr: u64, n: u32) -> u64 {
+    if n == 0 || addr == 0 {
+        return 0;
+    }
+    with_futex(|waiters| {
+        let mut woke = 0u32;
+        for slot in waiters.iter_mut().flatten() {
+            if slot.addr == addr && !slot.woke {
+                slot.woke = true;
+                woke += 1;
+                if woke == n {
+                    break;
+                }
+            }
+        }
+        u64::from(woke)
+    })
 }

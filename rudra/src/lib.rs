@@ -21,6 +21,7 @@ pub mod linux;
 pub mod memory;
 pub mod pci;
 pub mod serial;
+pub mod smp;
 pub mod syscall;
 pub mod task;
 pub mod time;
@@ -53,7 +54,8 @@ pub fn init(boot_info: &mut BootInfo) {
     PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
 
     let mut mapper = unsafe { memory::init(VirtAddr::new(phys_offset)) };
-    memory::init_frame_allocator(&boot_info.memory_regions);
+    let trampoline = smp::reserve_trampoline(&boot_info.memory_regions);
+    memory::init_frame_allocator(&boot_info.memory_regions, trampoline);
     memory::with_frame_allocator(|fa| {
         apic::init(&mut mapper, fa);
         allocator::init_heap(&mut mapper, fa).expect("heap initialization failed");
@@ -64,7 +66,9 @@ pub fn init(boot_info: &mut BootInfo) {
     }
     x86_64::instructions::interrupts::enable();
     time::finish();
+    time::init_realtime();
     apic::start_timer();
+    smp::start(trampoline, boot_info.rsdp_addr.into_option());
 
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();

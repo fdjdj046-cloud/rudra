@@ -62,6 +62,7 @@ lazy_static! {
             ));
         }
         idt[0xFFu8].set_handler_fn(spurious_apic_handler);
+        idt[crate::smp::IPI_VECTOR].set_handler_fn(apic_ipi_handler);
         idt
     };
 }
@@ -117,6 +118,11 @@ pub fn mask_irq(irq: u8) {
 }
 
 extern "x86-interrupt" fn spurious_apic_handler(_stack_frame: InterruptStackFrame) {}
+
+extern "x86-interrupt" fn apic_ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::smp::record_ipi();
+    crate::apic::eoi();
+}
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);

@@ -120,6 +120,7 @@ def main():
         [
             qemu,
             "-m", "256M",
+            "-smp", "2",
             "-display", "none",
             "-serial", "file:" + SERIAL,
             "-monitor", "tcp:127.0.0.1:%d,server,nowait" % MONITOR,

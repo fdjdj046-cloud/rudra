@@ -6,8 +6,12 @@ use spin::{Mutex, Once};
 /// одни и те же фреймы дважды (kernel heap, page tables, user tasks).
 static FRAME_ALLOCATOR: Once<Mutex<BootInfoFrameAllocator>> = Once::new();
 
-pub fn init_frame_allocator(memory_regions: &[MemoryRegion]) {
-    FRAME_ALLOCATOR.call_once(|| Mutex::new(BootInfoFrameAllocator::init(memory_regions)));
+pub fn init_frame_allocator(memory_regions: &[MemoryRegion], hole: Option<u64>) {
+    FRAME_ALLOCATOR.call_once(|| {
+        let mut alloc = BootInfoFrameAllocator::init(memory_regions);
+        alloc.hole = hole.unwrap_or(0);
+        Mutex::new(alloc)
+    });
 }
 
 /// Выполнить `f` с mutable-доступом к глобальному allocator'у.
@@ -69,6 +73,8 @@ pub struct BootInfoFrameAllocator {
     cursor: u64,
     free_head: u64,
     bump_count: usize,
+    /// Физический адрес одной страницы, которую курсор не выдаёт (трамплин AP).
+    hole: u64,
 }
 
 fn align4k(addr: u64) -> u64 {
@@ -91,6 +97,7 @@ impl BootInfoFrameAllocator {
             cursor: 0,
             free_head: FREE_EMPTY,
             bump_count: 0,
+            hole: 0,
         };
         alloc.skip_to_frame();
         alloc
@@ -126,6 +133,16 @@ impl BootInfoFrameAllocator {
             return None;
         }
         let addr = self.cursor;
+        if self.hole != 0 && addr == self.hole {
+            self.cursor = addr.saturating_add(4096);
+            let region_end = self.memory_regions[self.cursor_region].end;
+            if self.cursor.saturating_add(4096) > region_end {
+                self.cursor_region += 1;
+                self.cursor = 0;
+                self.skip_to_frame();
+            }
+            return self.bump_frame();
+        }
         let frame = PhysFrame::from_start_address(PhysAddr::new(addr)).ok()?;
         self.bump_count += 1;
         self.cursor = addr.saturating_add(4096);

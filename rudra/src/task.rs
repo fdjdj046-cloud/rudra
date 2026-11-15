@@ -462,6 +462,9 @@ pub struct Task {
     pub fs_base: u64,
     /// Адрес для CLONE_CHILD_CLEARTID: при exit записать 0 и разбудить futex.
     pub clear_tid: u64,
+    /// Пользовательская область rseq. Ноль — не зарегистрирована.
+    pub rseq: u64,
+    pub rseq_sig: u32,
     pub name: [u8; 24],
     pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
     pub cwd: String,
@@ -875,6 +878,8 @@ fn finish_task(
         parent: -1,
         fs_base: 0,
         clear_tid: 0,
+        rseq: 0,
+        rseq_sig: 0,
         name: name_buf,
         fds: default_fds(),
         cwd: String::from("/"),
@@ -1105,6 +1110,8 @@ pub fn sys_clone(
             parent: cur as isize,
             fs_base: if flags & CLONE_SETTLS != 0 { tls } else { parent_fs },
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
+            rseq: 0,
+            rseq_sig: 0,
             name: parent_name,
             fds,
             cwd: if flags & CLONE_FS != 0 { parent_cwd } else { parent_cwd },
@@ -1211,6 +1218,8 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         let old = core::mem::replace(&mut t.aspace, aspace);
         t.cr3 = l4;
         t.fs_base = 0;
+        t.rseq = 0;
+        t.rseq_sig = 0;
         let nb = canon.as_bytes();
         let n = nb.len().min(23);
         t.name = [0u8; 24];
@@ -1457,7 +1466,9 @@ pub fn exit_current() {
                 // CLONE_CHILD_CLEARTID: pthread join ждёт обнуления.
                 if t.clear_tid != 0 {
                     let zero = 0u32.to_le_bytes();
-                    let _ = user_write(t.clear_tid, &zero);
+                    let addr = t.clear_tid;
+                    let _ = user_write(addr, &zero);
+                    crate::linux::futex_wake(addr, 1);
                 }
                 t.state = TaskState::Exited;
             }
@@ -1538,6 +1549,122 @@ extern "C" fn lapic_timer_switch(current_rsp: u64) -> u64 {
     schedule(current_rsp)
 }
 
+/// `rseq` (syscall 334). Длина 32, выравнивание 32. Регистрация на задачу.
+/// Вытеснение из ring 3 переносит rip на abort, если подпись на месте.
+pub fn sys_rseq(addr: u64, len: u64, flags: u64, sig: u64) -> u64 {
+    const UNREGISTER: u64 = 1;
+    if flags & !UNREGISTER != 0 || len != 32 {
+        return crate::linux::EINVAL;
+    }
+    if flags & UNREGISTER != 0 {
+        return match with_current_task(|t| {
+            if t.rseq != addr || u64::from(t.rseq_sig) != sig {
+                crate::linux::EINVAL
+            } else {
+                t.rseq = 0;
+                t.rseq_sig = 0;
+                0
+            }
+        }) {
+            Some(rc) => rc,
+            None => crate::linux::EINVAL,
+        };
+    }
+    if addr == 0 || addr % 32 != 0 {
+        return crate::linux::EINVAL;
+    }
+    let registered = with_current_task(|t| {
+        if t.rseq != 0 {
+            return false;
+        }
+        t.rseq = addr;
+        t.rseq_sig = sig as u32;
+        true
+    });
+    match registered {
+        Some(true) => {
+            let ids = [0u8; 8];
+            if !user_write(addr, &ids) {
+                let _ = with_current_task(|t| {
+                    t.rseq = 0;
+                    t.rseq_sig = 0;
+                });
+                return crate::linux::EFAULT;
+            }
+            0
+        }
+        Some(false) => crate::linux::EBUSY,
+        None => crate::linux::EINVAL,
+    }
+}
+
+fn rseq_preempt(slot: usize, kernel_rsp: u64) {
+    let Some(ip) = timer_user_rip(kernel_rsp) else {
+        return;
+    };
+    let (addr, sig) = match with_tasks(|tasks| {
+        tasks
+            .get(slot)
+            .and_then(|t| t.as_ref())
+            .map(|t| (t.rseq, t.rseq_sig))
+    }) {
+        Some((addr, sig)) if addr != 0 => (addr, sig),
+        _ => return,
+    };
+    let zeros = 0u32.to_le_bytes();
+    let mut ids = [0u8; 8];
+    ids[..4].copy_from_slice(&zeros);
+    ids[4..].copy_from_slice(&zeros);
+    let _ = user_write(addr, &ids);
+
+    let mut cs_ptr_raw = [0u8; 8];
+    if !user_read(addr + 8, &mut cs_ptr_raw) {
+        return;
+    }
+    let cs_ptr = u64::from_le_bytes(cs_ptr_raw);
+    if cs_ptr == 0 {
+        return;
+    }
+    let mut cs = [0u8; 32];
+    if !user_read(cs_ptr, &mut cs) {
+        return;
+    }
+    let flags = u32::from_le_bytes([cs[4], cs[5], cs[6], cs[7]]);
+    let mut start_raw = [0u8; 8];
+    start_raw.copy_from_slice(&cs[8..16]);
+    let mut post_raw = [0u8; 8];
+    post_raw.copy_from_slice(&cs[16..24]);
+    let mut abort_raw = [0u8; 8];
+    abort_raw.copy_from_slice(&cs[24..32]);
+    let start = u64::from_le_bytes(start_raw);
+    let post = u64::from_le_bytes(post_raw);
+    let abort = u64::from_le_bytes(abort_raw);
+    let in_cs = post > 0 && ip >= start && ip.wrapping_sub(start) < post;
+    let no_preempt_restart = flags & 1 != 0;
+    if in_cs && !no_preempt_restart {
+        if abort < 4 {
+            return;
+        }
+        let mut mark = [0u8; 4];
+        if !user_read(abort - 4, &mut mark) || u32::from_le_bytes(mark) != sig {
+            return;
+        }
+        unsafe {
+            core::ptr::write_unaligned((kernel_rsp + 120) as *mut u64, abort);
+        }
+    }
+    let z = 0u64.to_le_bytes();
+    let _ = user_write(addr + 8, &z);
+}
+
+fn timer_user_rip(kernel_rsp: u64) -> Option<u64> {
+    let cs = unsafe { core::ptr::read_unaligned((kernel_rsp + 128) as *const u64) };
+    if cs & 3 != 3 {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned((kernel_rsp + 120) as *const u64) })
+}
+
 fn schedule(current_rsp: u64) -> u64 {
     if !SCHED_INITED.load(Ordering::Acquire) {
         return current_rsp;
@@ -1548,6 +1675,9 @@ fn schedule(current_rsp: u64) -> u64 {
     }
 
     let prev = CURRENT.load(Ordering::Relaxed);
+    if prev >= 0 {
+        rseq_preempt(prev as usize, current_rsp);
+    }
 
     let next = with_tasks(|tasks| {
         // Ищем следующую Runnable задачу, пропуская Exited и пустые слоты.
@@ -1707,6 +1837,17 @@ pub fn lapic_timer_handler_addr() -> u64 {
 mod tests {
     use super::*;
     use crate::{serial_print, serial_println};
+
+    #[test_case]
+    fn rseq_needs_a_task() {
+        serial_print!("test rseq_needs_a_task... ");
+        assert_eq!(
+            sys_rseq(0x1000, 32, 0, 0),
+            crate::linux::EINVAL,
+            "rseq without a task"
+        );
+        serial_println!("[ok]");
+    }
 
     #[test_case]
     fn user_pointer_rejects_kernel_and_holes() {
