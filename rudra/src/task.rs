@@ -80,33 +80,18 @@ fn rd16(b: &[u8], off: usize) -> u16 {
 }
 
 const USER_STACK_TOP: u64 = 0x80_0000;
+const USER_STACK_SIZE: u64 = 64 * 1024; // 16 страниц: буферы shell'а (cat) лезут в стек
 const USER_ARG_PAGE: u64 = 0x60_0000;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 pub const MAX_TASKS: usize = 4;
 
-pub const PROG_SHELL: u64 = 0;
-pub const PROG_HELLO: u64 = 1;
-pub const PROG_COUNTER: u64 = 2;
-
 /// User-программы, собранные крейтом `user` (build.sh собирает их до ядра).
+/// После монтирования FS копируются в /bin и запускаются оттуда по пути.
 static SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
 static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.elf"));
-
-fn elf_for(program: u64) -> Option<&'static [u8]> {
-    let elf = match program {
-        PROG_SHELL => SHELL_ELF,
-        PROG_HELLO => HELLO_ELF,
-        PROG_COUNTER => COUNTER_ELF,
-        _ => return None,
-    };
-    if elf.is_empty() {
-        None
-    } else {
-        Some(elf)
-    }
-}
+static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"));
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -131,51 +116,60 @@ static CURRENT: AtomicIsize = AtomicIsize::new(-1);
 static BOOT_RSP: AtomicU64 = AtomicU64::new(0);
 static SCHED_INITED: AtomicBool = AtomicBool::new(false);
 
-/// Инициализация: запускаем шелл в слоте 0 и включаем планировщик.
+/// Инициализация: кладём программы в /bin ramdisk'а, запускаем шелл оттуда
+/// и включаем планировщик.
 pub fn init() {
-    let elf = match elf_for(PROG_SHELL) {
-        Some(e) => e,
-        None => {
-            serial_println!("[task] shell.elf not found, scheduler disabled");
-            return;
+    const BINS: [(&str, &[u8]); 4] = [
+        ("/bin/shell.elf", SHELL_ELF),
+        ("/bin/hello.elf", HELLO_ELF),
+        ("/bin/counter.elf", COUNTER_ELF),
+        ("/bin/fizzbuzz.elf", FIZZ_ELF),
+    ];
+    for (name, elf) in BINS {
+        if !elf.is_empty() {
+            crate::fs::write_path(name.as_bytes(), elf);
         }
-    };
-    let ok = crate::memory::with_frame_allocator(|fa| build_task(elf, 0, fa)
-        .map(|t| {
-            TASKS.lock()[0] = Some(t);
-            TASK_COUNT.store(1, Ordering::Release);
-        })
-        .is_ok());
-    if ok {
-        SCHED_INITED.store(true, Ordering::Release);
-        serial_println!("[task] shell spawned, round-robin on PIT");
-    } else {
-        serial_println!("[task] failed to spawn shell");
+    }
+
+    match spawn_path("/bin/shell.elf") {
+        s if s != u64::MAX => {
+            SCHED_INITED.store(true, Ordering::Release);
+            serial_println!("[task] shell spawned (slot {}), round-robin on PIT", s);
+        }
+        _ => serial_println!("[task] failed to spawn shell"),
     }
 }
 
-/// Создать задачу из встроенной программы. Возвращает номер слота
-/// или u64::MAX, если свободных слотов нет.
-pub fn spawn(program: u64) -> u64 {
-    let elf = match elf_for(program) {
-        Some(e) => e,
-        None => return u64::MAX,
+/// Создать задачу из ELF-файла в ramdisk'е (путь, напр. "/bin/hello.elf").
+/// Возвращает номер слота или u64::MAX.
+pub fn spawn_path(name: &str) -> u64 {
+    let size = crate::fs::size_path(name.as_bytes());
+    if size <= 0 {
+        serial_println!("[task] spawn_path: no such file: {}", name);
+        return u64::MAX;
+    }
+    // Читаем ELF в выровненный буфер (копия утекает намеренно).
+    let mut aligned: Box<[u64]> = vec![0u64; (size as usize + 7) / 8 + 1].into_boxed_slice();
+    let elf_buf = unsafe {
+        core::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, size as usize)
     };
-    // TASKS и frame allocator берём с выключенными прерываниями:
-    // обе блокировки нужны одновременно, и таймер не должен вклиниться.
+    if crate::fs::read_path(name.as_bytes(), elf_buf) != size {
+        serial_println!("[task] spawn_path: failed to read {}", name);
+        return u64::MAX;
+    }
+
     x86_64::instructions::interrupts::without_interrupts(|| {
         let slot = {
             let tasks = TASKS.lock();
-            let slot = (0..MAX_TASKS).find(|&i| match &tasks[i] {
+            match (0..MAX_TASKS).find(|&i| match &tasks[i] {
                 None => true,
                 Some(t) => t.state == TaskState::Exited,
-            });
-            match slot {
+            }) {
                 Some(s) => s,
                 None => return u64::MAX,
             }
         };
-        let built = crate::memory::with_frame_allocator(|fa| build_task(elf, slot as u8, fa));
+        let built = crate::memory::with_frame_allocator(|fa| build_task(elf_buf, slot as u8, fa));
         match built {
             Ok(t) => {
                 {
@@ -184,11 +178,11 @@ pub fn spawn(program: u64) -> u64 {
                 }
                 let count = TASK_COUNT.load(Ordering::Acquire);
                 TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
-                serial_println!("[task] spawned program {} in slot {}", program, slot);
+                serial_println!("[task] spawned {} in slot {}", name, slot);
                 slot as u64
             }
             Err(e) => {
-                serial_println!("[task] spawn failed: {:?}", e);
+                serial_println!("[task] spawn {} failed: {:?}", name, e);
                 u64::MAX
             }
         }
@@ -314,13 +308,14 @@ fn build_task(
         unsafe { core::ptr::write(arg_frame_virt.as_mut_ptr::<u8>(), marker) };
     }
 
-    // 5) User-стек: одна страница под USER_STACK_TOP.
-    map_zeroed(
-        &mut mapper,
-        Page::containing_address(VirtAddr::new(USER_STACK_TOP - 1)),
-        frame_allocator,
-        user_flags,
-    )?;
+    // 5) User-стек: USER_STACK_SIZE байт под USER_STACK_TOP.
+    let stack_start = VirtAddr::new(USER_STACK_TOP - USER_STACK_SIZE);
+    let stack_end = VirtAddr::new(USER_STACK_TOP - 1);
+    let first_stack_page = Page::containing_address(stack_start);
+    let last_stack_page = Page::containing_address(stack_end);
+    for page in Page::range_inclusive(first_stack_page, last_stack_page) {
+        map_zeroed(&mut mapper, page, frame_allocator, user_flags)?;
+    }
 
     // 6) Kernel-стек задачи (в kernel-адресном пространстве, виден при любом CR3).
     let mut kstack: Box<[u8]> = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
@@ -482,5 +477,6 @@ extern "C" {
 
 /// Адрес asm-обработчика таймера (для регистрации в IDT).
 pub fn timer_handler_addr() -> u64 {
-    timer_entry as u64
+    let f: unsafe extern "C" fn() = timer_entry;
+    f as u64
 }

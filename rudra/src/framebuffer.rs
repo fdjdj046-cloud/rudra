@@ -20,7 +20,6 @@ pub fn init(framebuffer: FrameBuffer) {
 /// Вывод строки во все доступные бэкенды (serial + framebuffer).
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    use core::fmt::Write;
     crate::serial::_print(args);
     _print_screen(args);
 }

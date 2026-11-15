@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod framebuffer;
+pub mod fs;
 pub mod gdt;
 pub mod input;
 pub mod interrupts;
@@ -51,6 +52,9 @@ pub fn init(boot_info: &mut BootInfo) {
         interrupts::init_pics();
     }
     x86_64::instructions::interrupts::enable();
+
+    // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
+    fs::init();
 }
 
 pub fn hlt_loop() -> ! {
