@@ -16,4 +16,4 @@ jobs:
       - name: qemu
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 python3
       - name: kernel tests
-        run: ./rudra/scripts/test.sh
+        run: bash ./rudra/scripts/test.sh
