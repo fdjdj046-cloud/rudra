@@ -9,9 +9,12 @@
 //! arch_prctl, set_tid_address/robust_list), pipe/pipe2, poll, время,
 //! uname, reboot, getrandom и мелочь.
 //!
-//! UDP/`AF_INET` есть (петля и virtio-net). TCP, IPv6, netlink и доставка
-//! сигналов — нет. Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит
-//! ждущих на этом CPU; задачи крутит только BSP.
+//! UDP/`AF_INET` есть (петля и virtio-net). TCP, IPv6 и netlink нет.
+//! Сигналы 1–31 доставляются на возврате из syscall, если задан `SA_RESTORER`.
+//! epoll — level-triggered по номеру fd: `EPOLLET` принимается и ведёт себя
+//! как level, `epoll_pwait` маску не ставит, poll самого epoll-fd пуст.
+//! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
+//! CPU; задачи крутит только BSP.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
 use alloc::boxed::Box;
@@ -91,6 +94,8 @@ pub enum Fd {
     Pipe { id: usize, writable: bool },
     /// UDP-сокет `AF_INET`. `id` — слот в `net`.
     Udp { id: usize },
+    /// Набор epoll. `id` — слот в `EPOLLS`. Интерес хранит номер fd, не описание.
+    Epoll { id: usize },
 }
 
 impl Fd {
@@ -108,6 +113,10 @@ impl Fd {
             Fd::Udp { id } => {
                 crate::net::udp_addref(*id);
                 Fd::Udp { id: *id }
+            }
+            Fd::Epoll { id } => {
+                epoll_addref(*id);
+                Fd::Epoll { id: *id }
             }
             other => other.clone(),
         }
@@ -407,6 +416,19 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         }
         5 => sys_fstat(a1, a2),
         7 => sys_poll(a1, a2, a3),
+        213 => {
+            // epoll_create(size): аргумент — int. Ноль и минус — EINVAL.
+            if (a1 as i32) <= 0 {
+                EINVAL
+            } else {
+                sys_epoll_create(0)
+            }
+        }
+        232 => sys_epoll_wait(a1, a2, a3, a4),
+        233 => sys_epoll_ctl(a1, a2, a3, a4),
+        // epoll_pwait: sigmask не ставим, ждём так же, как epoll_wait.
+        281 => sys_epoll_wait(a1, a2, a3, a4),
+        291 => sys_epoll_create(a1),
         8 => sys_lseek(a1, a2 as i64, a3),
         9 => task::sys_mmap(a1, a2, a3, a4, a5, a6),
         10 | 11 => 0, // mprotect / munmap: без noop (память текёт, ох)
@@ -1045,7 +1067,9 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         }
         Some(Fd::Dir { .. }) => Kind::Bad(EISDIR),
         Some(Fd::File { .. }) => Kind::Bad(EBADF),
-        Some(Fd::Console { .. }) | Some(Fd::Pipe { .. }) => Kind::Bad(EBADF),
+        Some(Fd::Console { .. }) | Some(Fd::Pipe { .. }) | Some(Fd::Epoll { .. }) => {
+            Kind::Bad(EBADF)
+        }
         None => Kind::Bad(EBADF),
     });
     match kind {
@@ -1181,23 +1205,30 @@ fn sys_close(fd: u64) -> u64 {
         }
         fds[fd as usize].take()
     });
-    match taken {
-        Ok(Some(Fd::File { name, dirty: Some(data), .. })) => {
-            crate::fs::write_canon(&name, &data);
-            0
+    let obj = match taken {
+        Ok(Some(obj)) => obj,
+        Ok(None) => return EBADF,
+        Err(e) => return e,
+    };
+    let ep_id = match &obj {
+        Fd::File { name, dirty: Some(data), .. } => {
+            crate::fs::write_canon(name, data);
+            None
         }
-        Ok(Some(Fd::Pipe { id, writable })) => {
-            pipe_close_end(id, writable);
-            0
+        Fd::Pipe { id, writable } => {
+            pipe_close_end(*id, *writable);
+            None
         }
-        Ok(Some(Fd::Udp { id })) => {
-            crate::net::udp_close(id);
-            0
+        Fd::Udp { id } => {
+            crate::net::udp_close(*id);
+            None
         }
-        Ok(Some(_)) => 0,
-        Ok(None) => EBADF,
-        Err(e) => e,
-    }
+        Fd::Epoll { id } => Some(*id),
+        _ => None,
+    };
+    // Номер освобождён. Интересы, смотревшие на него, снимаем до повторной выдачи.
+    epoll_on_close(ep_id, fd);
+    0
 }
 
 fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
@@ -1302,6 +1333,7 @@ fn sys_fstat(fd: u64, buf: u64) -> u64 {
         }        Fd::Dir { .. } => Some((0, S_IFDIR | 0o755, 2)),
         Fd::Pipe { .. } => Some((0, S_IFCHR | 0o644, 1)),
         Fd::Udp { .. } => Some((0, 0o140000 | 0o666, 1)),
+        Fd::Epoll { .. } => Some((0, S_IFREG | 0o600, 1)),
     });
     match st {
         Ok(Some((sz, mode, nlink))) => {
@@ -1560,12 +1592,17 @@ fn sys_dup2(old: u64, new: u64) -> u64 {
                 if i >= fds.len() {
                     fds.resize(i + 1, None);
                 }
-                if let Some(Some(old_fd)) = fds.get(i) {
-                    match old_fd {
+                if let Some(prev) = fds[i].take() {
+                    match &prev {
                         Fd::Pipe { id, writable } => pipe_close_end(*id, *writable),
                         Fd::Udp { id } => crate::net::udp_close(*id),
                         _ => {}
                     }
+                    let ep = match prev {
+                        Fd::Epoll { id } => Some(id),
+                        _ => None,
+                    };
+                    epoll_on_close(ep, new);
                 }
                 fds[i] = Some(clone);
                 new
@@ -1613,6 +1650,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 Fd::Console { writable } => *writable as u64,
                 Fd::Pipe { writable, .. } => *writable as u64,
                 Fd::Udp { id } => 2 | if crate::net::udp_nonblock(*id) { 0x800 } else { 0 },
+                Fd::Epoll { .. } => 2,
             })
             .unwrap_or(EBADF)
         }
@@ -1755,9 +1793,294 @@ fn poll_ready(fd: u64, events: i16) -> i16 {
                     revents |= POLLOUT;
                 }
             }
+            // with_fd не реентерабелен: готовность набора смотрит только epoll_wait.
+            Fd::Epoll { .. } => {}
         }
     });
     revents
+}
+
+// ---- epoll ----
+//
+// Level-triggered. Интерес — номер fd в таблице задачи, не описание файла:
+// close этого номера снимает интерес, даже если остался dup. `EPOLLET`
+// принимается и не меняет поведение. Больше 16 наборов или 32 интересов —
+// ENOMEM. Таймаут дольше 60 с — EINVAL, чтобы зависший wait не выглядел
+// как рабочий epoll. `epoll_pwait` маску сигнала игнорирует.
+
+const EPOLL_MAX_SETS: usize = 16;
+const EPOLL_MAX_ITEMS: usize = 32;
+const EPOLLIN: u32 = 1;
+const EPOLLOUT: u32 = 4;
+const EPOLL_CLOEXEC: u64 = 0x80000;
+
+#[derive(Clone, Copy)]
+struct EpInterest {
+    fd: u64,
+    events: u32,
+    data: u64,
+}
+
+struct EpollSet {
+    refs: usize,
+    items: [Option<EpInterest>; EPOLL_MAX_ITEMS],
+}
+
+static EPOLLS: Mutex<Vec<Option<EpollSet>>> = Mutex::new(Vec::new());
+
+fn with_epolls<R>(f: impl FnOnce(&mut Vec<Option<EpollSet>>) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut EPOLLS.lock()))
+}
+
+fn arg_fd(raw: u64) -> Result<u64, u64> {
+    let fd = raw as i32;
+    if fd < 0 {
+        Err(EBADF)
+    } else {
+        Ok(fd as u64)
+    }
+}
+
+fn epoll_alloc() -> Result<usize, u64> {
+    with_epolls(|tab| {
+        if tab.iter().filter(|s| s.is_some()).count() >= EPOLL_MAX_SETS {
+            return Err(ENOMEM);
+        }
+        let set = EpollSet {
+            refs: 1,
+            items: [None; EPOLL_MAX_ITEMS],
+        };
+        if let Some(i) = tab.iter().position(|s| s.is_none()) {
+            tab[i] = Some(set);
+            Ok(i)
+        } else {
+            tab.push(Some(set));
+            Ok(tab.len() - 1)
+        }
+    })
+}
+
+fn epoll_addref(id: usize) {
+    with_epolls(|tab| {
+        if let Some(Some(set)) = tab.get_mut(id) {
+            set.refs += 1;
+        }
+    });
+}
+
+fn epoll_decref(id: usize) {
+    with_epolls(|tab| {
+        if let Some(set) = tab.get_mut(id).and_then(|s| s.as_mut()) {
+            set.refs = set.refs.saturating_sub(1);
+            if set.refs == 0 {
+                tab[id] = None;
+            }
+        }
+    });
+}
+
+/// Снимает ссылку на набор и все интересы, смотревшие на номер `fd_num`.
+fn epoll_on_close(ep_id: Option<usize>, fd_num: u64) {
+    with_epolls(|tab| {
+        if let Some(id) = ep_id {
+            if let Some(set) = tab.get_mut(id).and_then(|s| s.as_mut()) {
+                set.refs = set.refs.saturating_sub(1);
+                if set.refs == 0 {
+                    tab[id] = None;
+                }
+            }
+        }
+        for set in tab.iter_mut().flatten() {
+            for it in set.items.iter_mut() {
+                if it.is_some_and(|x| x.fd == fd_num) {
+                    *it = None;
+                }
+            }
+        }
+    });
+}
+
+fn sys_epoll_create(flags: u64) -> u64 {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return EINVAL;
+    }
+    let id = match epoll_alloc() {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let mut slot = Some(Fd::Epoll { id });
+    match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
+        Ok(fd) if slot.is_none() => fd,
+        Ok(err) => {
+            epoll_decref(id);
+            err
+        }
+        Err(e) => {
+            epoll_decref(id);
+            e
+        }
+    }
+}
+
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
+    const ADD: u64 = 1;
+    const DEL: u64 = 2;
+    const MOD: u64 = 3;
+    let epfd = match arg_fd(epfd) {
+        Ok(fd) => fd,
+        Err(e) => return e,
+    };
+    let fd = match arg_fd(fd) {
+        Ok(fd) => fd,
+        Err(e) => return e,
+    };
+    if epfd == fd || (op != ADD && op != DEL && op != MOD) {
+        return EINVAL;
+    }
+    let id = match with_current_fds(|fds| {
+        let ep = match fds.get(epfd as usize).and_then(|x| x.as_ref()) {
+            Some(Fd::Epoll { id }) => *id,
+            Some(_) => return Err(EINVAL),
+            None => return Err(EBADF),
+        };
+        if fds.get(fd as usize).and_then(|x| x.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        Ok(ep)
+    }) {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) | Err(e) => return e,
+    };
+    let interest = if op == DEL {
+        None
+    } else {
+        if event == 0 {
+            return EFAULT;
+        }
+        let mut raw = [0u8; 12];
+        if !u_read(event, &mut raw) {
+            return EFAULT;
+        }
+        Some(EpInterest {
+            fd,
+            events: u32::from_le_bytes(raw[0..4].try_into().unwrap()),
+            data: u64::from_le_bytes(raw[4..12].try_into().unwrap()),
+        })
+    };
+    with_epolls(|tab| {
+        let Some(set) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return EBADF;
+        };
+        let slot = set
+            .items
+            .iter()
+            .position(|it| it.is_some_and(|x| x.fd == fd));
+        match op {
+            ADD => {
+                if slot.is_some() {
+                    return EEXIST;
+                }
+                let Some(free) = set.items.iter().position(|it| it.is_none()) else {
+                    return ENOMEM;
+                };
+                set.items[free] = interest;
+                0
+            }
+            DEL => {
+                let Some(i) = slot else { return ENOENT };
+                set.items[i] = None;
+                0
+            }
+            MOD => {
+                let Some(i) = slot else { return ENOENT };
+                set.items[i] = interest;
+                0
+            }
+            _ => EINVAL,
+        }
+    })
+}
+
+fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let epfd = match arg_fd(epfd) {
+        Ok(fd) => fd,
+        Err(e) => return e,
+    };
+    let max = maxevents as i32;
+    if max < 1 || max > EPOLL_MAX_ITEMS as i32 {
+        return EINVAL;
+    }
+    let max = max as usize;
+    // Таймаут — int в младших 32 битах: userspace кладёт -1 через mov r10d.
+    let t = timeout as i32;
+    if t < -1 || t > 60_000 {
+        return EINVAL;
+    }
+    let deadline = if t > 0 {
+        Some(crate::interrupts::uptime_ms().saturating_add(t as u64))
+    } else {
+        None
+    };
+    loop {
+        let id = match with_current_fds(|fds| match fds.get(epfd as usize).and_then(|x| x.as_ref()) {
+            Some(Fd::Epoll { id }) => Ok(*id),
+            Some(_) => Err(EINVAL),
+            None => Err(EBADF),
+        }) {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) | Err(e) => return e,
+        };
+        let snap = with_epolls(|tab| {
+            tab.get(id).and_then(|s| s.as_ref()).map(|set| set.items)
+        });
+        let Some(items) = snap else {
+            return EBADF;
+        };
+        let mut n = 0usize;
+        let mut evs = [0u32; EPOLL_MAX_ITEMS];
+        let mut data = [0u64; EPOLL_MAX_ITEMS];
+        for it in items.into_iter().flatten() {
+            let want = (it.events & (EPOLLIN | EPOLLOUT)) as i16;
+            let re = poll_ready(it.fd, want);
+            let mut got = 0u32;
+            if re & 1 != 0 {
+                got |= EPOLLIN;
+            }
+            if re & 4 != 0 {
+                got |= EPOLLOUT;
+            }
+            if got != 0 {
+                evs[n] = got;
+                data[n] = it.data;
+                n += 1;
+                if n == max {
+                    break;
+                }
+            }
+        }
+        let expired = match deadline {
+            Some(d) => crate::interrupts::uptime_ms() >= d,
+            None => false,
+        };
+        if n > 0 || t == 0 || expired {
+            if n == 0 {
+                return 0;
+            }
+            if events_ptr == 0 {
+                return EFAULT;
+            }
+            for i in 0..n {
+                let mut raw = [0u8; 12];
+                raw[0..4].copy_from_slice(&evs[i].to_le_bytes());
+                raw[4..12].copy_from_slice(&data[i].to_le_bytes());
+                if !u_write(events_ptr + (i as u64) * 12, &raw) {
+                    return if i == 0 { EFAULT } else { i as u64 };
+                }
+            }
+            return n as u64;
+        }
+        x86_64::instructions::hlt();
+    }
 }
 
 fn sys_select(nfds: u64, readfds: u64, _writefds: u64, _exceptfds: u64, timeout: u64) -> u64 {

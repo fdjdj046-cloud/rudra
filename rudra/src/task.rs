@@ -501,17 +501,19 @@ static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.el
 static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"));
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
 static SIGNAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/signal.elf"));
+static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 6] = [
+    const BINS: [(&str, &[u8]); 7] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
         ("/bin/fizzbuzz.elf", FIZZ_ELF),
         ("/bin/threads.elf", THREADS_ELF),
         ("/bin/signal.elf", SIGNAL_ELF),
+        ("/bin/epoll.elf", EPOLL_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {

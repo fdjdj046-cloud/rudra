@@ -480,12 +480,20 @@ fn ext2_on() -> bool {
     crate::ext2::mounted()
 }
 
-/// Синтетический `/proc`. Не пишется на диск: и при ext2, и на ramdisk.
-fn proc_root(name: &str) -> bool {
-    name == "/proc"
+/// Синтетические `/proc` и `/sys`. На диск не пишутся: ни на ext2, ни на ramdisk.
+fn synth_children(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "/proc" => Some(&["cpuinfo", "uptime"]),
+        "/sys" => Some(&["devices", "kernel"]),
+        "/sys/devices" => Some(&["system"]),
+        "/sys/devices/system" => Some(&["cpu"]),
+        "/sys/devices/system/cpu" => Some(&["online"]),
+        "/sys/kernel" => Some(&["hostname"]),
+        _ => None,
+    }
 }
 
-fn proc_body(name: &str) -> Option<String> {
+fn synth_body(name: &str) -> Option<String> {
     match name {
         "/proc/uptime" => {
             let ns = crate::time::monotonic_ns();
@@ -498,19 +506,25 @@ fn proc_body(name: &str) -> Option<String> {
             "processor\t: 0\nsiblings\t: {}\n",
             crate::smp::cpu_count()
         )),
+        // Задачи крутит только BSP, даже если AP уже подняты.
+        "/sys/devices/system/cpu/online" => Some("0\n".into()),
+        "/sys/kernel/hostname" => Some("rudra\n".into()),
         _ => None,
     }
 }
 
-fn proc_mut(name: &str) -> bool {
-    proc_root(name) || name.starts_with("/proc/")
+fn synth_mut(name: &str) -> bool {
+    name == "/proc"
+        || name.starts_with("/proc/")
+        || name == "/sys"
+        || name.starts_with("/sys/")
 }
 
 pub fn is_dir(name: &str) -> bool {
-    if proc_root(name) {
+    if synth_children(name).is_some() {
         return true;
     }
-    if proc_body(name).is_some() {
+    if synth_body(name).is_some() {
         return false;
     }
     if ext2_on() {
@@ -521,7 +535,7 @@ pub fn is_dir(name: &str) -> bool {
 }
 
 pub fn exists(name: &str) -> bool {
-    if proc_root(name) || proc_body(name).is_some() {
+    if synth_children(name).is_some() || synth_body(name).is_some() {
         return true;
     }
     if ext2_on() {
@@ -532,10 +546,10 @@ pub fn exists(name: &str) -> bool {
 }
 
 pub fn size_of(name: &str) -> isize {
-    if let Some(text) = proc_body(name) {
+    if let Some(text) = synth_body(name) {
         return text.len() as isize;
     }
-    if proc_root(name) {
+    if synth_children(name).is_some() {
         return 0;
     }
     if ext2_on() {
@@ -546,10 +560,10 @@ pub fn size_of(name: &str) -> isize {
 }
 
 pub fn nlink_of(name: &str) -> u64 {
-    if proc_root(name) {
+    if synth_children(name).is_some() {
         return 2;
     }
-    if proc_body(name).is_some() {
+    if synth_body(name).is_some() {
         return 1;
     }
     if ext2_on() {
@@ -562,7 +576,7 @@ pub fn nlink_of(name: &str) -> u64 {
 }
 
 pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
-    if let Some(text) = proc_body(name) {
+    if let Some(text) = synth_body(name) {
         let bytes = text.as_bytes();
         let start = offset as usize;
         if start >= bytes.len() {
@@ -580,16 +594,21 @@ pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
 }
 
 pub fn list_dir(name: &str) -> Vec<String> {
-    if proc_root(name) {
-        return vec!["cpuinfo".into(), "uptime".into()];
+    if let Some(kids) = synth_children(name) {
+        return kids.iter().map(|s| (*s).into()).collect();
     }
     let mut names = if ext2_on() {
         crate::ext2::list_dir(name)
     } else {
         fs().list_dir(name)
     };
-    if name == "/" && !names.iter().any(|n| n == "proc") {
-        names.push("proc".into());
+    if name == "/" {
+        if !names.iter().any(|n| n == "proc") {
+            names.push("proc".into());
+        }
+        if !names.iter().any(|n| n == "sys") {
+            names.push("sys".into());
+        }
     }
     names
 }
@@ -603,8 +622,12 @@ pub fn parent_ok(name: &str) -> Result<(), FsError> {
 }
 
 pub fn mkdir(name: &str) -> Result<(), FsError> {
-    if proc_mut(name) {
-        return Err(if proc_root(name) { FsError::Exist } else { FsError::Perm });
+    if synth_mut(name) {
+        return Err(if synth_children(name).is_some() {
+            FsError::Exist
+        } else {
+            FsError::Perm
+        });
     }
     if ext2_on() {
         crate::ext2::mkdir(name)
@@ -614,10 +637,10 @@ pub fn mkdir(name: &str) -> Result<(), FsError> {
 }
 
 pub fn rmdir(name: &str) -> Result<(), FsError> {
-    if proc_root(name) {
+    if synth_children(name).is_some() {
         return Err(FsError::NotEmpty);
     }
-    if proc_mut(name) {
+    if synth_mut(name) {
         return Err(FsError::NotDir);
     }
     if ext2_on() {
@@ -628,7 +651,7 @@ pub fn rmdir(name: &str) -> Result<(), FsError> {
 }
 
 pub fn unlink(name: &str) -> Result<(), FsError> {
-    if proc_mut(name) {
+    if synth_mut(name) {
         return Err(FsError::Perm);
     }
     if ext2_on() {
@@ -639,7 +662,7 @@ pub fn unlink(name: &str) -> Result<(), FsError> {
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), FsError> {
-    if proc_mut(old) || proc_mut(new) {
+    if synth_mut(old) || synth_mut(new) {
         return Err(FsError::Perm);
     }
     if ext2_on() {
@@ -720,7 +743,7 @@ pub fn read_file_to_vec(path: &[u8]) -> Option<Vec<u8>> {
 
 /// Прочитать файл по каноническому имени в Vec (для execve).
 pub fn read_canon(name: &str) -> Option<Vec<u8>> {
-    if let Some(text) = proc_body(name) {
+    if let Some(text) = synth_body(name) {
         return Some(text.into_bytes());
     }
     if ext2_on() {
@@ -744,7 +767,7 @@ pub fn delete_canon(name: &str) -> bool {
 
 /// Создать/перезаписать файл по каноническому имени.
 pub fn write_canon(name: &str, data: &[u8]) -> isize {
-    if proc_mut(name) {
+    if synth_mut(name) {
         return -1;
     }
     if ext2_on() {
@@ -837,6 +860,29 @@ mod tests {
         assert!(read_at("/proc/cpuinfo", 0, &mut buf) > 0);
         assert_eq!(unlink("/proc/uptime"), Err(FsError::Perm));
         assert!(write_canon("/proc/uptime", b"x") < 0);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn sys_online_is_bsp_only() {
+        serial_print!("test sys_online_is_bsp_only... ");
+        assert!(is_dir("/sys"));
+        assert!(is_dir("/sys/devices/system/cpu"));
+        assert!(is_dir("/sys/kernel"));
+        assert!(exists("/sys/devices/system/cpu/online"));
+        assert!(exists("/sys/kernel/hostname"));
+        assert!(!is_dir("/sys/devices/system/cpu/online"));
+        assert!(list_dir("/").iter().any(|n| n == "sys"));
+        assert!(list_dir("/sys").iter().any(|n| n == "devices"));
+        let mut buf = [0u8; 16];
+        let n = read_at("/sys/devices/system/cpu/online", 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"0\n");
+        let n = read_at("/sys/kernel/hostname", 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"rudra\n");
+        assert_eq!(mkdir("/sys"), Err(FsError::Exist));
+        assert_eq!(rmdir("/sys/kernel"), Err(FsError::NotEmpty));
+        assert_eq!(unlink("/sys/kernel/hostname"), Err(FsError::Perm));
+        assert!(write_canon("/sys/kernel/hostname", b"x") < 0);
         serial_println!("[ok]");
     }
 }

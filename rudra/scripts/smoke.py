@@ -177,6 +177,7 @@ def main():
             "true",
             "wc -c /motd.txt",
             "run /bin/signal.elf",
+            "run /bin/epoll.elf",
             "ls /",
             "run /bin/counter.elf",
             "run /bin/fizzbuzz.elf",
@@ -232,6 +233,8 @@ def main():
             raise SystemExit("wc did not print 203 for motd\n" + text[-1500:])
         if "signal-ok" not in text:
             raise SystemExit("signal.elf did not report signal-ok\n" + text[-1500:])
+        if "epoll-ok" not in text:
+            raise SystemExit("epoll.elf did not report epoll-ok\n" + text[-1500:])
         print("SMOKE PASS")
         print("--- tail ---")
         print(text[-1800:])
