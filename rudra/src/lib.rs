@@ -14,25 +14,29 @@ pub mod memory;
 pub mod serial;
 pub mod vga_buffer;
 
-use bootloader::BootInfo;
+use bootloader_api::BootInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
+use x86_64::VirtAddr;
+
+/// Физическое смещение маппинга всей физической памяти (выставляется в `init`).
+pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Общая инициализация ядра: GDT/TSS, IDT, пейджинг, куча.
-///
-/// Возвращает (менеджер страниц, физический офсет) для демо/тестов памяти.
-pub fn init(boot_info: &'static BootInfo) {
+pub fn init(boot_info: &'static mut BootInfo) {
     serial::init();
     gdt::init();
     interrupts::init_idt();
 
-    let phys_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let mut mapper = unsafe { memory::init(phys_offset) };
-    let mut frame_allocator =
-        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    allocator::init_heap(&mut mapper, &mut frame_allocator)
-        .expect("heap initialization failed");
-}
+    let phys_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("kernel requires physical memory mapping (bootloader config)");
+    PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
 
-use x86_64::VirtAddr;
+    let mut mapper = unsafe { memory::init(VirtAddr::new(phys_offset)) };
+    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+}
 
 pub fn hlt_loop() -> ! {
     loop {

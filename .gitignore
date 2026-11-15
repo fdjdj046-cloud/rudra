@@ -13,3 +13,9 @@ Cargo.lock.bak
 # IDE
 .idea/
 .vscode/
+*.img
+*.bin
+*.fd
+*.log
+screen*.png
+target/

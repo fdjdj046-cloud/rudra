@@ -4,14 +4,24 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use bootloader::BootInfo;
+use bootloader_api::config::Mapping;
+use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use rudra::{println, serial_println};
 
-#[no_mangle]
-pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
+static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    // Маппим всю физическую память по динамическому смещению —
+    // так ядру доступны page tables и MMIO.
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     rudra::serial::init();
-    rudra::serial_println!("rudra: early serial up");
+    serial_println!("rudra: early serial up");
     rudra::init(boot_info);
 
     println!("rudra kernel v0.1.0");
@@ -34,10 +44,8 @@ fn heap_demo() {
     println!("heap demo: allocated Vec of {} u64s, sum ok", v.len());
 }
 
-#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
     serial_println!("PANIC: {}", info);
     rudra::hlt_loop()
 }

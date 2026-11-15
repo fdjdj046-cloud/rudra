@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // Путь к ELF ядра подставляет cargo (artifact dependency).
@@ -13,10 +13,10 @@ fn main() {
     let uefi_path = out_dir.join("rudra-uefi.img");
     let bios_path = out_dir.join("rudra-bios.img");
 
-    bootloader::UefiBoot::new(kernel_binary_path)
+    bootloader::UefiBoot::new(Path::new(kernel_binary_path))
         .create_disk_image(&uefi_path)
         .expect("failed to create UEFI disk image");
-    bootloader::BiosBoot::new(kernel_binary_path)
+    bootloader::BiosBoot::new(Path::new(kernel_binary_path))
         .create_disk_image(&bios_path)
         .expect("failed to create BIOS disk image");
 
