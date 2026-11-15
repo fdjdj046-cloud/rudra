@@ -9,7 +9,7 @@
 | 1.0.0, 1.0.1 | ext2-корень, проверка указателей, возврат кадров | теги стоят, не двигаются |
 | 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; таймер BSP LAPIC ~250 Гц; AP паркуются и отвечают на IPI; RTC в `CLOCK_REALTIME`; `futex WAIT/WAKE`; `rseq` на вытеснении из ring 3. Нет очереди задач на AP, x2APIC, per-CPU TSS, `FUTEX_REQUEUE`/PI |
 | 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | начато: legacy virtio-net, DHCP и ARP в QEMU user-net, UDP `AF_INET` и петля `127.0.0.0/8`. Нет IPv6, TCP, netlink, проверки UDP-суммы |
-| 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | начато: `/proc/uptime` и `/proc/cpuinfo` (idle в uptime — 0). Нет `PT_INTERP`, сигналов, epoll, `/sys` |
+| 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | начато: `/proc/uptime` и `/proc/cpuinfo` (idle в uptime — 0); сигналы 1–31 у текущего потока (`rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `kill`) доставляются на возврате из syscall, если задан `SA_RESTORER`. Нет `PT_INTERP`, epoll, `/sys`, доставки с тика |
 | 1.4 | блочный слой, NVMe/AHCI, page cache, ext4 | нет |
 | 1.5 | PID1, пользователи, пакеты | нет |
 | 1.6 | только то из USB и консоли, без чего сервер в облаке не живёт. DRM/KMS и Wayland сюда не входят — это `desktop-3.x` | нет |
@@ -23,3 +23,5 @@
 Долг 1.1: задачи исполняет только BSP. AP подняты и стоят в `hlt`, своего TSS и тика у них нет. Пока `sys_clone` и разбор адресного пространства держат IF выключенным, тик LAPIC на BSP не приходит и квант сдвигается. `nanosleep` и `CLOCK_MONOTONIC` на TSC. `CLOCK_REALTIME` — CMOS RTC, без NTP. `FUTEX_REQUEUE` и PI нет. `rseq` не обрывает критическую секцию на входе в syscall.
 
 Долг 1.2: один слот ARP. `SO_REUSEADDR` и `SO_BROADCAST` принимаются и не запоминаются. Датаграмма UDP не длиннее 1280 байт. Адрес с карты появляется после DHCP, сам по себе при загрузке не запрашивается. `SOCK_STREAM` возвращает `EPROTONOSUPPORT`.
+
+Долг 1.3: доставка сигнала только когда поток возвращается из syscall. Тик, блокирующий `read` и `nanosleep` сигнал не прерывают. Чужой tid получает бит, но умрёт или войдёт в обработчик на своём следующем syscall. `SIGSTOP` и сигналы остановки сбрасываются. Нет `SA_RESTART`, очереди rt-сигналов (32–64), `SIGCHLD` при `exit`, epoll, `/sys`, `PT_INTERP`. Смерть по умолчанию — `exit(128+sig)`, не `WIFSIGNALED`. Без `SA_RESTORER` перехваченный сигнал не доставляется: для смертельных по умолчанию это `exit`.

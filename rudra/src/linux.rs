@@ -32,7 +32,7 @@ macro_rules! errno {
     )*};
 }
 errno! {
-    EPERM = 1, ENOENT = 2, EINTR = 4, EIO = 5, ENOMEM = 12, EFAULT = 14,
+    EPERM = 1, ENOENT = 2, ESRCH = 3, EINTR = 4, EIO = 5, ENOMEM = 12, EFAULT = 14,
     EBUSY = 16, EEXIST = 17, ENODEV = 19, ENOTDIR = 20, EISDIR = 21,
     EINVAL = 22, ENFILE = 23, EMFILE = 24, ENOTTY = 25, EFBIG = 27,
     ENOSPC = 28, ESPIPE = 29, EROFS = 30, EMLINK = 31, EPIPE = 32,
@@ -411,7 +411,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         9 => task::sys_mmap(a1, a2, a3, a4, a5, a6),
         10 | 11 => 0, // mprotect / munmap: без noop (память текёт, ох)
         12 => task::sys_brk(a1),
-        13 | 14 => 0, // rt_sigaction / rt_sigprocmask
+        13 => crate::signal::sys_rt_sigaction(a1, a2, a3, a4),
+        14 => crate::signal::sys_rt_sigprocmask(a1, a2, a3, a4),
+        15 => crate::signal::sys_rt_sigreturn(frame),
         16 => sys_ioctl(a1, a2, a3),
         17 => sys_pread(a1, a2, a3, a5, a6),
         18 => sys_pwrite(a1, a2, a3, a5, a6),
@@ -462,7 +464,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let _ = task::sys_exit(a1);
         }
         61 => sys_wait4(a1, a2, a3),
-        62 => 0, // kill: сигналов нет, притворяемся успехом
+        62 => crate::signal::sys_kill(a1, a2),
         63 => sys_uname(a1),
         169 => sys_reboot(a1, a2, a3),
         72 => sys_fcntl(a1, a2, a3),

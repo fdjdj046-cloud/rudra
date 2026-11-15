@@ -10,10 +10,14 @@ pub fn init() {
 #[doc(hidden)]
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
-    SERIAL1
-        .lock()
-        .write_fmt(args)
-        .expect("Printing to serial failed");
+    // Планировщик может вытеснить загрузочный контекст навсегда. Если лок
+    // останется у него, следующий serial_println зависнет без паники.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SERIAL1
+            .lock()
+            .write_fmt(args)
+            .expect("Printing to serial failed");
+    });
 }
 
 #[macro_export]

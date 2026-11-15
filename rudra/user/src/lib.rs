@@ -22,7 +22,9 @@ pub unsafe fn syscall6(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6:
         in("rdi") a1,
         in("rsi") a2,
         in("rdx") a3,
-        in("r10") a4,
+        // Ядро на sysret оставляет в r10 пользовательский rsp. Без lateout
+        // компилятор считает регистр живым и не перезагружает arg4.
+        inlateout("r10") a4 => _,
         in("r8") a5,
         in("r9") a6,
         lateout("rcx") _,

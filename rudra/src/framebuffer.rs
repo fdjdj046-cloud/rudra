@@ -30,7 +30,10 @@ pub fn _print(args: fmt::Arguments) {
 pub fn _print_screen(args: fmt::Arguments) {
     use core::fmt::Write;
     if let Some(writer) = WRITER.get() {
-        writer.lock().write_fmt(args).ok();
+        // Тот же риск, что у serial: лок нельзя оставлять вытесненному контексту.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            writer.lock().write_fmt(args).ok();
+        });
     }
 }
 

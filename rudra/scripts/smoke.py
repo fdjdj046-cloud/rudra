@@ -100,10 +100,19 @@ def wait_prompts(mon, need, timeout):
 def send_line(mon, line, gap=None):
     if gap is None:
         gap = KEY_GAP
+    # Enter только после эха. На TCG с -smp 2 гость не всегда успевает
+    # прочитать сканкод, и следующий sendkey его затирает.
+    start = len(read_serial())
     for ch in line:
         key = KEYS.get(ch, ch)
         mon.sendall(("sendkey %s\n" % key).encode())
         time.sleep(gap)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if line in read_serial()[start:]:
+            break
+        time.sleep(0.05)
+    time.sleep(0.05)
     mon.sendall(b"sendkey ret\n")
     time.sleep(0.15)
 
@@ -124,6 +133,7 @@ def main():
             "-display", "none",
             "-serial", "file:" + SERIAL,
             "-monitor", "tcp:127.0.0.1:%d,server,nowait" % MONITOR,
+            "-nic", "none",
             "-drive", "if=none,id=vd0,format=raw,file=" + COPY,
             "-device", "virtio-blk-pci,drive=vd0,disable-modern=on,bootindex=0",
             "-netdev", "user,id=n0",
@@ -166,6 +176,7 @@ def main():
             "rmdir /demo",
             "true",
             "wc -c /motd.txt",
+            "run /bin/signal.elf",
             "ls /",
             "run /bin/counter.elf",
             "run /bin/fizzbuzz.elf",
@@ -219,6 +230,8 @@ def main():
             raise SystemExit("uname did not show 1.0.1\n" + text[-1500:])
         if "203 /motd.txt" not in text and "203  /motd.txt" not in text:
             raise SystemExit("wc did not print 203 for motd\n" + text[-1500:])
+        if "signal-ok" not in text:
+            raise SystemExit("signal.elf did not report signal-ok\n" + text[-1500:])
         print("SMOKE PASS")
         print("--- tail ---")
         print(text[-1800:])

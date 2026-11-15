@@ -465,6 +465,9 @@ pub struct Task {
     /// Пользовательская область rseq. Ноль — не зарегистрирована.
     pub rseq: u64,
     pub rseq_sig: u32,
+    /// Обработчики сигналов 1–31. Потомок наследует маску и обработчики,
+    /// но не ожидающие биты. execve сбрасывает всё в SIG_DFL.
+    pub signals: crate::signal::Signals,
     pub name: [u8; 24],
     pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
     pub cwd: String,
@@ -497,16 +500,18 @@ static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"))
 static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.elf"));
 static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"));
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
+static SIGNAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/signal.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 5] = [
+    const BINS: [(&str, &[u8]); 6] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
         ("/bin/fizzbuzz.elf", FIZZ_ELF),
         ("/bin/threads.elf", THREADS_ELF),
+        ("/bin/signal.elf", SIGNAL_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -880,6 +885,7 @@ fn finish_task(
         clear_tid: 0,
         rseq: 0,
         rseq_sig: 0,
+        signals: crate::signal::Signals::new(),
         name: name_buf,
         fds: default_fds(),
         cwd: String::from("/"),
@@ -1003,6 +1009,7 @@ pub fn sys_clone(
             parent_umask,
             parent_fds,
             parent_name,
+            parent_signals,
             parent_tid,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
@@ -1014,6 +1021,7 @@ pub fn sys_clone(
                 p.umask,
                 p.fds.clone(),
                 p.name,
+                p.signals.for_child(),
                 p.tid,
             )
         });
@@ -1112,6 +1120,7 @@ pub fn sys_clone(
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
             rseq: 0,
             rseq_sig: 0,
+            signals: parent_signals,
             name: parent_name,
             fds,
             cwd: if flags & CLONE_FS != 0 { parent_cwd } else { parent_cwd },
@@ -1220,6 +1229,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         t.fs_base = 0;
         t.rseq = 0;
         t.rseq_sig = 0;
+        t.signals = crate::signal::Signals::new();
         let nb = canon.as_bytes();
         let n = nb.len().min(23);
         t.name = [0u8; 24];

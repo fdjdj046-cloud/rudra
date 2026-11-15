@@ -161,5 +161,6 @@ extern "C" fn syscall_dispatch(
     a4: u64,
     frame: *mut u64,
 ) -> u64 {
-    crate::linux::dispatch(nr, a1, a2, a3, a4, frame)
+    let ret = crate::linux::dispatch(nr, a1, a2, a3, a4, frame);
+    crate::signal::deliver_pending(frame, ret)
 }

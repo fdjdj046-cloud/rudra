@@ -22,6 +22,7 @@ pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod serial;
+pub mod signal;
 pub mod smp;
 pub mod syscall;
 pub mod task;
