@@ -1,18 +1,13 @@
+//! Приветствие: демонстрация write/exit через Linux ABI.
+
 #![no_std]
 #![no_main]
 
-//! Простейшая user-программа: приветствие и exit.
+use rudra::println;
 
-use core::panic::PanicInfo;
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    user::write("hello from userspace!\n");
-    user::exit(0)
+fn main() {
+    println!("Hello from rudra userspace (ring 3)!");
+    println!("pid = {}", rudra::getpid());
 }
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    user::write("hello panic\n");
-    user::exit(1)
-}
+rudra::entry!(main);

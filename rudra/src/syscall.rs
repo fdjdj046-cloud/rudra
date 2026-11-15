@@ -1,15 +1,37 @@
 //! Интерфейс syscall/sysret между ring 3 и ядром.
 //!
-//! Конвенция: rax = номер, rdi/rsi/rdx = аргументы 1-3, возврат в rax.
-//! Номера: 1 = write(ptr, len), 2 = exit(code).
+//! Конвенция (Linux ABI): rax = номер, rdi/rsi/rdx/r10/r8/r9 = аргументы,
+//! возврат в rax. Диспетчеризация — в `linux::dispatch`.
 //!
 //! syscall НЕ переключает стек сам — entry переключается на kernel-стек
 //! текущей задачи (см. `CURRENT_KSTACK`), обновляемый планировщиком.
+//! Шестым аргументом в диспетчер передаётся указатель на сохранённый
+//! фрейм (нужен clone/fork/execve — см. `FRAME`).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::registers::model_specific::{Efer, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
+
+/// Смещения (в u64-слотах от rsp) в сохранённом фрейме syscall_entry.
+/// Порядок push'ей: r10,rcx,r11,rax,rdi,rsi,rdx,r8,r9,rbx,rbp,r12..r15.
+pub mod FRAME {
+    pub const R15: usize = 0;
+    pub const R14: usize = 1;
+    pub const R13: usize = 2;
+    pub const R12: usize = 3;
+    pub const RBP: usize = 4;
+    pub const RBX: usize = 5;
+    pub const R9: usize = 6;
+    pub const R8: usize = 7;
+    pub const RDX: usize = 8;
+    pub const RSI: usize = 9;
+    pub const RDI: usize = 10;
+    pub const RAX: usize = 11;
+    pub const RFLAGS: usize = 12;
+    pub const RIP: usize = 13;
+    pub const RSP: usize = 14;
+}
 
 /// Вершина kernel-стека текущей задачи (для syscall entry).
 #[no_mangle]
@@ -29,8 +51,8 @@ syscall_boot_stack_top:
     .text
     .global syscall_entry
 syscall_entry:
-    # На входе: rax=nr, rdi/rsi/rdx=args, rcx=user rip, r11=user rflags,
-    # IF очищен через SFMask. Стек — пользовательский.
+    # На входе: rax=nr, rdi/rsi/rdx/r10/r8/r9=args, rcx=user rip, r11=user
+    # rflags, IF очищен через SFMask. Стек — пользовательский.
     mov r10, rsp
     mov rsp, qword ptr [rip + CURRENT_KSTACK]
     test rsp, rsp
@@ -55,10 +77,11 @@ syscall_entry:
 
     # Стек (top=rsp): r15,r14,r13,r12,rbp,rbx,r9,r8,rdx,rsi,rdi,rax,r11,rcx,r10
     mov rdi, [rsp + 11*8]       # nr
-    mov rsi, [rsp + 10*8]       # arg1
-    mov rdx, [rsp + 9*8]        # arg2
-    mov rcx, [rsp + 8*8]        # arg3
-    mov r8,  [rsp + 7*8]        # arg4
+    mov rsi, [rsp + 10*8]       # arg1 (rdi)
+    mov rdx, [rsp + 9*8]        # arg2 (rsi)
+    mov rcx, [rsp + 8*8]        # arg3 (rdx)
+    mov r8,  [rsp + 14*8]       # arg4 (r10 по Linux ABI)
+    mov r9, rsp                 # arg6: указатель на фрейм (arg5/6 оттуда)
     sti
     call syscall_dispatch
     cli
@@ -114,92 +137,16 @@ pub fn init() {
     SFMask::write(RFlags::INTERRUPT_FLAG);
 }
 
-/// Диспетчер системных вызовов (вызывается из asm).
-///
-/// Номера: 1=write(ptr,len), 2=exit(code), 3=read(buf,len) — блокирующий,
-/// 4=yield, 5=spawn(program_id) (устарел, см. 10), 6=read_file(path,len,buf,len),
-/// 7=write_file(path,len,data,len), 8=list(index,buf,len), 9=delete(path,len),
-/// 10=spawn_path(path,len).
+/// Диспетчер системных вызовов (вызывается из asm, frame — сохранённый
+/// стековый фрейм; linux::dispatch сама знает про номера Linux ABI).
 #[no_mangle]
-extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    match nr {
-        1 => sys_write(a1 as *const u8, a2 as usize),
-        2 => sys_exit(a1),
-        3 => sys_read(a1 as *mut u8, a2 as usize),
-        4 => 0, // yield: PIT и так вытесняет; syscall для симметрии API
-        6 => {
-            let path = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let buf = unsafe { core::slice::from_raw_parts_mut(a3 as *mut u8, a4 as usize) };
-            crate::fs::read_path(path, buf) as u64
-        }
-        7 => {
-            let path = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let data = unsafe { core::slice::from_raw_parts(a3 as *const u8, a4 as usize) };
-            crate::fs::write_path(path, data) as u64
-        }
-        8 => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize) };
-            crate::fs::list_index(a1 as usize, buf) as u64
-        }
-        9 => {
-            let path = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            crate::fs::delete_path(path) as u64
-        }
-        10 => {
-            let path = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            match core::str::from_utf8(path) {
-                Ok(name) => crate::task::spawn_path(name.trim_end_matches('\0')),
-                Err(_) => u64::MAX,
-            }
-        }
-        _ => {
-            crate::serial_println!("[syscall] unknown nr={} args={},{},{},{}", nr, a1, a2, a3, a4);
-            u64::MAX
-        }
-    }
-}
-
-fn sys_write(ptr: *const u8, len: usize) -> u64 {
-    if ptr.is_null() || len == 0 {
-        return 0;
-    }
-    // Serial получает байты как есть (UTF-8 текст рендерится терминалом),
-    // на экран — только печатные ASCII и '\n'.
-    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
-    for &b in slice {
-        use x86_64::instructions::port::Port;
-        unsafe {
-            Port::<u8>::new(0x3F8).write(b);
-        }
-        if b == b'\n' || (0x20..=0x7e).contains(&b) {
-            crate::framebuffer::_print_screen(core::format_args!("{}", b as char));
-        }
-    }
-    len as u64
-}
-
-/// Блокирующее чтение одного байта из очереди клавиатуры.
-/// IF остаётся включённым (мы после sti в entry): таймер вытесняет задачу,
-/// клавиатура пополняет очередь.
-fn sys_read(ptr: *mut u8, len: usize) -> u64 {
-    if ptr.is_null() || len == 0 {
-        return 0;
-    }
-    loop {
-        let b = crate::input::INPUT_QUEUE.lock().pop();
-        if let Some(b) = b {
-            unsafe { ptr.write(b) };
-            return 1;
-        }
-        core::hint::spin_loop();
-    }
-}
-
-fn sys_exit(code: u64) -> u64 {
-    crate::serial_println!("[syscall] task {} exited with code {}", crate::task::current_slot(), code);
-    crate::task::exit_current();
-    // Планировщик больше не выберет эту задачу; тикаем hlt до конца таймсов.
-    loop {
-        x86_64::instructions::hlt();
-    }
+extern "C" fn syscall_dispatch(
+    nr: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    frame: *mut u64,
+) -> u64 {
+    crate::linux::dispatch(nr, a1, a2, a3, a4, frame)
 }

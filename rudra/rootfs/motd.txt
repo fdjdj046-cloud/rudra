@@ -1,3 +1,4 @@
-добро пожаловать в rudra v0.5.
-шелл работает в ring 3, команды — см. help.
-файлы живут в ramdisk: 256 KiB, плоское пространство имён.
+добро пожаловать в rudra v0.6.
+новое: Linux ABI (настоящие статические бинарники Linux),
+многопоточность (clone/CLONE_VM + futex), fork/execve/wait4,
+pipe, каталоги. попробуйте: ls, ps, run /bin/threads.elf.

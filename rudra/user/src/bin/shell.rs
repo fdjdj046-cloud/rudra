@@ -1,233 +1,379 @@
+//! Интерактивный шелл rudra (ring 3).
+//!
+//! Билтины: help, ls, cat, echo, pwd, cd, rm, mkdir, ps, uname, clear,
+//! run, exit. Всё остальное — execve: сначала как путь, потом /bin/<cmd>,
+//! потом /bin/<cmd>.elf, и финально fallback на busybox-апплет
+//! (execve /bin/busybox busybox <cmd> ...) — настоящая Linux-утилита.
+
 #![no_std]
 #![no_main]
 
-//! Интерактивный шелл rudra (ring 3).
-//!
-//! Команды:
-//!   ls [path]        — список файлов ramdisk'а
-//!   cat <path>       — напечатать файл
-//!   echo <text>      — напечатать текст
-//!   echo <text> > <path> — записать текст в файл
-//!   run <prog>       — запустить /bin/<prog>.elf
-//!   rm <path>        — удалить файл
-//!   uname            — информация о системе
-//!   pwd              — текущий каталог (всегда "/")
-//!   help             — эта справка
-//!   clear            — очистить экран
-//!   exit             — завершить шелл
+use rudra::{print, println};
 
-use core::panic::PanicInfo;
+const BB_PATH: &str = "/bin/busybox";
 
-fn read_line(buf: &mut [u8]) -> usize {
-    let mut len = 0;
-    while len < buf.len() {
-        let mut c = [0u8; 1];
-        if user::read(&mut c) == 0 {
-            user::r#yield();
-            continue;
+fn main() {
+    println!("rudra shell v0.6 (Linux ABI). 'help' — список команд.");
+    let motd_buf = &mut [0u8; 512];
+    let n = rudra::read_file("/motd.txt", motd_buf);
+    if n > 0 {
+        if let Ok(s) = core::str::from_utf8(&motd_buf[..n as usize]) {
+            print!("{}", s);
         }
-        let ch = c[0];
-        if ch == b'\n' {
-            user::write("\n");
-            break;
-        }
-        if ch == 0x08 || ch == 0x7f {
-            if len > 0 {
-                len -= 1;
-                user::write("\u{8} \u{8}");
-            }
-            continue;
-        }
-        buf[len] = ch;
-        len += 1;
-        user::write(core::str::from_utf8(&c[..1]).unwrap_or("?"));
     }
-    len
+    println!();
+
+    loop {
+        let line = rudra::readline("rudra:/$ ");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        run_command(line);
+    }
 }
 
-/// Разбить строку на токены по пробелам. Возвращает число токенов.
-fn tokenize<'a>(line: &'a [u8], tokens: &mut [&'a str]) -> usize {
-    let s = core::str::from_utf8(line).unwrap_or("");
+/// Разбить строку на слова (пробелы). Возвращает число слов.
+fn split<'a>(line: &'a str, words: &mut [&'a str]) -> usize {
     let mut n = 0;
-    for t in s.split(' ') {
-        let t = t.trim();
-        if t.is_empty() {
-            continue;
+    for w in line.split(' ').filter(|w| !w.is_empty()) {
+        if n >= words.len() {
+            break;
         }
-        if n < tokens.len() {
-            tokens[n] = t;
-            n += 1;
-        }
+        words[n] = w;
+        n += 1;
     }
     n
 }
 
-fn cmd_ls(arg: &str) {
-    let mut name = [0u8; 32];
-    let filter = arg.trim_start_matches('/');
-    let mut i: u64 = 0;
-    loop {
-        let n = user::list(i, &mut name);
-        if n <= 0 {
-            break;
-        }
-        let entry = core::str::from_utf8(&name[..n as usize]).unwrap_or("?");
-        if !filter.is_empty() && entry.trim_start_matches('/') != filter {
-            i += 1;
-            continue;
-        }
-        user::write(entry);
-        user::write("\n");
-        i += 1;
-    }
-}
-
-fn cmd_cat(path: &str) {
-    if path.is_empty() {
-        user::write("usage: cat <file>\n");
-        return;
-    }
-    let mut buf = [0u8; user::FS_BUF_SIZE];
-    let n = user::read_file(path, &mut buf);
-    if n < 0 {
-        user::write("cat: no such file: ");
-        user::write(path);
-        user::write("\n");
-        return;
-    }
-    user::write(core::str::from_utf8(&buf[..n as usize]).unwrap_or("<binary>"));
-    user::write("\n");
-}
-
-fn cmd_echo(tokens: &[&str], n: usize) {
-    // echo text... [> file]
-    let mut redirect: Option<&str> = None;
-    let mut text_end = n;
-    for i in 1..n {
-        if tokens[i] == ">" && i + 1 < n {
-            redirect = Some(tokens[i + 1]);
-            text_end = i;
-            break;
-        }
-    }
-    let mut text_buf = [0u8; 256];
-    let text = {
-        let mut s = heapless::Str::new(&mut text_buf);
-        for (k, t) in tokens[1..text_end].iter().enumerate() {
-            if k > 0 {
-                s.push(" ");
-            }
-            s.push(t);
-        }
-        s.into_str()
-    };
-    match redirect {
-        Some(path) => {
-            if user::write_file(path, text.as_bytes()) < 0 {
-                user::write("echo: write failed (disk full or bad name)\n");
-            }
-        }
-        None => {
-            user::write(text);
-            user::write("\n");
-        }
-    }
-}
-
-fn cmd_run(name: &str) {
-    if name.is_empty() {
-        user::write("usage: run <program>   (see: ls /bin)\n");
-        return;
-    }
-    let mut path_buf = [0u8; 40];
-    let path = {
-        let mut s = heapless::Str::new(&mut path_buf);
-        s.push("/bin/").push(name).push(".elf");
-        s.into_str()
-    };
-    if user::spawn_path(path) == u64::MAX {
-        user::write("run: program not found or no free slots\n");
-    }
-}
-
-fn execute(tokens: &[&str], n: usize) {
+fn run_command(line: &str) {
+    let mut words = [""; 16];
+    let n = split(line, &mut words);
     if n == 0 {
         return;
     }
-    match tokens[0] {
-        "help" => user::write(
-            "commands: ls cat echo run rm uname pwd help clear exit\n\
-             examples: ls\n\
-                       cat /motd.txt\n\
-                       echo hello > note.txt && cat note.txt\n\
-                       run fizzbuzz\n",
-        ),
-        "ls" => cmd_ls(if n > 1 { tokens[1] } else { "" }),
-        "cat" => cmd_cat(if n > 1 { tokens[1] } else { "" }),
-        "echo" => cmd_echo(tokens, n),
-        "run" => cmd_run(if n > 1 { tokens[1] } else { "" }),
-        "rm" => {
-            if n > 1 {
-                if !user::delete(tokens[1]) {
-                    user::write("rm: no such file\n");
-                }
-            } else {
-                user::write("usage: rm <file>\n");
+    let cmd = words[0];
+    let args = &words[1..n];
+
+    match cmd {
+        "help" => {
+            println!("Билтины: help ls cat echo pwd cd rm mkdir ps uname clear run exit");
+            println!("Любая другая команда — execve: /bin/<cmd>, /bin/<cmd>.elf,");
+            println!("затем busybox-апплет (ls, cat, echo, wc, true, yes...).");
+            println!("Примеры: ls / | run /bin/hello.elf | echo привет > x.txt | cat x.txt");
+        }
+        "exit" => {
+            println!("bye");
+            rudra::exit(0);
+        }
+        "clear" => {
+            print!("\x1b[2J\x1b[H"); // ANSI: ядро рисует по-своему, но serial чистим
+            for _ in 0..40 {
+                println!();
             }
         }
-        "uname" => user::write("rudra 0.5.0 x86_64 (hobby OS, rust nightly)\n"),
-        "pwd" => user::write("/\n"),
-        "clear" => user::write("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"),
-        "exit" => user::exit(0),
+        "pwd" => {
+            let mut buf = [0u8; 128];
+            let n = rudra::read_file("/dev/null", &mut buf);
+            let _ = (buf, n);
+            // getcwd через syscall 79
+            let mut cwd = [0u8; 128];
+            let len = unsafe {
+                rudra::syscall6(79, cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0)
+            };
+            if len > 0 {
+                println!("{}", core::str::from_utf8(&cwd[..(len - 1) as usize]).unwrap_or("/"));
+            } else {
+                println!("/");
+            }
+        }
+        "cd" => {
+            let dir = args.first().copied().unwrap_or("/");
+            let mut p = [0u8; 128];
+            let pb = dir.as_bytes();
+            if pb.len() >= p.len() {
+                println!("cd: слишком длинный путь");
+                return;
+            }
+            p[..pb.len()].copy_from_slice(pb);
+            p[pb.len()] = 0;
+            let r = unsafe { rudra::syscall6(80, p.as_ptr() as u64, 0, 0, 0, 0, 0) };
+            if r != 0 {
+                println!("cd: {}: нет такого каталога ({})", dir, r as i64);
+            }
+        }
+        "ls" => {
+            ls(args.first().copied().unwrap_or("."));
+        }
+        "cat" => {
+            if args.is_empty() {
+                println!("cat: нужен файл");
+                return;
+            }
+            cat(args[0]);
+        }
+        "echo" => {
+            echo(args);
+        }
+        "rm" => {
+            if args.is_empty() {
+                println!("rm: нужен файл");
+                return;
+            }
+            for f in args {
+                if !rudra::delete(f) {
+                    println!("rm: {}: нет такого файла", f);
+                }
+            }
+        }
+        "mkdir" => {
+            // Каталоги неявные — просто успех.
+            println!("ok (каталоги в rudra неявные)");
+        }
+        "ps" => {
+            unsafe { rudra::syscall6(rudra::SYS_DEBUG_TASKS, 0, 0, 0, 0, 0, 0) };
+        }
+        "uname" => {
+            let mut buf = [0u8; 6 * 65];
+            unsafe { rudra::syscall6(rudra::SYS_UNAME, buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0) };
+            let fields = [
+                core::str::from_utf8(&buf[0..65]).unwrap_or("?"),
+                core::str::from_utf8(&buf[65..130]).unwrap_or("?"),
+                core::str::from_utf8(&buf[130..195]).unwrap_or("?"),
+                core::str::from_utf8(&buf[195..260]).unwrap_or("?"),
+                core::str::from_utf8(&buf[260..325]).unwrap_or("?"),
+            ];
+            println!(
+                "{} {} {} {} {} x86_64",
+                fields[0], fields[1], fields[2], fields[3], fields[4]
+            );
+        }
+        "run" => {
+            if args.is_empty() {
+                println!("run: нужен путь");
+                return;
+            }
+            let path = args[0];
+            let code = rudra::run_and_wait(path, &[]);
+            println!("[exit {}]", code);
+        }
         _ => {
-            user::write("unknown command: ");
-            user::write(tokens[0]);
-            user::write(" (try 'help')\n");
+            // Внешняя команда: execve с fallback'ами.
+            external(cmd, args);
         }
     }
 }
 
-/// Крошечная строка поверх буфера (без alloc).
-mod heapless {
-    pub struct Str<'a> {
-        buf: &'a mut [u8],
-        len: usize,
+fn ls(path: &str) {
+    let fd = rudra::open(path, rudra::O_RDONLY | rudra::O_DIRECTORY);
+    if fd < 0 {
+        // Может, это файл?
+        let mut buf = [0u8; 64];
+        if rudra::read_file(path, &mut buf) >= 0 {
+            println!("{}", path);
+            return;
+        }
+        println!("ls: {}: нет такого каталога", path);
+        return;
     }
-    impl<'a> Str<'a> {
-        pub fn new(buf: &'a mut [u8]) -> Self {
-            Str { buf, len: 0 }
-        }
-        pub fn push(&mut self, s: &str) -> &mut Self {
-            let n = s.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-            self.len += n;
-            self
-        }
-        /// Отдать собранную строку с лайфтаймом буфера.
-        pub fn into_str(self) -> &'a str {
-            let len = self.len;
-            let buf = self.buf;
-            core::str::from_utf8(&buf[..len]).unwrap_or("")
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    user::write("rudra shell v0.5 (type 'help')\n");
-    let mut line = [0u8; 96];
-
+    let mut buf = [0u8; 4096];
     loop {
-        user::write("rudra> ");
-        let len = read_line(&mut line);
-        let mut tokens = [""; 12];
-        let n = tokenize(&line[..len], &mut tokens);
-        execute(&tokens, n);
+        let n = unsafe {
+            rudra::syscall6(rudra::SYS_GETDENTS64, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0)
+        };
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off < n as usize {
+            let p = unsafe { buf.as_ptr().add(off) };
+            let reclen = unsafe { (p.add(16) as *const u16).read() } as usize;
+            if reclen == 0 {
+                break;
+            }
+            let name_len = (0..64)
+                .find(|&i| unsafe { *p.add(19 + i) } == 0)
+                .unwrap_or(0);
+            let name = core::str::from_utf8(unsafe { core::slice::from_raw_parts(p.add(19), name_len) })
+                .unwrap_or("?");
+            let d_type = unsafe { *p.add(reclen - 1) };
+            if d_type == 4 {
+                println!("{}/", name);
+            } else {
+                println!("{}", name);
+            }
+            off += reclen;
+        }
+    }
+    rudra::close(fd as u64);
+}
+
+fn cat(path: &str) {
+    let fd = rudra::open(path, rudra::O_RDONLY);
+    if fd < 0 {
+        println!("cat: {}: нет такого файла", path);
+        return;
+    }
+    let mut buf = [0u8; 512];
+    loop {
+        let n = rudra::read(fd as u64, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        rudra::write_str(core::str::from_utf8(&buf[..n as usize]).unwrap_or("?"));
+    }
+    rudra::close(fd as u64);
+}
+
+/// echo [текст] [> файл]
+fn echo(args: &[&str]) {
+    let mut text_end = args.len();
+    let mut redirect: Option<&str> = None;
+    for (i, a) in args.iter().enumerate() {
+        if *a == ">" {
+            text_end = i;
+            redirect = args.get(i + 1).copied();
+            break;
+        }
+    }
+    let mut line = [0u8; 256];
+    let mut len = 0usize;
+    for (i, w) in args[..text_end].iter().enumerate() {
+        if i > 0 && len < line.len() - 1 {
+            line[len] = b' ';
+            len += 1;
+        }
+        let b = w.as_bytes();
+        let n = b.len().min(line.len() - 1 - len);
+        line[len..len + n].copy_from_slice(&b[..n]);
+        len += n;
+    }
+    line[len] = 0;
+    let text = core::str::from_utf8(&line[..len]).unwrap_or("");
+    match redirect {
+        Some(path) => {
+            rudra::write_file(path, text.as_bytes());
+        }
+        None => {
+            println!("{}", text);
+        }
     }
 }
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    user::write("shell panic\n");
-    user::exit(1)
+/// Внешняя команда: пробуем execve варианты в child-процессе.
+fn external(cmd: &str, args: &[&str]) {
+    let pid = rudra::fork();
+    if pid == 0 {
+        // Ребёнок: последовательные попытки execve.
+        // 1) как путь (если содержит '/')
+        if cmd.contains('/') {
+            let mut argv: [&str; 16] = [""; 16];
+            argv[0] = cmd;
+            for (i, a) in args.iter().take(14).enumerate() {
+                argv[i + 1] = a;
+            }
+            let r = rudra::execve(cmd, &argv[..args.len().min(14) + 1]);
+            if r != 0 && r != u64::MAX {
+                rudra::write_err("rudra: exec format error\n");
+            } else {
+                rudra::write_err("rudra: not found\n");
+            }
+            rudra::exit(127);
+        }
+        // 2) /bin/<cmd>, 3) /bin/<cmd>.elf, 4) /bin/busybox <cmd>
+        let mut pbuf = [0u8; 64];
+        let full: &'static str = {
+            let b = cmd.as_bytes();
+            let pre = b"/bin/";
+            if pre.len() + b.len() + 4 < pbuf.len() {
+                pbuf[..pre.len()].copy_from_slice(pre);
+                pbuf[pre.len()..pre.len() + b.len()].copy_from_slice(b);
+                pbuf[pre.len() + b.len()] = 0;
+                let full_len = pre.len() + b.len();
+                leak_str(core::str::from_utf8(&pbuf[..full_len]).unwrap_or(""))
+            } else {
+                rudra::write_err("rudra: имя слишком длинное\n");
+                rudra::exit(127);
+            }
+        };
+        let mut argv: [&str; 16] = [""; 16];
+        argv[0] = full;
+        for (i, a) in args.iter().take(14).enumerate() {
+            argv[i + 1] = a;
+        }
+        let r1 = rudra::execve(full, &argv[..args.len().min(14) + 1]);
+        if r1 == 0 {
+            rudra::exit(0); // не достигается
+        }
+        // .elf вариант
+        let elf: &'static str = {
+            let b = full.as_bytes();
+            if b.len() + 4 < pbuf.len() {
+                pbuf[..b.len()].copy_from_slice(b);
+                pbuf[b.len()..b.len() + 4].copy_from_slice(b".elf");
+                pbuf[b.len() + 4] = 0;
+                leak_str(core::str::from_utf8(&pbuf[..b.len() + 4]).unwrap_or(""))
+            } else {
+                ""
+            }
+        };
+        if !elf.is_empty() {
+            let mut argv2: [&str; 16] = [""; 16];
+            argv2[0] = elf;
+            for (i, a) in args.iter().take(14).enumerate() {
+                argv2[i + 1] = a;
+            }
+            let r2 = rudra::execve(elf, &argv2[..args.len().min(14) + 1]);
+            if r2 == 0 {
+                rudra::exit(0);
+            }
+        }
+        // busybox fallback
+        let mut argv3: [&str; 16] = [""; 16];
+        argv3[0] = BB_PATH;
+        argv3[1] = "busybox";
+        argv3[2] = cmd;
+        for (i, a) in args.iter().take(12).enumerate() {
+            argv3[i + 3] = a;
+        }
+        let r3 = rudra::execve(BB_PATH, &argv3[..args.len().min(12) + 3]);
+        if r3 != 0 {
+            let msg = if r3 == (-2i64) as u64 {
+                "rudra: command not found\n"
+            } else {
+                "rudra: busybox exec failed\n"
+            };
+            rudra::write_err(msg);
+        }
+        rudra::exit(127);
+    }
+    if pid == u64::MAX {
+        println!("fork failed");
+        return;
+    }
+    let (tid, _) = rudra::wait4(pid);
+    let _ = tid;
 }
+
+// Копия строки в статический буфер-пул (шелл без alloc).
+static mut LEAK_BUF: [u8; 1024] = [0u8; 1024];
+static mut LEAK_POS: usize = 0;
+
+fn leak_str(s: &str) -> &'static str {
+    unsafe {
+        let start = LEAK_POS;
+        let b = s.as_bytes();
+        if start + b.len() + 1 > LEAK_BUF.len() {
+            return "";
+        }
+        LEAK_BUF[start..start + b.len()].copy_from_slice(b);
+        LEAK_BUF[start + b.len()] = 0;
+        LEAK_POS = start + b.len() + 1;
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            LEAK_BUF.as_ptr().add(start),
+            b.len(),
+        ))
+    }
+}
+
+rudra::entry!(main);

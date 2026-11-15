@@ -13,6 +13,7 @@ pub mod fs;
 pub mod gdt;
 pub mod input;
 pub mod interrupts;
+pub mod linux;
 pub mod memory;
 pub mod serial;
 pub mod syscall;

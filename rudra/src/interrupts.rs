@@ -1,4 +1,5 @@
 use crate::{gdt, serial_println};
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::{self, Mutex};
@@ -8,6 +9,15 @@ use x86_64::structures::idt::{
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+
+/// Счётчик тиков PIT (инкрементируется в task::timer_switch).
+/// PIT на частоте по умолчанию: ~18.2 тиков/сек (55 мс на тик).
+pub static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Аптайм в миллисекундах (грубо, кратно 55 мс).
+pub fn uptime_ms() -> u64 {
+    TICKS.load(Ordering::Relaxed) * 55
+}
 
 /// Chained PICs, ремаппленные на векторы 32..=47 (чтобы не пересекаться с CPU exceptions).
 pub static PICS: Mutex<ChainedPics> =
@@ -76,6 +86,21 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     let accessed = x86_64::registers::control::Cr2::read();
+    // Fault из ring 3 — убиваем задачу, а не всю систему: таймер уведёт
+    // управление на другую задачу (см. task::exit_current).
+    if stack_frame.code_segment.0 & 0x3 == 3 {
+        serial_println!(
+            "[task {}] PAGE FAULT at {:?}, code {:?}, rip {:#x} — killing task",
+            crate::task::current_slot(),
+            accessed,
+            error_code,
+            stack_frame.instruction_pointer.as_u64(),
+        );
+        crate::task::exit_current();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("  accessed address (CR2): {:?}", accessed);
     serial_println!("  error code: {:?}", error_code);
@@ -121,6 +146,17 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    if stack_frame.code_segment.0 & 0x3 == 3 {
+        serial_println!(
+            "[task {}] GENERAL PROTECTION FAULT, code {:#x} — killing task",
+            crate::task::current_slot(),
+            error_code
+        );
+        crate::task::exit_current();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT, code {:#x}", error_code);
     serial_println!("  {:#?}", stack_frame);
     panic!("general protection fault, code {:#x}", error_code);
