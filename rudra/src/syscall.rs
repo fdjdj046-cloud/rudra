@@ -107,11 +107,17 @@ pub fn init() {
 }
 
 /// Диспетчер системных вызовов (вызывается из asm).
+///
+/// Номера: 1=write(ptr,len), 2=exit(code), 3=read(buf,len) — блокирующий,
+/// 4=yield, 5=spawn(program_id).
 #[no_mangle]
 extern "C" fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
         1 => sys_write(a1 as *const u8, a2 as usize),
         2 => sys_exit(a1),
+        3 => sys_read(a1 as *mut u8, a2 as usize),
+        4 => 0, // yield: PIT и так вытесняет; syscall для симметрии API
+        5 => crate::task::spawn(a1),
         _ => {
             crate::serial_println!("[syscall] unknown nr={} args={},{},{}", nr, a1, a2, a3);
             u64::MAX
@@ -123,18 +129,40 @@ fn sys_write(ptr: *const u8, len: usize) -> u64 {
     if ptr.is_null() || len == 0 {
         return 0;
     }
-    // Побайтовый вывод: и в serial, и на экран, без требований к UTF-8.
+    // Побайтовый вывод: serial и экран раздельно (иначе serial получит
+    // дубль, т.к. framebuffer::_print сам печатает в serial).
     let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
     for &b in slice {
         if b == b'\n' || (0x20..=0x7e).contains(&b) {
             crate::serial::_print(core::format_args!("{}", b as char));
-            crate::framebuffer::_print(core::format_args!("{}", b as char));
+            crate::framebuffer::_print_screen(core::format_args!("{}", b as char));
         }
     }
     len as u64
 }
 
+/// Блокирующее чтение одного байта из очереди клавиатуры.
+/// IF остаётся включённым (мы после sti в entry): таймер вытесняет задачу,
+/// клавиатура пополняет очередь.
+fn sys_read(ptr: *mut u8, len: usize) -> u64 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    loop {
+        let b = crate::input::INPUT_QUEUE.lock().pop();
+        if let Some(b) = b {
+            unsafe { ptr.write(b) };
+            return 1;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 fn sys_exit(code: u64) -> u64 {
-    crate::serial_println!("[syscall] task exited with code {}", code);
-    crate::hlt_loop()
+    crate::serial_println!("[syscall] task {} exited with code {}", crate::task::current_slot(), code);
+    crate::task::exit_current();
+    // Планировщик больше не выберет эту задачу; тикаем hlt до конца таймсов.
+    loop {
+        x86_64::instructions::hlt();
+    }
 }

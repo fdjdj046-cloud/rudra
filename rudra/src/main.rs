@@ -23,12 +23,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("rudra: early serial up");
     rudra::init(boot_info);
 
-    rudra::println!("rudra kernel v0.3.0");
+    rudra::println!("rudra kernel v0.4.0");
     rudra::println!("subsystems: gdt/idt, paging, heap, framebuffer: ok");
-    rudra::println!("features: syscall/sysret, userspace tasks, round-robin");
+    rudra::println!("features: syscall/sysret, spawn/exit, keyboard input, round-robin");
     serial_println!("rudra: serial output alive");
 
-    // Пользовательские задачи ring 3 + планировщик.
+    // Пользовательский шелл ring 3 + планировщик.
     rudra::task::init();
 
     rudra::println!("It did not crash!");

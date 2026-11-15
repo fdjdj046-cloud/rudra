@@ -1,4 +1,4 @@
-use crate::{gdt, serial_print, serial_println};
+use crate::{gdt, serial_println};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::{self, Mutex};
@@ -146,8 +146,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
         if let Some(key) = keyboard.process_keyevent(key_event) {
             match key {
-                DecodedKey::Unicode(c) => serial_print!("{}", c),
-                DecodedKey::RawKey(k) => serial_println!("\n[key: {:?}]", k),
+                // Символы уходят в очередь ввода — эхо делает user-программа
+                // (шелл). В serial больше не дублируем, чтобы не смешивать
+                // отладочный вывод с сессией шелла.
+                DecodedKey::Unicode(c) => {
+                    crate::input::INPUT_QUEUE.lock().push(c as u8);
+                }
+                DecodedKey::RawKey(_) => {}
             }
         }
     }

@@ -22,6 +22,13 @@ pub fn init(framebuffer: FrameBuffer) {
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     crate::serial::_print(args);
+    _print_screen(args);
+}
+
+/// Вывод только на экран (serial не трогаем) — для sys_write,
+/// который сам управляет serial-выводом.
+#[doc(hidden)]
+pub fn _print_screen(args: fmt::Arguments) {
     if let Some(writer) = WRITER.get() {
         writer.lock().write_fmt(args).ok();
     }

@@ -17,4 +17,3 @@ lazy_static = { version = "1.5", features = ["spin_no_std"] }
 embedded-graphics = "0.8"
 pic8259 = "0.10"
 pc-keyboard = "0.7"
-xmas-elf = { version = "0.8", default-features = false }

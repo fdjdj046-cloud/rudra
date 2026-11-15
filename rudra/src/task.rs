@@ -7,32 +7,112 @@
 //! Переключение контекста — в обработчике таймера (asm `timer_entry`):
 //! сохраняем все регистры на kernel-стеке текущей задачи, в Rust-коде
 //! (timer_switch) меняем CR3/TSS/syscall-стек, возвращаем rsp следующей
-//! задачи, asm восстанавливает регистры и делает iretq в userland.
+//! задачи, asm восстанавливает регистры и делает iretq. Завершённые задачи
+//! (Exited) планировщик пропускает; их слоты переиспользует spawn.
 
 use alloc::boxed::Box;
 use alloc::vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
     Size4KiB, Translate,
 };
 use x86_64::VirtAddr;
-use xmas_elf::program::Type;
-use xmas_elf::ElfFile;
 
 use crate::gdt;
 use crate::memory::{active_level_4_table, BootInfoFrameAllocator};
 use crate::{serial_println, syscall};
 
+/// Минимальный парсер ELF64: заголовок + программные заголовки типа LOAD.
+/// Руками вместо xmas-elf: меньше кода в ядре, ноль магии, ноль сюрпризов.
+struct LoadSeg {
+    offset: u64,
+    vaddr: u64,
+    file_size: u64,
+    mem_size: u64,
+}
+
+fn rd32(b: &[u8], off: usize) -> u64 {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as u64
+}
+
+fn rd64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+/// (entry_point, сегменты LOAD) или None, если файл не похож на ELF64.
+fn parse_elf64(elf: &[u8]) -> Option<(u64, Vec<LoadSeg>)> {
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
+        return None;
+    }
+    let entry = rd64(elf, 24);
+    let phoff = rd64(elf, 32) as usize;
+    let phentsize = rd16(elf, 54) as usize;
+    let phnum = rd16(elf, 56) as usize;
+    if phentsize < 56 {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for i in 0..phnum {
+        let base = phoff + i * phentsize;
+        if base + 56 > elf.len() {
+            break;
+        }
+        if rd32(elf, base) == 1 {
+            // PT_LOAD
+            segs.push(LoadSeg {
+                offset: rd64(elf, base + 8),
+                vaddr: rd64(elf, base + 16),
+                file_size: rd64(elf, base + 32),
+                mem_size: rd64(elf, base + 40),
+            });
+        }
+    }
+    Some((entry, segs))
+}
+
+fn rd16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
+}
+
 const USER_STACK_TOP: u64 = 0x80_0000;
 const USER_ARG_PAGE: u64 = 0x60_0000;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
-/// User-программа, собранная крейтом `user` (build.sh собирает её до ядра).
-static USER_PROGRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
+pub const MAX_TASKS: usize = 4;
+
+pub const PROG_SHELL: u64 = 0;
+pub const PROG_HELLO: u64 = 1;
+pub const PROG_COUNTER: u64 = 2;
+
+/// User-программы, собранные крейтом `user` (build.sh собирает их до ядра).
+static SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
+static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
+static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.elf"));
+
+fn elf_for(program: u64) -> Option<&'static [u8]> {
+    let elf = match program {
+        PROG_SHELL => SHELL_ELF,
+        PROG_HELLO => HELLO_ELF,
+        PROG_COUNTER => COUNTER_ELF,
+        _ => return None,
+    };
+    if elf.is_empty() {
+        None
+    } else {
+        Some(elf)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Runnable,
+    Exited,
+}
 
 pub struct Task {
     cr3: PhysFrame,
@@ -40,48 +120,97 @@ pub struct Task {
     kernel_rsp: u64,
     /// Вершина kernel-стека задачи: для TSS (прерывания из ring 3) и syscall.
     kstack_top: u64,
+    state: TaskState,
 }
 
-static TASKS: Mutex<[Option<Task>; 2]> = Mutex::new([None, None]);
+static TASKS: Mutex<[Option<Task>; MAX_TASKS]> = Mutex::new([None, None, None, None]);
 static TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Индекс текущей задачи; -1 = boot-контекст (ядро до первого переключения).
-static CURRENT: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
+static CURRENT: AtomicIsize = AtomicIsize::new(-1);
 /// Сохранённый rsp boot-контекста (возврата в него не предусмотрено).
 static BOOT_RSP: AtomicU64 = AtomicU64::new(0);
 static SCHED_INITED: AtomicBool = AtomicBool::new(false);
 
-/// Создать две задачи из user ELF (маркеры 'A'/'B') и включить планировщик.
+/// Инициализация: запускаем шелл в слоте 0 и включаем планировщик.
 pub fn init() {
-    if USER_PROGRAM.is_empty() {
-        serial_println!("[task] user.elf not found, scheduler disabled");
-        return;
-    }
-
-    // xmas-elf читает заголовки через ptr::read и требует выравнивания
-    // буфера (u64-поля), а include_bytes даёт align(1) — копируем в
-    // выровненный по 8 байт буфер.
-    let mut aligned: Box<[u64]> = vec![0u64; (USER_PROGRAM.len() + 7) / 8 + 1].into_boxed_slice();
-    let aligned_bytes = unsafe {
-        core::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, USER_PROGRAM.len())
+    let elf = match elf_for(PROG_SHELL) {
+        Some(e) => e,
+        None => {
+            serial_println!("[task] shell.elf not found, scheduler disabled");
+            return;
+        }
     };
-    aligned_bytes.copy_from_slice(USER_PROGRAM);
+    let ok = crate::memory::with_frame_allocator(|fa| build_task(elf, 0, fa)
+        .map(|t| {
+            TASKS.lock()[0] = Some(t);
+            TASK_COUNT.store(1, Ordering::Release);
+        })
+        .is_ok());
+    if ok {
+        SCHED_INITED.store(true, Ordering::Release);
+        serial_println!("[task] shell spawned, round-robin on PIT");
+    } else {
+        serial_println!("[task] failed to spawn shell");
+    }
+}
 
-    crate::memory::with_frame_allocator(|frame_allocator| {
-        for (i, marker) in [b'A', b'B'].iter().enumerate() {
-            let task = match build_task(aligned_bytes, *marker, frame_allocator) {
-                Ok(t) => t,
-                Err(e) => {
-                    serial_println!("[task] failed to build task {}: {:?}", i, e);
-                    return;
+/// Создать задачу из встроенной программы. Возвращает номер слота
+/// или u64::MAX, если свободных слотов нет.
+pub fn spawn(program: u64) -> u64 {
+    let elf = match elf_for(program) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    // TASKS и frame allocator берём с выключенными прерываниями:
+    // обе блокировки нужны одновременно, и таймер не должен вклиниться.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let slot = {
+            let tasks = TASKS.lock();
+            let slot = (0..MAX_TASKS).find(|&i| match &tasks[i] {
+                None => true,
+                Some(t) => t.state == TaskState::Exited,
+            });
+            match slot {
+                Some(s) => s,
+                None => return u64::MAX,
+            }
+        };
+        let built = crate::memory::with_frame_allocator(|fa| build_task(elf, slot as u8, fa));
+        match built {
+            Ok(t) => {
+                {
+                    let mut tasks = TASKS.lock();
+                    tasks[slot] = Some(t);
                 }
-            };
-            TASKS.lock()[i] = Some(task);
-            TASK_COUNT.store(i + 1, Ordering::Release);
+                let count = TASK_COUNT.load(Ordering::Acquire);
+                TASK_COUNT.store(count.max(slot + 1), Ordering::Release);
+                serial_println!("[task] spawned program {} in slot {}", program, slot);
+                slot as u64
+            }
+            Err(e) => {
+                serial_println!("[task] spawn failed: {:?}", e);
+                u64::MAX
+            }
+        }
+    })
+}
+
+/// Пометить текущую задачу завершённой. Планировщик больше в неё не вернётся.
+pub fn exit_current() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cur = CURRENT.load(Ordering::Relaxed);
+        if cur >= 0 {
+            let mut tasks = TASKS.lock();
+            if let Some(t) = tasks[cur as usize].as_mut() {
+                t.state = TaskState::Exited;
+            }
         }
     });
+}
 
-    SCHED_INITED.store(true, Ordering::Release);
-    serial_println!("[task] 2 user tasks ready, round-robin on PIT");
+/// Номер текущего слота (для отладки).
+pub fn current_slot() -> isize {
+    CURRENT.load(Ordering::Relaxed)
 }
 
 fn phys_offset() -> VirtAddr {
@@ -94,11 +223,18 @@ fn build_task(
     frame_allocator: &mut BootInfoFrameAllocator,
 ) -> Result<Task, MapToError<Size4KiB>> {
     let phys_offset = phys_offset();
-    let elf = ElfFile::new(elf_bytes).map_err(|_| MapToError::FrameAllocationFailed)?;
-    let entry = elf.header.pt2.entry_point();
+    let (entry, segments) = match parse_elf64(elf_bytes) {
+        Some(p) => p,
+        None => {
+            serial_println!("[task] bad ELF image");
+            return Err(MapToError::FrameAllocationFailed);
+        }
+    };
 
     // 1) Своя L4-таблица для задачи.
-    let l4_frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+    let l4_frame = frame_allocator
+        .allocate_frame()
+        .ok_or(MapToError::FrameAllocationFailed)?;
     let l4_virt = phys_offset + l4_frame.start_address().as_u64();
     unsafe { core::ptr::write_bytes(l4_virt.as_mut_ptr::<u8>(), 0, 4096) };
     let l4_table = unsafe { &mut *(l4_virt.as_mut_ptr::<PageTable>()) };
@@ -113,42 +249,41 @@ fn build_task(
     }
 
     let mut mapper = unsafe { OffsetPageTable::new(l4_table, phys_offset) };
-    let user_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let user_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     // 3) Маппим страницы ELF (сегменты могут делить страницы — сначала
     //    маппим все уникальные страницы, потом копируем данные).
-    let mut mapped_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    for ph in elf.program_iter() {
-        if ph.get_type() != Ok(Type::Load) || ph.mem_size() == 0 {
+    let mut mapped_pages: Vec<u64> = Vec::new();
+    for seg in &segments {
+        if seg.mem_size == 0 {
             continue;
         }
-        let seg_end = ph.virtual_addr() + ph.mem_size();
-        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(ph.virtual_addr()));
+        let seg_end = seg.vaddr + seg.mem_size;
+        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg.vaddr));
         let last_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_end - 1));
         for page in Page::range_inclusive(first_page, last_page) {
             let start = page.start_address().as_u64();
             if mapped_pages.contains(&start) {
                 continue;
             }
-            let frame =
-                frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
             let frame_virt = phys_offset + frame.start_address().as_u64();
             unsafe { core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096) };
             unsafe { mapper.map_to(page, frame, user_flags, frame_allocator)?.flush() };
             mapped_pages.push(start);
         }
     }
-    // Копируем данные сегментов в их страницы (через physmap найдём фрейм).
-    for ph in elf.program_iter() {
-        if ph.get_type() != Ok(Type::Load) || ph.file_size() == 0 {
+    // Копируем данные сегментов в их страницы (фрейм находим через translate).
+    for seg in &segments {
+        if seg.file_size == 0 {
             continue;
         }
-        let data: &[u8] = match ph {
-            xmas_elf::program::ProgramHeader::Ph64(h) => h.raw_data(&elf),
-            _ => continue,
-        };
-        let seg_end = ph.virtual_addr() + ph.mem_size();
-        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(ph.virtual_addr()));
+        let data = &elf_bytes[seg.offset as usize..(seg.offset + seg.file_size) as usize];
+        let seg_end = seg.vaddr + seg.mem_size;
+        let first_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg.vaddr));
         let last_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_end - 1));
         for page in Page::range_inclusive(first_page, last_page) {
             let page_start = page.start_address().as_u64();
@@ -156,26 +291,28 @@ fn build_task(
                 .translate_addr(page.start_address())
                 .ok_or(MapToError::FrameAllocationFailed)?;
             let frame_virt = phys_offset + frame_phys.as_u64();
-            let copy_start = ph.virtual_addr().max(page_start);
-            let copy_end = (ph.virtual_addr() + data.len() as u64).min(page_start + 4096);
+            let copy_start = seg.vaddr.max(page_start);
+            let copy_end = (seg.vaddr + data.len() as u64).min(page_start + 4096);
             if copy_start < copy_end {
-                let src = &data[(copy_start - ph.virtual_addr()) as usize
-                    ..(copy_end - ph.virtual_addr()) as usize];
+                let src = &data
+                    [(copy_start - seg.vaddr) as usize..(copy_end - seg.vaddr) as usize];
                 let dst = (frame_virt.as_u64() + (copy_start - page_start)) as *mut u8;
                 unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
             }
         }
     }
 
-    // 4) Страница аргумента (маркер задачи).
+    // 4) Страница аргумента (индекс слота; программы могут использовать).
     map_zeroed(
         &mut mapper,
         Page::containing_address(VirtAddr::new(USER_ARG_PAGE)),
         frame_allocator,
         user_flags,
     )?;
-    let arg_frame_virt = phys_offset + task_frame_addr(&mapper, USER_ARG_PAGE);
-    unsafe { core::ptr::write(arg_frame_virt.as_mut_ptr::<u8>(), marker) };
+    if let Some(arg_phys) = mapper.translate_addr(VirtAddr::new(USER_ARG_PAGE)) {
+        let arg_frame_virt = phys_offset + arg_phys.as_u64();
+        unsafe { core::ptr::write(arg_frame_virt.as_mut_ptr::<u8>(), marker) };
+    }
 
     // 5) User-стек: одна страница под USER_STACK_TOP.
     map_zeroed(
@@ -209,6 +346,7 @@ fn build_task(
         cr3: l4_frame,
         kernel_rsp: rsp,
         kstack_top,
+        state: TaskState::Runnable,
     })
 }
 
@@ -218,21 +356,13 @@ fn map_zeroed(
     frame_allocator: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
-    let frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+    let frame = frame_allocator
+        .allocate_frame()
+        .ok_or(MapToError::FrameAllocationFailed)?;
     let frame_virt = phys_offset() + frame.start_address().as_u64();
     unsafe { core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096) };
     unsafe { mapper.map_to(page, frame, flags, frame_allocator)?.flush() };
     Ok(())
-}
-
-/// Физический адрес фрейма, замапленного на user-адрес (через walk).
-fn task_frame_addr(mapper: &OffsetPageTable, addr: u64) -> u64 {
-    // USER_ARG_PAGE замаплен только что; читаем адрес через page table walk.
-    // Упрощённо: переводим через OffsetPageTable::translate_addr.
-    mapper
-        .translate_addr(VirtAddr::new(addr))
-        .map(|p| p.as_u64())
-        .unwrap_or(0)
 }
 
 /// Переключение контекста из обработчика таймера (вызывается из asm).
@@ -254,12 +384,32 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
     }
 
     let prev = CURRENT.load(Ordering::Relaxed);
-    let next = if prev < 0 {
-        0
-    } else {
-        (prev as usize + 1) % count
+
+    let next = {
+        let tasks = TASKS.lock();
+        // Ищем следующую Runnable задачу, пропуская Exited и пустые слоты.
+        let mut found = None;
+        for k in 1..=count {
+            let i = if prev < 0 {
+                (k - 1) % count
+            } else {
+                (prev as usize + k) % count
+            };
+            if matches!(
+                tasks[i].as_ref().map(|t| t.state),
+                Some(TaskState::Runnable)
+            ) {
+                found = Some(i);
+                break;
+            }
+        }
+        found
     };
-    CURRENT.store(next as isize, Ordering::Relaxed);
+
+    let next = match next {
+        Some(n) => n,
+        None => return current_rsp, // некому переключаться
+    };
 
     let (next_rsp, next_kstack_top, next_cr3);
     {
@@ -271,11 +421,13 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
         } else {
             BOOT_RSP.store(current_rsp, Ordering::Relaxed);
         }
-        let task = tasks[next].as_ref().expect("task disappeared");
+        let task = tasks[next].as_ref().expect("runnable task disappeared");
         next_rsp = task.kernel_rsp;
         next_kstack_top = task.kstack_top;
         next_cr3 = task.cr3;
     }
+
+    CURRENT.store(next as isize, Ordering::Relaxed);
 
     unsafe { Cr3::write(next_cr3, Cr3Flags::empty()) };
     gdt::set_kernel_stack(VirtAddr::new(next_kstack_top));
@@ -283,8 +435,6 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
 
     next_rsp
 }
-
-use x86_64::registers::control::Cr3Flags;
 
 core::arch::global_asm!(r#"
     .text
