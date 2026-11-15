@@ -13,5 +13,5 @@ cargo build -p rudra --target x86_64-unknown-none
 
 echo "== creating disk images"
 (cd builder && cargo run --release)
-python scripts/mk_ext2.py target/images/data.img
-echo "images: target/images/rudra-bios.img, target/images/rudra-uefi.img, target/images/data.img"
+python scripts/mk_ext2.py target/images/rudra-bios.img target/images/rudra-1.0.0.img
+echo "images: target/images/rudra-bios.img, target/images/rudra-uefi.img, target/images/rudra-1.0.0.img"

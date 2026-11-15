@@ -177,26 +177,33 @@ pub fn present() -> bool {
 }
 
 /// Прочитать `buf.len()` байт с сектора `lba`. Длина кратна 512 и не больше DMA-страницы.
+///
+/// Прерывания выключены на всё время: `DEV` — обычный spinlock, таймер
+/// не должен вытеснить задачу, которая его держит.
 pub fn read_sectors(lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    check_len(lba, buf.len())?;
-    let mut guard = DEV.lock();
-    let dev = guard.as_mut().ok_or("no dev")?;
-    dev.request(lba, buf.len(), false)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(dev.data as *const u8, buf.as_mut_ptr(), buf.len());
-    }
-    Ok(())
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        check_len(lba, buf.len())?;
+        let mut guard = DEV.lock();
+        let dev = guard.as_mut().ok_or("no dev")?;
+        dev.request(lba, buf.len(), false)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(dev.data as *const u8, buf.as_mut_ptr(), buf.len());
+        }
+        Ok(())
+    })
 }
 
 /// Записать `buf.len()` байт с сектора `lba`.
 pub fn write_sectors(lba: u64, buf: &[u8]) -> Result<(), &'static str> {
-    check_len(lba, buf.len())?;
-    let mut guard = DEV.lock();
-    let dev = guard.as_mut().ok_or("no dev")?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), dev.data as *mut u8, buf.len());
-    }
-    dev.request(lba, buf.len(), true)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        check_len(lba, buf.len())?;
+        let mut guard = DEV.lock();
+        let dev = guard.as_mut().ok_or("no dev")?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), dev.data as *mut u8, buf.len());
+        }
+        dev.request(lba, buf.len(), true)
+    })
 }
 
 fn check_len(lba: u64, len: usize) -> Result<(), &'static str> {

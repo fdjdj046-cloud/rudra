@@ -25,48 +25,12 @@ pub fn sector_count() -> u64 {
 pub fn init() {
     if crate::virtio_blk::init().is_err() {
         crate::serial_println!("[virtio-blk] no device");
+        crate::serial_println!("[root] recovery ramdisk");
         return;
     }
-    if let Err(e) = read_lba0() {
-        crate::serial_println!("[virtio-blk] LBA0 failed ({:?})", e);
-        return;
-    }
-    match self_test() {
-        Ok(()) => crate::serial_println!("[block] write/read LBA 200: ok"),
-        Err(e) => crate::serial_println!("[block] write/read LBA 200 failed ({:?})", e),
-    }
-    crate::ext2::probe();
-}
-
-fn read_lba0() -> Result<(), BlockError> {
-    let mut sec = [0u8; SECTOR];
-    read_blocks(0, &mut sec)?;
-    if &sec[..10] == b"RUDRA-DISK" {
-        crate::serial_println!("[virtio-blk] LBA0: RUDRA-DISK");
-    } else {
-        crate::serial_println!(
-            "[virtio-blk] LBA0 {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
-            sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]
-        );
-    }
-    Ok(())
-}
-
-/// Записать сектор далеко за ext2-томом и прочитать обратно.
-fn self_test() -> Result<(), BlockError> {
-    if sector_count() <= 200 {
-        return Err(BlockError::Range);
-    }
-    let mut src = [0u8; SECTOR];
-    src[..8].copy_from_slice(b"BLKWRITE");
-    src[8] = 0xA5;
-    write_blocks(200, &src)?;
-    let mut dst = [0u8; SECTOR];
-    read_blocks(200, &mut dst)?;
-    if dst[..9] != src[..9] {
-        return Err(BlockError::Io);
-    }
-    Ok(())
+    // Не пишем в LBA 0.. : на общем образе там загрузчик.
+    // Проверка записи — внутри свободного блока ext2.
+    crate::ext2::mount();
 }
 
 pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {

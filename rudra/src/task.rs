@@ -346,8 +346,8 @@ static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.el
 static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"));
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
 
-/// Инициализация: кладём программы в /bin ramdisk'а, запускаем шелл оттуда
-/// и включаем планировщик.
+/// Инициализация: программы уже лежат в ext2-образе. Если файла нет
+/// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
     const BINS: [(&str, &[u8]); 5] = [
         ("/bin/shell.elf", SHELL_ELF),
@@ -357,7 +357,11 @@ pub fn init() {
         ("/bin/threads.elf", THREADS_ELF),
     ];
     for (name, elf) in BINS {
-        if !elf.is_empty() {
+        if elf.is_empty() {
+            continue;
+        }
+        // На ext2 бинарники уже в образе. Перезапись только если размер другой.
+        if crate::fs::size_of(name) != elf.len() as isize {
             crate::fs::write_path(name.as_bytes(), elf);
         }
     }

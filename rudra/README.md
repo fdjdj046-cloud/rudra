@@ -30,23 +30,10 @@
 
 Шина PCI 0 читается (`pci.rs`): в QEMU видны мост i440FX, PIIX IDE, VGA и e1000.
 
-## Диск: virtio-blk и ext2 только на чтение
+## 1.0.0: ext2 read-write — это корень
 
-Проверено в QEMU с `-device virtio-blk-pci,drive=vd0,disable-modern=on` и образом `target/images/data.img` (1 МиБ, `scripts/mk_ext2.py`):
+Research OS. Не ставьте образ на единственный диск с данными. Контракт, whitelist и `ENOSYS` — в [RELEASE_NOTES.md](../RELEASE_NOTES.md).
 
-```
-[pci] 00:04.0 1af4:1001 class 010000
-[virtio-blk] io 0xc000 queue 256 capacity 2048 host-features 0x71006ed4 guest-features 0x0 irq 11
-[virtio-blk] LBA0: RUDRA-DISK
-[block] write/read LBA 200: ok
-[ext2] magic ok block 1024 inode-table 5
-[ext2] /hello.txt
-[ext2] /readme.txt
-[ext2] /hello.txt: hello from ext2
-```
+Релизный файл — `target/images/rudra-1.0.0.img`, raw, не ISO. 32 МиБ: загрузчик в первых 16 МиБ, ext2 сразу после. QEMU грузит его одним virtio-blk (`disable-modern=on`, `bootindex=0`). Проверено на копии: запись `/keep.txt`, reboot, чтение того же текста; busybox `echo`/`cat`/`ls`/`wc`/`true`/`rmdir` и `hello.elf`/`threads.elf` выходят с кодом 0. Юнит-тесты без диска по-прежнему печатают `[virtio-blk] no device`, `[root] recovery ramdisk` и проходят (код выхода QEMU 33).
 
-Дальше приходит приглашение `rudra:/$`.
-
-Корень шелла — по-прежнему RFS2 в памяти. ext2 не смонтирован в шелл: это второй том, ядро читает его один раз при старте. Гостевые features оставлены 0: базовый `VIRTIO_BLK_T_IN` / `T_OUT` от флага не зависит. Очередь одна, запрос один за раз. IRQ virtio (в этом прогоне 11) замаскирован, завершение — опрос used-кольца.
-
-Без второго диска serial пишет `[virtio-blk] no device`. Юнит-тесты ядра на образе без virtio проходят (`isa-debug-exit`, код 33). `scripts/run-bios.sh` подключает `data.img`, только если файл уже собран. SMP ещё впереди.
+Гостевые features virtio оставлены 0. Очередь одна. IRQ virtio маскируется, завершение — опрос used-кольца. Запись сектора проверяется внутри свободного блока ext2, не в LBA загрузчика.

@@ -2,15 +2,16 @@
 //! (glibc/musl) без перекомпиляции.
 //!
 //! Реализовано подмножество syscall'ов x86_64: файловый ввод-вывод поверх
-//! RFS2 (open/openat/read/write/close/lseek/dup2/fcntl), каталоги
-//! (getdents64/stat/newfstatat/statx/chdir/getcwd), память (brk/mmap/
-//! munmap/mprotect), процессы (clone/fork/execve/wait4/exit) и pthreads
-//! (clone с CLONE_VM, futex, arch_prctl, set_tid_address/robust_list),
-//! pipe/pipe2, poll, время, uname, getrandom и мелочь.
+//! ext2 (если смонтирован) или RFS2 (open/openat/read/write/close/lseek/
+//! dup2/fcntl), каталоги (getdents64/stat/newfstatat/statx/mkdir/rmdir/
+//! unlink/rename/chdir/getcwd), память (brk/mmap/munmap/mprotect), процессы
+//! (clone/fork/execve/wait4/exit) и pthreads (clone с CLONE_VM, futex,
+//! arch_prctl, set_tid_address/robust_list), pipe/pipe2, poll, время,
+//! uname, reboot, getrandom и мелочь.
 //!
-//! Не поддержано: сокеты, сигналы, файловые маппинги (mmap файла →
-//! ENODEV), настоящие блокировки (futex WAIT — spin с hlt; SMP-семантика
-//! не гарантируется, но для 1 CPU корректно), unlink-семантика POSIX.
+//! Не поддержано: сокеты, доставка сигналов, файловые маппинги (mmap файла →
+//! ENODEV), настоящие блокировки (futex WAIT — spin с hlt; SMP нет).
+//! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -280,6 +281,7 @@ fn fs_err(e: crate::fs::FsError) -> u64 {
         NoSpc => ENOSPC,
         Inval => EINVAL,
         Perm => EPERM,
+        Io => EIO,
     }
 }
 
@@ -329,14 +331,11 @@ fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) {
 }
 
 fn stat_of(path: &str) -> Option<(u64, u32, u64)> {
-    let f = crate::fs::fs_lock();
-    if f.is_dir(path) {
-        Some((0, S_IFDIR | 0o755, 2))
-    } else if f.exists(path) {
-        let sz = f.size_of(path).max(0) as u64;
-        // Симлинки хранятся как файлы с контентом-целью — режим отдаём
-        // по имени (readlink читает как обычный файл).
-        Some((sz, S_IFREG | 0o644, 1))
+    if crate::fs::is_dir(path) {
+        Some((0, S_IFDIR | 0o755, crate::fs::nlink_of(path).max(2)))
+    } else if crate::fs::exists(path) {
+        let sz = crate::fs::size_of(path).max(0) as u64;
+        Some((sz, S_IFREG | 0o644, crate::fs::nlink_of(path).max(1)))
     } else {
         None
     }
@@ -424,6 +423,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         61 => sys_wait4(a1, a2, a3),
         62 => 0, // kill: сигналов нет, притворяемся успехом
         63 => sys_uname(a1),
+        169 => sys_reboot(a1, a2, a3),
         72 => sys_fcntl(a1, a2, a3),
         73 | 74 | 75 => 0, // flock / fsync / fdatasync
         76 => {
@@ -465,7 +465,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             // chdir
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            if crate::fs::fs_lock().is_dir(&canon) {
+            if crate::fs::is_dir(&canon) {
                 task::with_current_task(|t| t.cwd = canon);
                 0
             } else if stat_of(&canon).is_some() {
@@ -481,7 +481,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let (Some(o), Some(n)) = (task_resolve(&old), task_resolve(&new)) else {
                 return ENAMETOOLONG;
             };
-            match crate::fs::fs_lock().rename(&o, &n) {
+            match crate::fs::rename(&o, &n) {
                 Ok(()) => 0,
                 Err(e) => fs_err(e),
             }
@@ -490,7 +490,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             // mkdir
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            match crate::fs::fs_lock().mkdir(&canon) {
+            match crate::fs::mkdir(&canon) {
                 Ok(()) => 0,
                 Err(e) => fs_err(e),
             }
@@ -499,7 +499,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             // rmdir
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            match crate::fs::fs_lock().rmdir(&canon) {
+            match crate::fs::rmdir(&canon) {
                 Ok(()) => 0,
                 Err(e) => fs_err(e),
             }
@@ -515,7 +515,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let (Some(o), Some(n)) = (task_resolve(&old), task_resolve(&new)) else {
                 return ENAMETOOLONG;
             };
-            if crate::fs::fs_lock().is_dir(&o) {
+            if crate::fs::is_dir(&o) {
                 return EPERM;
             }
             match crate::fs::read_canon(&o) {
@@ -528,7 +528,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             // unlink
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            match crate::fs::fs_lock().unlink(&canon) {
+            match crate::fs::unlink(&canon) {
                 Ok(()) => 0,
                 Err(e) => fs_err(e),
             }
@@ -742,7 +742,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
                         n
                     }
                 } else {
-                    crate::fs::fs_lock().read_at(&name, pos, &mut tmp).max(0) as usize
+                    crate::fs::read_at(&name, pos, &mut tmp).max(0) as usize
                 };
                 if n == 0 {
                     break;
@@ -899,10 +899,8 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
 
     let accmode = flags & O_ACCMODE;
     let want_dir = flags & O_DIRECTORY != 0;
-    let f = crate::fs::fs_lock();
-    let is_dir = f.is_dir(&canon);
-    let exists = f.exists(&canon);
-    drop(f);
+    let is_dir = crate::fs::is_dir(&canon);
+    let exists = crate::fs::exists(&canon);
 
     if is_dir {
         if want_dir || accmode == 0 {
@@ -918,7 +916,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
         if flags & O_CREAT == 0 {
             return ENOENT;
         }
-        if let Err(e) = crate::fs::fs_lock().parent_ok(&canon) {
+        if let Err(e) = crate::fs::parent_ok(&canon) {
             return fs_err(e);
         }
         let mut slot = Some(Fd::File {
@@ -955,7 +953,7 @@ fn sys_fstat(fd: u64, buf: u64) -> u64 {
         Fd::File { name, dirty, .. } => {
             let size = match dirty {
                 Some(d) => d.len() as u64,
-                None => crate::fs::fs_lock().size_of(name).max(0) as u64,
+                None => crate::fs::size_of(name).max(0) as u64,
             };
             Some((size, S_IFREG | 0o644, 1))
         }        Fd::Dir { .. } => Some((0, S_IFDIR | 0o755, 2)),
@@ -1079,7 +1077,7 @@ fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
         Fd::File { name, offset: cur, dirty, .. } => {
             let size = match dirty {
                 Some(d) => d.len() as i64,
-                None => crate::fs::fs_lock().size_of(name).max(0) as i64,
+                None => crate::fs::size_of(name).max(0) as i64,
             };
             let base = match whence {
                 0 => 0,               // SEEK_SET
@@ -1146,7 +1144,7 @@ fn sys_pread_full(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
                 }
             } else {
                 let mut tmp = alloc::vec![0u8; len as usize];
-                let n = crate::fs::fs_lock().read_at(&name, pos, &mut tmp).max(0) as usize;
+                let n = crate::fs::read_at(&name, pos, &mut tmp).max(0) as usize;
                 unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n) };
                 n
             };
@@ -1278,7 +1276,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
     let r = with_fd(fd, |f| match f {
         Fd::Dir { prefix, idx } => {
-            let names = crate::fs::fs_lock().list_dir(prefix);
+            let names = crate::fs::list_dir(prefix);
             let is_root = prefix == "/";
             let mut written = 0u64;
             let mut i = *idx;
@@ -1296,7 +1294,7 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
                 } else {
                     format!("{}/{}", prefix, name)
                 };
-                let d_type = if crate::fs::fs_lock().is_dir(&full) { 4u8 } else { 8u8 }; // DT_DIR / DT_REG
+                let d_type = if crate::fs::is_dir(&full) { 4u8 } else { 8u8 }; // DT_DIR / DT_REG
                 let p = unsafe { (buf as *mut u8).add(written as usize) };
                 unsafe {
                     (p as *mut u64).write_unaligned(fake_ino(&full));
@@ -1436,11 +1434,51 @@ fn sys_select(nfds: u64, readfds: u64, _writefds: u64, _exceptfds: u64, timeout:
     }
 }
 
+fn sys_reboot(magic1: u64, magic2: u64, cmd: u64) -> u64 {
+    const MAGIC1: u64 = 0xfee1dead;
+    const MAGIC2: u64 = 672274793;
+    const RESTART: u64 = 0x01234567;
+    const HALT: u64 = 0xCDEF0123;
+    const POWER_OFF: u64 = 0x4321FEDC;
+    const RESTART2: u64 = 0xA1B2C3D4;
+    if magic1 != MAGIC1 || magic2 != MAGIC2 {
+        return EINVAL;
+    }
+    crate::ext2::sync();
+    crate::serial_println!("[reboot] cmd {:#x}", cmd);
+    unsafe {
+        match cmd {
+            POWER_OFF => {
+                let mut port = x86_64::instructions::port::Port::<u16>::new(0x604);
+                port.write(0x2000);
+            }
+            HALT => {
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+            RESTART | RESTART2 => {
+                let mut status = x86_64::instructions::port::Port::<u8>::new(0x64);
+                for _ in 0..100_000 {
+                    if status.read() & 0x02 == 0 {
+                        break;
+                    }
+                }
+                status.write(0xFE);
+            }
+            _ => return EINVAL,
+        }
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 fn sys_uname(buf: u64) -> u64 {
     if buf == 0 {
         return EFAULT;
     }
-    let fields = ["rudra", "rudra", "0.6.0", "#1 rudra (rudra-dev)", "x86_64", "(none)"];
+    let fields = ["rudra", "rudra", "1.0.0", "#1 rudra 1.0.0", "x86_64", "(none)"];
     unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 6 * 65) };
     for (i, f) in fields.iter().enumerate() {
         unsafe {

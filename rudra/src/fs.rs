@@ -22,6 +22,7 @@ use spin::{Mutex, Once};
 const MAGIC: u32 = 0x3253_4652; // "RFS2"
 const MAX_FILES: usize = 192;
 const NAME_LEN: usize = 64;
+const PATH_MAX: usize = 256;
 const ENTRY_SIZE: usize = 72; // name[64] + offset u32 + size u32
 const TABLE_OFF: usize = 12; // magic + num_files + data_used
 const DATA_OFF: usize = 16 * 1024;
@@ -39,6 +40,7 @@ pub enum FsError {
     NoSpc,
     Inval,
     Perm,
+    Io,
 }
 
 /// Базовый образ ramdisk, собранный pack_rfs.py из rootfs при сборке ядра.
@@ -445,7 +447,7 @@ impl RamFs {
 
 /// Привести путь к каноническому виду "/a/b" (убирает ".", "..", "//").
 /// Возвращает None, если результат не влезает в NAME_LEN.
-fn canon(path: &str, buf: &mut [u8; NAME_LEN]) -> Option<usize> {
+fn canon(path: &str, buf: &mut [u8; PATH_MAX]) -> Option<usize> {
     let p = path.trim_end_matches('\0').trim_matches(' ');
     let mut comps: Vec<&str> = Vec::new();
     for part in p.split('/') {
@@ -467,11 +469,105 @@ fn canon(path: &str, buf: &mut [u8; NAME_LEN]) -> Option<usize> {
         }
         s
     };
-    if full.len() >= NAME_LEN {
+    if full.len() >= PATH_MAX {
         return None;
     }
     buf[..full.len()].copy_from_slice(full.as_bytes());
     Some(full.len())
+}
+
+fn ext2_on() -> bool {
+    crate::ext2::mounted()
+}
+
+pub fn is_dir(name: &str) -> bool {
+    if ext2_on() {
+        crate::ext2::is_dir(name)
+    } else {
+        fs().is_dir(name)
+    }
+}
+
+pub fn exists(name: &str) -> bool {
+    if ext2_on() {
+        crate::ext2::exists(name)
+    } else {
+        fs().exists(name)
+    }
+}
+
+pub fn size_of(name: &str) -> isize {
+    if ext2_on() {
+        crate::ext2::size_of(name)
+    } else {
+        fs().size_of(name)
+    }
+}
+
+pub fn nlink_of(name: &str) -> u64 {
+    if ext2_on() {
+        crate::ext2::nlink_of(name)
+    } else if fs().is_dir(name) {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
+    if ext2_on() {
+        crate::ext2::read_at(name, offset, buf)
+    } else {
+        fs().read_at(name, offset, buf)
+    }
+}
+
+pub fn list_dir(name: &str) -> Vec<String> {
+    if ext2_on() {
+        crate::ext2::list_dir(name)
+    } else {
+        fs().list_dir(name)
+    }
+}
+
+pub fn parent_ok(name: &str) -> Result<(), FsError> {
+    if ext2_on() {
+        crate::ext2::parent_ok(name)
+    } else {
+        fs().parent_ok(name)
+    }
+}
+
+pub fn mkdir(name: &str) -> Result<(), FsError> {
+    if ext2_on() {
+        crate::ext2::mkdir(name)
+    } else {
+        fs().mkdir(name)
+    }
+}
+
+pub fn rmdir(name: &str) -> Result<(), FsError> {
+    if ext2_on() {
+        crate::ext2::rmdir(name)
+    } else {
+        fs().rmdir(name)
+    }
+}
+
+pub fn unlink(name: &str) -> Result<(), FsError> {
+    if ext2_on() {
+        crate::ext2::unlink(name)
+    } else {
+        fs().unlink(name)
+    }
+}
+
+pub fn rename(old: &str, new: &str) -> Result<(), FsError> {
+    if ext2_on() {
+        crate::ext2::rename(old, new)
+    } else {
+        fs().rename(old, new)
+    }
 }
 
 /// Разрешить путь относительно cwd в каноническое имя FS.
@@ -488,7 +584,7 @@ pub fn resolve(cwd: &str, path: &str) -> Option<String> {
         s.push_str(path);
         s
     };
-    let mut buf = [0u8; NAME_LEN];
+    let mut buf = [0u8; PATH_MAX];
     match canon(&joined, &mut buf) {
         Some(len) => Some(String::from(
             core::str::from_utf8(&buf[..len]).unwrap_or("/"),
@@ -502,7 +598,7 @@ fn with_name<R>(path: &[u8], f: impl FnOnce(&str) -> R, default: R) -> R {
         Ok(s) => s,
         Err(_) => return default,
     };
-    let mut buf = [0u8; NAME_LEN];
+    let mut buf = [0u8; PATH_MAX];
     match canon(s, &mut buf) {
         Some(len) => f(core::str::from_utf8(&buf[..len]).unwrap_or("")),
         None => default,
@@ -511,15 +607,15 @@ fn with_name<R>(path: &[u8], f: impl FnOnce(&str) -> R, default: R) -> R {
 
 /// Прочитать файл (путь из user/kernel памяти, игнорирует cwd).
 pub fn read_path(path: &[u8], buf: &mut [u8]) -> isize {
-    with_name(path, |n| fs().read(n, buf), -1)
+    with_name(path, |n| read_at(n, 0, buf), -1)
 }
 
 pub fn write_path(path: &[u8], data: &[u8]) -> isize {
-    with_name(path, |n| fs().write(n, data), -1)
+    with_name(path, |n| write_canon(n, data), -1)
 }
 
 pub fn delete_path(path: &[u8]) -> bool {
-    with_name(path, |n| fs().delete(n), false)
+    with_name(path, |n| unlink(n).is_ok(), false)
 }
 
 pub fn list_index(index: usize, buf: &mut [u8]) -> isize {
@@ -528,7 +624,7 @@ pub fn list_index(index: usize, buf: &mut [u8]) -> isize {
 
 /// Размер файла по пути (для execve/spawn).
 pub fn size_path(path: &[u8]) -> isize {
-    with_name(path, |n| fs().size_of(n), -1)
+    with_name(path, |n| size_of(n), -1)
 }
 
 pub fn read_file_to_vec(path: &[u8]) -> Option<Vec<u8>> {
@@ -545,6 +641,9 @@ pub fn read_file_to_vec(path: &[u8]) -> Option<Vec<u8>> {
 
 /// Прочитать файл по каноническому имени в Vec (для execve).
 pub fn read_canon(name: &str) -> Option<Vec<u8>> {
+    if ext2_on() {
+        return crate::ext2::read_file(name);
+    }
     let size = fs().size_of(name);
     if size <= 0 {
         return None;
@@ -558,12 +657,16 @@ pub fn read_canon(name: &str) -> Option<Vec<u8>> {
 
 /// Удалить файл по каноническому имени.
 pub fn delete_canon(name: &str) -> bool {
-    fs().delete(name)
+    unlink(name).is_ok()
 }
 
 /// Создать/перезаписать файл по каноническому имени.
 pub fn write_canon(name: &str, data: &[u8]) -> isize {
-    fs().write(name, data)
+    if ext2_on() {
+        crate::ext2::write_file(name, data)
+    } else {
+        fs().write(name, data)
+    }
 }
 
 #[cfg(test)]

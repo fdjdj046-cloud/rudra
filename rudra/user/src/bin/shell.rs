@@ -1,7 +1,7 @@
 //! Интерактивный шелл rudra (ring 3).
 //!
 //! Билтины: help, ls, cat, echo, pwd, cd, rm, mkdir, ps, uname, clear,
-//! run, exit. Всё остальное — execve: сначала как путь, потом /bin/<cmd>,
+//! run, reboot, exit. Всё остальное — execve: сначала как путь, потом /bin/<cmd>,
 //! потом /bin/<cmd>.elf, и финально fallback на busybox-апплет
 //! (execve /bin/busybox busybox <cmd> ...) — настоящая Linux-утилита.
 
@@ -13,7 +13,7 @@ use rudra::{print, println};
 const BB_PATH: &str = "/bin/busybox";
 
 fn main() {
-    println!("rudra shell v0.6 (Linux ABI). 'help' — список команд.");
+    println!("rudra shell v1.0.0 (Linux ABI). 'help' — список команд.");
     let motd_buf = &mut [0u8; 512];
     let n = rudra::read_file("/motd.txt", motd_buf);
     if n > 0 {
@@ -57,7 +57,7 @@ fn run_command(line: &str) {
 
     match cmd {
         "help" => {
-            println!("Билтины: help ls cat echo pwd cd rm mkdir ps uname clear run exit");
+            println!("Билтины: help ls cat echo pwd cd rm mkdir ps uname clear run reboot exit");
             println!("Любая другая команда — execve: /bin/<cmd>, /bin/<cmd>.elf,");
             println!("затем busybox-апплет (ls, cat, echo, wc, true, yes...).");
             println!("Примеры: ls / | run /bin/hello.elf | echo привет > x.txt | cat x.txt");
@@ -165,6 +165,13 @@ fn run_command(line: &str) {
             let code = rudra::run_and_wait(path, &[]);
             println!("[exit {}]", code);
         }
+        "reboot" => {
+            println!("reboot");
+            unsafe {
+                rudra::syscall6(169, 0xfee1dead, 672274793, 0x01234567, 0, 0, 0);
+            }
+            println!("reboot: refused");
+        }
         _ => {
             // Внешняя команда: execve с fallback'ами.
             external(cmd, args);
@@ -270,6 +277,7 @@ fn echo(args: &[&str]) {
 
 /// Внешняя команда: пробуем execve варианты в child-процессе.
 fn external(cmd: &str, args: &[&str]) {
+    unsafe { LEAK_POS = 0; }
     let pid = rudra::fork();
     if pid == 0 {
         // Ребёнок: последовательные попытки execve.

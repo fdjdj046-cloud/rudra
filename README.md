@@ -9,6 +9,14 @@
 ![QEMU](https://img.shields.io/badge/runs%20on-QEMU%2011-green)
 ![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-lightgrey)
 
+**rudra 1.0.0 — research OS. Не ставьте образ на единственный диск с данными.**
+
+Релиз — один raw-образ, не ISO: `rudra-1.0.0.img`. Корень — ext2 на том же virtio-blk, с которого идёт загрузка. Файлы живы после reboot. Ramdisk RFS2 остаётся только если диска нет. Контракт, команды и `ENOSYS` — в [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+```
+qemu-system-x86_64 -m 256M -serial stdio -drive if=none,id=vd0,format=raw,file=rudra-1.0.0.img -device virtio-blk-pci,drive=vd0,disable-modern=on,bootindex=0
+```
+
 ---
 
 ## Скриншоты
@@ -74,12 +82,11 @@
   файл создаётся только внутри существующего родителя. Имя по-прежнему полный путь.
   Образ `rootfs/` собирается `scripts/pack_rfs.py` и вшивается в ядро
   (`include_bytes!`, не ramdisk bootloader'а)
-- **PCI и virtio-blk**: обход шины 0 (мост, IDE, VGA, e1000). Legacy virtio-blk
-  (`1af4:1001`, QEMU `disable-modern=on`) согласует features, поднимает одну
-  virtqueue и читает/пишет сектора по 512 байт. Блочный слой —
-  `read_blocks` / `write_blocks`. Второй диск `data.img` — ext2 rev 0 только
-  на чтение: при загрузке ядро печатает `/hello.txt`. Корень шелла по-прежнему
-  RFS2 в памяти. Нет диска — строка `[virtio-blk] no device`, загрузка идёт дальше
+- **PCI и virtio-blk**: обход шины 0. Legacy virtio-blk
+  (`1af4:1001`, QEMU `disable-modern=on`) читает и пишет сектора.
+  Релизный образ один: первые 16 МиБ — загрузчик, дальше ext2 (блок 4096,
+  запись, каталоги). Это корень шелла. Нет диска — `[virtio-blk] no device`
+  и `[root] recovery ramdisk`: RFS2 в памяти, не основной корень
 - **Тесты прямо в ядре**: `cargo test` собирает тестовый бинарь ядра и гоняет его
   в QEMU через `isa-debug-exit` — код 33 = pass, 35 = fail
 
@@ -108,11 +115,12 @@ rudra/
 │   └── user.ld         # линковка по 0x400000
 ├── rootfs/             # то, что pack_rfs.py кладёт в RFS2 (bin/busybox, motd)
 ├── scripts/
-│   ├── build.sh        # user → kernel → образы
-│   ├── run-bios.sh     # QEMU, serial → stdout
-│   ├── run-uefi.sh     # QEMU + OVMF (q35)
-│   ├── pack_rfs.py     # rootfs/ → образ RFS2
-│   ├── mk_ext2.py      # data.img: ext2 rev 0 и подпись RUDRA-DISK в LBA 0
+│   ├── build.sh        # user → kernel → rudra-1.0.0.img
+│   ├── run-bios.sh     # QEMU, один virtio-blk, serial → stdout
+│   ├── run-uefi.sh     # QEMU + OVMF (q35), не релизный образ
+│   ├── pack_rfs.py     # rootfs/ → recovery-ramdisk RFS2
+│   ├── mk_ext2.py      # 16 МиБ ext2 и склейка с загрузчиком
+│   ├── smoke.py        # boot → файл → reboot → cat
 │   └── test.sh         # юнит-тесты ядра в QEMU (isa-debug-exit)
 └── src/
     ├── main.rs         # entry_point (bootloader_api), общий поток инициализации
@@ -122,11 +130,11 @@ rudra/
     ├── syscall.rs      # EFER/LSTAR/STAR/SFMask, asm entry, Linux-dispatch
     ├── linux.rs        # номера syscall'ов Linux x86_64
     ├── task.rs         # ELF, fork/clone/execve, адресные пространства, round-robin
-    ├── fs.rs           # RFS2, 8 МиБ, каталоги — отдельные записи
+    ├── fs.rs           # VFS: ext2, если смонтирован, иначе RFS2
     ├── pci.rs          # обход шины 0 через 0xCF8/0xCFC, BAR, bus master
     ├── virtio_blk.rs   # legacy virtio-blk, одна virtqueue, IN/OUT
     ├── block.rs        # read_blocks / write_blocks, сектор 512
-    ├── ext2.rs         # ext2 только на чтение (прямые блоки)
+    ├── ext2.rs         # ext2 чтение и запись, корень на диске
     ├── memory.rs       # OffsetPageTable, frame allocator (глобальный, один)
     ├── allocator.rs    # bump-аллокатор кучи (48 МиБ)
     ├── framebuffer.rs  # DrawTarget + текстовый писатель (baseline-семантика!)
@@ -233,7 +241,8 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] Linux x86_64 ABI, fork/clone/execve/wait4, pipe, brk/mmap, статический busybox
 - [x] SSE/FXSAVE на задачу, `threads.elf` (clone + общий счётчик)
 - [x] Каталоги RFS2 — отдельные записи (`mkdir` / `rmdir` / `rename`), не префиксы
-- [x] VirtIO-blk (legacy, одна очередь) и ext2 read-only со второго диска
+- [x] VirtIO-blk (legacy, одна очередь) и ext2 read-write как корень
+- [x] 1.0.0: один raw-образ, reboot сохраняет файлы, smoke и заметки релиза
 - [ ] SMP: APIC, startup IPI, второй CPU
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра

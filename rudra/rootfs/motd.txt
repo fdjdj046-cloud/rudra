@@ -1,4 +1,3 @@
-добро пожаловать в rudra v0.6.
-новое: Linux ABI (настоящие статические бинарники Linux),
-многопоточность (clone/CLONE_VM + futex), fork/execve/wait4,
-pipe, каталоги. попробуйте: ls, ps, run /bin/threads.elf.
+добро пожаловать в rudra 1.0.0.
+корень — ext2 на virtio-blk, файлы живы после reboot.
+попробуйте: ls, cat /motd.txt, echo hi > /note.txt, uname, reboot.

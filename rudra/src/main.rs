@@ -23,10 +23,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("rudra: early serial up");
     rudra::init(boot_info);
 
-    rudra::println!("rudra kernel v0.6.0");
+    rudra::println!("rudra kernel v1.0.0");
     rudra::println!("subsystems: gdt/idt, paging, heap, framebuffer: ok");
     rudra::println!("features: Linux ABI (static glibc/musl bins), threads (CLONE_VM+futex),");
-    rudra::println!("          fork/execve/wait4, pipe/poll, dirs, ramdisk fs, virtio-blk, ext2");
+    rudra::println!("          fork/execve/wait4, pipe/poll, ext2 root on virtio-blk");
     serial_println!("rudra: serial output alive");
 
     // Пользовательский шелл ring 3 + планировщик.
