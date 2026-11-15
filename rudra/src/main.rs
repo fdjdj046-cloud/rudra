@@ -24,9 +24,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("rudra: early serial up");
     rudra::init(boot_info);
 
-    println!("rudra kernel v0.1.0");
-    println!("gdt/idt: ok, paging: ok, heap: ok");
+    println!("rudra kernel v0.2.0");
+    println!("subsystems: gdt/idt, paging, heap, framebuffer: ok");
     serial_println!("rudra: serial output alive");
+    serial_println!("rudra: PS/2 keyboard echo active, timer heartbeat on");
 
     heap_demo();
 
@@ -44,6 +45,7 @@ fn heap_demo() {
     println!("heap demo: allocated Vec of {} u64s, sum ok", v.len());
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("PANIC: {}", info);

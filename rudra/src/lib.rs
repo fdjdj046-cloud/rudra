@@ -8,11 +8,11 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod framebuffer;
 pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
-pub mod vga_buffer;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -21,11 +21,15 @@ use x86_64::VirtAddr;
 /// Физическое смещение маппинга всей физической памяти (выставляется в `init`).
 pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-/// Общая инициализация ядра: GDT/TSS, IDT, пейджинг, куча.
+/// Общая инициализация ядра: serial, GDT/TSS, IDT, framebuffer, пейджинг, куча, PIC.
 pub fn init(boot_info: &'static mut BootInfo) {
     serial::init();
     gdt::init();
     interrupts::init_idt();
+
+    if let Some(fb) = boot_info.framebuffer.take() {
+        framebuffer::init(fb);
+    }
 
     let phys_offset = boot_info
         .physical_memory_offset
@@ -36,6 +40,11 @@ pub fn init(boot_info: &'static mut BootInfo) {
     let mut mapper = unsafe { memory::init(VirtAddr::new(phys_offset)) };
     let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
     allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+
+    unsafe {
+        interrupts::init_pics();
+    }
+    x86_64::instructions::interrupts::enable();
 }
 
 pub fn hlt_loop() -> ! {
@@ -50,6 +59,27 @@ pub fn test_runner(tests: &[&dyn Fn()]) {
     for test in tests {
         test();
     }
+    serial_println!("[all tests passed]");
+    exit_qemu(QemuExitCode::Success);
+}
+
+/// Точка входа test-бинарника ядра (cargo test --lib).
+/// entry_point! встраивает секцию .bootloader-config, без которой
+/// bootloader 0.11 не загрузит kernel.
+#[cfg(test)]
+static BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
+    let mut config = bootloader_api::BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(bootloader_api::config::Mapping::Dynamic);
+    config
+};
+
+#[cfg(test)]
+bootloader_api::entry_point!(kernel_test_main, config = &BOOTLOADER_CONFIG);
+
+#[cfg(test)]
+fn kernel_test_main(boot_info: &'static mut BootInfo) -> ! {
+    init(boot_info);
+    test_main();
     exit_qemu(QemuExitCode::Success);
 }
 

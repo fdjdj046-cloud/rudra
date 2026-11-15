@@ -1,6 +1,19 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Режим тестов: builder <kernel-elf> <out-img> — BIOS-образ для isa-debug-exit.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 {
+        let kernel = PathBuf::from(&args[1]);
+        let out = PathBuf::from(&args[2]);
+        bootloader::BiosBoot::new(&kernel)
+            .create_disk_image(&out)
+            .expect("failed to create test disk image");
+        println!("test image: {}", out.display());
+        return;
+    }
+
+    // Обычный режим: собрать boot-образы ядра (BIOS + UEFI).
     // Путь к ELF ядра подставляет cargo (artifact dependency).
     let kernel_binary_path = env!("CARGO_BIN_FILE_RUDRA_rudra");
 

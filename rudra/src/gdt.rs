@@ -5,6 +5,12 @@ use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+struct Selectors {
+    code: SegmentSelector,
+    data: SegmentSelector,
+    tss: SegmentSelector,
+}
+
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
@@ -12,26 +18,32 @@ lazy_static! {
             const STACK_SIZE: usize = 4096 * 5;
             // Статик-стек для double fault handler; .bss, zeroed, kernel-сегмент.
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
             stack_start + STACK_SIZE as u64
         };
         tss
     };
-    static ref GDT: (GlobalDescriptorTable, SegmentSelector, SegmentSelector) = {
+    static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
-        let code_selector = gdt.append(Descriptor::kernel_code_segment());
-        let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-        (gdt, code_selector, tss_selector)
+        let code = gdt.append(Descriptor::kernel_code_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
+        let tss = gdt.append(Descriptor::tss_segment(&TSS));
+        (gdt, Selectors { code, data, tss })
     };
 }
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{Segment, CS};
+    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
     use x86_64::instructions::tables::load_tss;
 
     GDT.0.load();
     unsafe {
-        CS::set_reg(GDT.1);
-        load_tss(GDT.2);
+        // Без валидного data-сегмента в SS/DS любой hardware interrupt
+        // (и IRET) ловит GPF: селекторы bootloader'а указывали бы на чужие дескрипторы.
+        CS::set_reg(GDT.1.code);
+        SS::set_reg(GDT.1.data);
+        DS::set_reg(GDT.1.data);
+        ES::set_reg(GDT.1.data);
+        load_tss(GDT.1.tss);
     }
 }
