@@ -64,6 +64,7 @@ pub fn init(boot_info: &mut BootInfo) {
     }
     x86_64::instructions::interrupts::enable();
     time::finish();
+    apic::start_timer();
 
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();

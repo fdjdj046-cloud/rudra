@@ -751,7 +751,7 @@ fn sleep_timespec(ptr: u64, absolute: bool) -> u64 {
     };
     while crate::time::monotonic_ns() < deadline {
         let left = deadline - crate::time::monotonic_ns();
-        // Короткий хвост докручиваем по TSC: тик PIT ~55 мс, ждать его нельзя.
+        // Короткий хвост докручиваем по TSC, не дожидаясь тика планировщика.
         if left > 2_000_000 && x86_64::instructions::interrupts::are_enabled() {
             x86_64::instructions::hlt();
         } else {

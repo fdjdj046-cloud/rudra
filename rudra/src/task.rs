@@ -518,7 +518,15 @@ pub fn init() {
     match spawn_path("/bin/shell.elf") {
         s if s != u64::MAX => {
             SCHED_INITED.store(true, Ordering::Release);
-            serial_println!("[task] shell spawned (slot {}), round-robin on PIT", s);
+            serial_println!(
+                "[task] shell spawned (slot {}), round-robin on {}",
+                s,
+                if crate::apic::timer_armed() {
+                    "lapic"
+                } else {
+                    "PIT"
+                }
+            );
         }
         _ => serial_println!("[task] failed to spawn shell"),
     }
@@ -1515,13 +1523,22 @@ pub fn debug_dump() {
 #[no_mangle]
 extern "C" fn timer_switch(current_rsp: u64) -> u64 {
     crate::interrupts::TICKS.fetch_add(1, Ordering::Relaxed);
-
     unsafe {
         crate::interrupts::PICS
             .lock()
             .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Timer.as_u8());
     }
+    schedule(current_rsp)
+}
 
+#[no_mangle]
+extern "C" fn lapic_timer_switch(current_rsp: u64) -> u64 {
+    crate::interrupts::TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::apic::eoi();
+    schedule(current_rsp)
+}
+
+fn schedule(current_rsp: u64) -> u64 {
     if !SCHED_INITED.load(Ordering::Acquire) {
         return current_rsp;
     }
@@ -1628,15 +1645,61 @@ timer_entry:
     pop rcx
     pop rax
     iretq
+
+    .global lapic_timer_entry
+lapic_timer_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rsp
+    mov rdi, rbx
+    and rsp, -16
+    call lapic_timer_switch
+    mov rsp, rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
 "#);
 
 extern "C" {
     fn timer_entry();
+    fn lapic_timer_entry();
 }
 
-/// Адрес asm-обработчика таймера (для регистрации в IDT).
+/// Адрес asm-обработчика таймера PIT (для регистрации в IDT).
 pub fn timer_handler_addr() -> u64 {
     let f: unsafe extern "C" fn() = timer_entry;
+    f as u64
+}
+
+/// Адрес asm-обработчика таймера локального APIC.
+pub fn lapic_timer_handler_addr() -> u64 {
+    let f: unsafe extern "C" fn() = lapic_timer_entry;
     f as u64
 }
 

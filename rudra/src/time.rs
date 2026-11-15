@@ -1,9 +1,8 @@
 //! Монотонные часы по TSC.
 //!
-//! PIT IRQ0 по-прежнему будит планировщик (~18.2 Гц) и крутит `TICKS`.
 //! `clock_gettime` и `nanosleep` считают наносекунды от TSC, откалиброванного
-//! по каналу 2 PIT (1_193_182 Гц). Пока ядро держит IF выключенным и тик
-//! IRQ0 теряется, сон и чтение часов этого не замечают.
+//! по каналу 2 PIT (1_193_182 Гц). Тик планировщика — отдельный источник
+//! (LAPIC либо IRQ0) и на эти часы не влияет.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
@@ -148,25 +147,22 @@ mod tests {
     use crate::{serial_print, serial_println};
 
     #[test_case]
-    fn tsc_tracks_pit_irq() {
-        serial_print!("test tsc_tracks_pit_irq... ");
+    fn tsc_scale_matches_rdtsc() {
+        serial_print!("test tsc_scale_matches_rdtsc... ");
         assert!(calibrated(), "tsc was not calibrated");
         let hz = tsc_hz();
         assert!(hz > 50_000_000 && hz < 20_000_000_000, "hz {}", hz);
         let t0 = monotonic_ns();
-        let tick0 = crate::interrupts::TICKS.load(Ordering::Relaxed);
-        while crate::interrupts::TICKS
-            .load(Ordering::Relaxed)
-            .wrapping_sub(tick0)
-            < 3
-        {
-            x86_64::instructions::hlt();
+        let start = rdtsc();
+        let need = hz / 200;
+        while rdtsc().wrapping_sub(start) < need {
+            core::hint::spin_loop();
         }
         let dt = monotonic_ns().saturating_sub(t0);
-        // Три тика по ~55 мс. Допуск широкий: край тика и длина калибровки.
+        // Пять миллисекунд по самому TSC. Ловит ошибку шкалы, не частоту PIT.
         assert!(
-            (80_000_000..300_000_000).contains(&dt),
-            "dt {} ns over 3 pit ticks, hz {}",
+            (2_000_000..20_000_000).contains(&dt),
+            "dt {} ns, hz {}",
             dt,
             hz
         );

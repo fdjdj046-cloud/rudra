@@ -7,7 +7,7 @@
 | Версия | Содержание | Статус |
 |---|---|---|
 | 1.0.0, 1.0.1 | ext2-корень, проверка указателей, возврат кадров | теги стоят, не двигаются |
-| 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC для `clock_gettime`/`nanosleep`, чтение local APIC у BSP. APs, LAPIC-таймер, futex WAKE — нет |
+| 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; таймер BSP LAPIC ~250 Гц, IRQ0 замаскирован. APs, IPI, per-CPU, RTC, futex WAKE — нет |
 | 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | нет |
 | 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | нет |
 | 1.4 | блочный слой, NVMe/AHCI, page cache, ext4 | нет |
@@ -20,4 +20,4 @@
 
 Пункты 0.1–0.9 записаны в `doc/`: [compat-contract](doc/compat-contract.md), [profiles](doc/profiles.md), [architecture](doc/architecture.md), [unsafe](doc/unsafe.md), [governance](doc/governance.md). aarch64 (0.10) и HCL (0.11) в 2.0.0 не обязательны и не начаты.
 
-Известный долг 1.1, который этот шаг не закрывает: планировщик по-прежнему крутится от PIT ~18 Гц, тик PIT теряется, пока `sys_clone` и разбор адресного пространства держат IF выключенным. `nanosleep` и `clock_gettime` от этих тиков больше не зависят. Квант планировщика — зависит, пока нет таймера LAPIC.
+Долг 1.1: один CPU. Пока `sys_clone` и разбор адресного пространства держат IF выключенным, тик LAPIC не приходит и квант сдвигается. `nanosleep` и `clock_gettime` от этого не зависят — они на TSC. `futex WAKE` по-прежнему никого не будит. Времени суток (RTC) нет.

@@ -10,11 +10,11 @@ use x86_64::structures::idt::{
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-/// Счётчик тиков PIT (инкрементируется в task::timer_switch).
-/// PIT на частоте по умолчанию: ~18.2 тиков/сек (55 мс на тик).
+/// Счётчик тиков планировщика. После `apic::start_timer` это LAPIC ~250 Гц,
+/// иначе IRQ0 PIT (~18.2 Гц).
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Аптайм в миллисекундах по TSC. `TICKS` остаётся счётчиком IRQ0.
+/// Аптайм в миллисекундах по TSC. `TICKS` — счётчик тиков планировщика, не часы.
 pub fn uptime_ms() -> u64 {
     crate::time::monotonic_ns() / 1_000_000
 }
@@ -56,6 +56,12 @@ lazy_static! {
             ));
         }
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        unsafe {
+            idt[crate::apic::TIMER_VECTOR].set_handler_addr(x86_64::VirtAddr::new(
+                crate::task::lapic_timer_handler_addr(),
+            ));
+        }
+        idt[0xFFu8].set_handler_fn(spurious_apic_handler);
         idt
     };
 }
@@ -72,8 +78,27 @@ pub unsafe fn init_pics() {
     PICS.lock().initialize();
 }
 
-/// Замаскировать линию IRQ на PIC. Таймер (0), клавиатура (1) и каскад (2)
-/// не трогаем: virtio опрашивается, а его INTx не должен останавливать PIC.
+/// Замаскировать IRQ0. Планировщик перешёл на таймер локального APIC.
+pub fn mask_pit() {
+    // Клавиатурный IRQ тоже берёт `PICS`. IF должен быть выключен на время лока.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut pics = PICS.lock();
+        let masks = pics.read_masks();
+        pics.write_masks(masks[0] | 1, masks[1]);
+    });
+}
+
+/// Снова пустить IRQ0, если таймер APIC не завёлся.
+pub fn unmask_pit() {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let mut pics = PICS.lock();
+        let masks = pics.read_masks();
+        pics.write_masks(masks[0] & !1, masks[1]);
+    });
+}
+
+/// Замаскировать линию IRQ на PIC. Таймер (0) маскирует только `mask_pit`.
+/// Клавиатуру (1) и каскад (2) не трогаем.
 pub fn mask_irq(irq: u8) {
     if !(3..16).contains(&irq) {
         return;
@@ -90,6 +115,8 @@ pub fn mask_irq(irq: u8) {
         pics.write_masks(m0, m1);
     }
 }
+
+extern "x86-interrupt" fn spurious_apic_handler(_stack_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);

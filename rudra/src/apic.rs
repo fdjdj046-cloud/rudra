@@ -5,7 +5,7 @@
 //! x2APIC не включаем. Если прошивка уже подняла x2APIC, id берём из MSR,
 //! потому что MMIO в этом режиме отключено.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
@@ -16,8 +16,15 @@ const IA32_X2APIC_APICID: u32 = 0x802;
 const APIC_VIRT: u64 = 0x4444_4800_0000;
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
+static MMIO: AtomicBool = AtomicBool::new(false);
 static APIC_ID: AtomicU32 = AtomicU32::new(0);
 static APIC_VERSION: AtomicU32 = AtomicU32::new(0);
+static TIMER_ARMED: AtomicBool = AtomicBool::new(false);
+static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Вектор IDT для таймера локального APIC. PIC занимает 32..=47.
+pub const TIMER_VECTOR: u8 = 48;
+const TIMER_TARGET_HZ: u64 = 250;
 
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
@@ -29,6 +36,14 @@ pub fn id() -> u32 {
 
 pub fn version() -> u32 {
     APIC_VERSION.load(Ordering::Relaxed)
+}
+
+pub fn timer_armed() -> bool {
+    TIMER_ARMED.load(Ordering::Relaxed)
+}
+
+pub fn timer_hz() -> u64 {
+    TIMER_HZ.load(Ordering::Relaxed)
 }
 
 pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Size4KiB>) {
@@ -79,6 +94,7 @@ pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Siz
     APIC_ID.store(id, Ordering::Relaxed);
     APIC_VERSION.store(version, Ordering::Relaxed);
     PRESENT.store(true, Ordering::Relaxed);
+    MMIO.store(true, Ordering::Relaxed);
     crate::serial_println!(
         "[apic] base {:#x} bsp {} id {} version {:#x} (APs not started)",
         phys,
@@ -88,8 +104,129 @@ pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Siz
     );
 }
 
+/// Включить периодический таймер ~250 Гц и замаскировать IRQ0 PIT.
+/// Период меряем по приходу IRQ, не по регистру текущего счёта: в QEMU
+/// эти две шкалы расходятся. Без удачной калибровки планировщик остаётся на PIT.
+pub fn start_timer() {
+    if !MMIO.load(Ordering::Relaxed) || !crate::time::calibrated() {
+        crate::serial_println!("[apic] timer stays on pit");
+        return;
+    }
+    let svr = read32(0xF0);
+    write32(0xF0, (svr & !0x1FF) | 0x1FF);
+    // Делитель 16 (биты 0 и 1 регистра DCR; бит 2 зарезервирован).
+    write32(0x3E0, 0x3);
+
+    // Старт с середины периода: два фронта IRQ0 — это от ~55 мс до ~110 мс, не ровно два кванта.
+    let pit_ns = pit_ticks_ns(2);
+    crate::serial_println!("[time] 2 pit irq0 ticks = {} ns", pit_ns);
+
+    const PROBE: u32 = 100_000;
+    let probed = match measure_ticks_ns(PROBE, 16) {
+        Some(ns) if ns > 1_000_000 => ns,
+        Some(ns) => {
+            crate::serial_println!("[apic] timer probe too fast: {} ns", ns);
+            crate::interrupts::unmask_pit();
+            TIMER_ARMED.store(false, Ordering::Relaxed);
+            return;
+        }
+        None => {
+            crate::serial_println!("[apic] timer probe got no ticks");
+            crate::interrupts::unmask_pit();
+            TIMER_ARMED.store(false, Ordering::Relaxed);
+            return;
+        }
+    };
+    // 16 тиков должны занять 16/250 с.
+    let want = 16 * 1_000_000_000 / TIMER_TARGET_HZ;
+    let initial = (u64::from(PROBE)).saturating_mul(want) / probed;
+    if initial == 0 || initial > u32::MAX as u64 {
+        crate::serial_println!("[apic] timer initial count {} unusable", initial);
+        crate::interrupts::unmask_pit();
+        TIMER_ARMED.store(false, Ordering::Relaxed);
+        return;
+    }
+    arm_periodic(initial as u32);
+    TIMER_HZ.store(TIMER_TARGET_HZ, Ordering::Relaxed);
+    crate::serial_println!(
+        "[apic] timer {} Hz, count {} (probe {} ns, pit irq0 masked, APs not started)",
+        TIMER_TARGET_HZ,
+        initial,
+        probed
+    );
+}
+
+fn pit_ticks_ns(ticks: u64) -> u64 {
+    let start = crate::time::monotonic_ns();
+    let base = crate::interrupts::TICKS.load(Ordering::Relaxed);
+    let mut spins = 0u64;
+    while crate::interrupts::TICKS
+        .load(Ordering::Relaxed)
+        .wrapping_sub(base)
+        < ticks
+    {
+        x86_64::instructions::hlt();
+        spins += 1;
+        if spins > 1_000_000 {
+            return 0;
+        }
+    }
+    crate::time::monotonic_ns().saturating_sub(start)
+}
+
+/// Замаскировать PIT, запустить periodic и дождаться `ticks` целых периодов.
+fn measure_ticks_ns(count: u32, ticks: u64) -> Option<u64> {
+    arm_periodic(count);
+    let warmup = crate::interrupts::TICKS.load(Ordering::Relaxed);
+    let mut spins = 0u64;
+    while crate::interrupts::TICKS
+        .load(Ordering::Relaxed)
+        .wrapping_sub(warmup)
+        < 2
+    {
+        x86_64::instructions::hlt();
+        spins += 1;
+        if spins > 5_000_000 {
+            return None;
+        }
+    }
+    let start = crate::time::monotonic_ns();
+    let base = crate::interrupts::TICKS.load(Ordering::Relaxed);
+    spins = 0;
+    while crate::interrupts::TICKS
+        .load(Ordering::Relaxed)
+        .wrapping_sub(base)
+        < ticks
+    {
+        x86_64::instructions::hlt();
+        spins += 1;
+        if spins > 5_000_000 {
+            return None;
+        }
+    }
+    Some(crate::time::monotonic_ns().saturating_sub(start))
+}
+
+fn arm_periodic(count: u32) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::interrupts::mask_pit();
+        // Бит 17 — periodic, бит 16 (маска) снят.
+        write32(0x320, u32::from(TIMER_VECTOR) | (1 << 17));
+        write32(0x380, count);
+        TIMER_ARMED.store(true, Ordering::Relaxed);
+    });
+}
+
+pub fn eoi() {
+    write32(0xB0, 0);
+}
+
 fn read32(offset: u64) -> u32 {
     unsafe { core::ptr::read_volatile((APIC_VIRT + offset) as *const u32) }
+}
+
+fn write32(offset: u64, value: u32) {
+    unsafe { core::ptr::write_volatile((APIC_VIRT + offset) as *mut u32, value) }
 }
 
 #[cfg(test)]
@@ -107,5 +244,29 @@ mod tests {
             version()
         );
         serial_println!("[ok] id {} version {:#x}", id(), version());
+    }
+
+    #[test_case]
+    fn lapic_timer_period() {
+        serial_print!("test lapic_timer_period... ");
+        assert!(timer_armed(), "lapic timer was not armed");
+        assert_eq!(timer_hz(), 250);
+        let t0 = crate::time::monotonic_ns();
+        let tick0 = crate::interrupts::TICKS.load(Ordering::Relaxed);
+        while crate::interrupts::TICKS
+            .load(Ordering::Relaxed)
+            .wrapping_sub(tick0)
+            < 8
+        {
+            x86_64::instructions::hlt();
+        }
+        let dt = crate::time::monotonic_ns().saturating_sub(t0);
+        // 8 тиков по 4 мс. Допуск — ошибка калибровки и неполный первый период.
+        assert!(
+            (10_000_000..80_000_000).contains(&dt),
+            "dt {} ns over 8 ticks",
+            dt
+        );
+        serial_println!("[ok]");
     }
 }
