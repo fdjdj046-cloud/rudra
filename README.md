@@ -11,6 +11,8 @@
 
 **rudra 1.0.1 — research OS. Не ставьте образ на единственный диск с данными.**
 
+Дальше по `main` — серверный контракт 2.0.0, не десктоп. Решения и что уже обещано: [ROADMAP.md](ROADMAP.md), [doc/compat-contract.md](doc/compat-contract.md), [doc/profiles.md](doc/profiles.md). Тег 2.0.0 не стоит. Профиль Desktop пойдёт в ветки `desktop-3.x`.
+
 Релиз — один raw-образ, не ISO: `rudra-1.0.1.img`. Корень — ext2 на том же virtio-blk, с которого идёт загрузка. Файлы живы после reboot. Ramdisk RFS2 остаётся только если диска нет. Контракт, команды и `ENOSYS` — в [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```

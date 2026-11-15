@@ -423,16 +423,11 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         28 => 0, // madvise
         32 => sys_dup(a1),
         33 => sys_dup2(a1, a2),
-        35 | 230 => {
-            // nanosleep / clock_nanosleep
-            let mut raw = [0u8; 16];
-            if !u_read(a1, &mut raw) {
-                return EFAULT;
-            }
-            let sec = u64::from_le_bytes(raw[0..8].try_into().unwrap());
-            let nsec = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-            sleep_ms(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000));
-            0
+        35 => sleep_timespec(a1, false),
+        230 => {
+            // clock_nanosleep(clockid, flags, req, rem). TIMER_ABSTIME = 1.
+            // Часы пока одни: монотонный TSC. rem не пишем, сон не прерывается.
+            sleep_timespec(a3, a2 & 1 != 0)
         }
         39 => task::current_tid(),
         102 | 104 | 107 | 108 => 1000, // getuid/getgid/geteuid/getegid
@@ -670,11 +665,12 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             task::current_tid()
         }
         228 => {
-            // clock_gettime
-            let ms = crate::interrupts::uptime_ms();
+            // clock_gettime. REALTIME и MONOTONIC — монотонный TSC с загрузки.
+            // Суток и RTC ещё нет: это не UTC.
+            let ns = crate::time::monotonic_ns();
             let mut raw = [0u8; 16];
-            raw[0..8].copy_from_slice(&(ms / 1000).to_le_bytes());
-            raw[8..16].copy_from_slice(&(((ms % 1000) * 1_000_000).to_le_bytes()));
+            raw[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            raw[8..16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
             if !u_write(a2, &raw) {
                 return EFAULT;
             }
@@ -737,11 +733,32 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
 const ENAMETOOLONG: u64 = (-(36i64)) as u64;
 const AT_FDCWD: u64 = (-100i64) as u64;
 
-fn sleep_ms(ms: u64) {
-    let deadline = crate::interrupts::uptime_ms() + ms;
-    while crate::interrupts::uptime_ms() < deadline {
-        x86_64::instructions::hlt();
+fn sleep_timespec(ptr: u64, absolute: bool) -> u64 {
+    let mut raw = [0u8; 16];
+    if !u_read(ptr, &mut raw) {
+        return EFAULT;
     }
+    let sec = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let nsec = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+    let span = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
+    let deadline = if absolute {
+        span
+    } else {
+        crate::time::monotonic_ns().saturating_add(span)
+    };
+    while crate::time::monotonic_ns() < deadline {
+        let left = deadline - crate::time::monotonic_ns();
+        // Короткий хвост докручиваем по TSC: тик PIT ~55 мс, ждать его нельзя.
+        if left > 2_000_000 && x86_64::instructions::interrupts::are_enabled() {
+            x86_64::instructions::hlt();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    0
 }
 
 // ---- Файловые операции ----

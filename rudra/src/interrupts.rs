@@ -1,5 +1,5 @@
 use crate::{gdt, serial_println};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::{self, Mutex};
@@ -14,9 +14,9 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 /// PIT на частоте по умолчанию: ~18.2 тиков/сек (55 мс на тик).
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Аптайм в миллисекундах (грубо, кратно 55 мс).
+/// Аптайм в миллисекундах по TSC. `TICKS` остаётся счётчиком IRQ0.
 pub fn uptime_ms() -> u64 {
-    TICKS.load(Ordering::Relaxed) * 55
+    crate::time::monotonic_ns() / 1_000_000
 }
 
 /// Chained PICs, ремаппленные на векторы 32..=47 (чтобы не пересекаться с CPU exceptions).

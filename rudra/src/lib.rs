@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod apic;
 pub mod block;
 pub mod ext2;
 pub mod framebuffer;
@@ -22,6 +23,7 @@ pub mod pci;
 pub mod serial;
 pub mod syscall;
 pub mod task;
+pub mod time;
 pub mod virtio_blk;
 
 use bootloader_api::BootInfo;
@@ -36,6 +38,7 @@ pub fn init(boot_info: &mut BootInfo) {
     serial::init();
     gdt::init();
     fpu::enable();
+    time::init();
     syscall::init();
     interrupts::init_idt();
 
@@ -52,6 +55,7 @@ pub fn init(boot_info: &mut BootInfo) {
     let mut mapper = unsafe { memory::init(VirtAddr::new(phys_offset)) };
     memory::init_frame_allocator(&boot_info.memory_regions);
     memory::with_frame_allocator(|fa| {
+        apic::init(&mut mapper, fa);
         allocator::init_heap(&mut mapper, fa).expect("heap initialization failed");
     });
 
@@ -59,6 +63,7 @@ pub fn init(boot_info: &mut BootInfo) {
         interrupts::init_pics();
     }
     x86_64::instructions::interrupts::enable();
+    time::finish();
 
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();
