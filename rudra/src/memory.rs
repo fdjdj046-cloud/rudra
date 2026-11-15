@@ -87,3 +87,31 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         frame
     }
 }
+
+/// Несколько подряд идущих кадров. Нужны virtqueue и DMA: устройство видит
+/// гостевой физический адрес и не умеет разрозненные страницы в одной очереди.
+pub fn alloc_contiguous(pages: usize) -> Option<u64> {
+    if pages == 0 {
+        return None;
+    }
+    with_frame_allocator(|fa| {
+        let mut start = 0u64;
+        let mut len = 0usize;
+        let mut prev = 0u64;
+        for _ in 0..(pages + 128) {
+            let frame = fa.allocate_frame()?;
+            let addr = frame.start_address().as_u64();
+            if len > 0 && addr == prev + 4096 {
+                len += 1;
+            } else {
+                start = addr;
+                len = 1;
+            }
+            prev = addr;
+            if len == pages {
+                return Some(start);
+            }
+        }
+        None
+    })
+}

@@ -74,7 +74,12 @@
   файл создаётся только внутри существующего родителя. Имя по-прежнему полный путь.
   Образ `rootfs/` собирается `scripts/pack_rfs.py` и вшивается в ядро
   (`include_bytes!`, не ramdisk bootloader'а)
-- **PCI**: обход шины 0 (мост, IDE, VGA, e1000 в QEMU). VirtIO-поверх этого ещё нет
+- **PCI и virtio-blk**: обход шины 0 (мост, IDE, VGA, e1000). Legacy virtio-blk
+  (`1af4:1001`, QEMU `disable-modern=on`) согласует features, поднимает одну
+  virtqueue и читает/пишет сектора по 512 байт. Блочный слой —
+  `read_blocks` / `write_blocks`. Второй диск `data.img` — ext2 rev 0 только
+  на чтение: при загрузке ядро печатает `/hello.txt`. Корень шелла по-прежнему
+  RFS2 в памяти. Нет диска — строка `[virtio-blk] no device`, загрузка идёт дальше
 - **Тесты прямо в ядре**: `cargo test` собирает тестовый бинарь ядра и гоняет его
   в QEMU через `isa-debug-exit` — код 33 = pass, 35 = fail
 
@@ -107,17 +112,21 @@ rudra/
 │   ├── run-bios.sh     # QEMU, serial → stdout
 │   ├── run-uefi.sh     # QEMU + OVMF (q35)
 │   ├── pack_rfs.py     # rootfs/ → образ RFS2
+│   ├── mk_ext2.py      # data.img: ext2 rev 0 и подпись RUDRA-DISK в LBA 0
 │   └── test.sh         # юнит-тесты ядра в QEMU (isa-debug-exit)
 └── src/
     ├── main.rs         # entry_point (bootloader_api), общий поток инициализации
-    ├── lib.rs          # init(): gdt → fpu → syscall → idt → fb → paging → heap → PIC
+    ├── lib.rs          # init(): gdt → fpu → syscall → idt → fb → paging → heap → PIC → pci → virtio
     ├── gdt.rs          # kernel/user-сегменты, TSS (IST + privilege stack)
     ├── fpu.rs          # CR0/CR4, FXSAVE-образ задачи
     ├── syscall.rs      # EFER/LSTAR/STAR/SFMask, asm entry, Linux-dispatch
     ├── linux.rs        # номера syscall'ов Linux x86_64
     ├── task.rs         # ELF, fork/clone/execve, адресные пространства, round-robin
     ├── fs.rs           # RFS2, 8 МиБ, каталоги — отдельные записи
-    ├── pci.rs          # обход шины 0 через 0xCF8/0xCFC
+    ├── pci.rs          # обход шины 0 через 0xCF8/0xCFC, BAR, bus master
+    ├── virtio_blk.rs   # legacy virtio-blk, одна virtqueue, IN/OUT
+    ├── block.rs        # read_blocks / write_blocks, сектор 512
+    ├── ext2.rs         # ext2 только на чтение (прямые блоки)
     ├── memory.rs       # OffsetPageTable, frame allocator (глобальный, один)
     ├── allocator.rs    # bump-аллокатор кучи (48 МиБ)
     ├── framebuffer.rs  # DrawTarget + текстовый писатель (baseline-семантика!)
@@ -224,7 +233,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] Linux x86_64 ABI, fork/clone/execve/wait4, pipe, brk/mmap, статический busybox
 - [x] SSE/FXSAVE на задачу, `threads.elf` (clone + общий счётчик)
 - [x] Каталоги RFS2 — отдельные записи (`mkdir` / `rmdir` / `rename`), не префиксы
-- [ ] VirtIO-blk, ext2 read-only
+- [x] VirtIO-blk (legacy, одна очередь) и ext2 read-only со второго диска
 - [ ] SMP: APIC, startup IPI, второй CPU
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра

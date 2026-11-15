@@ -8,6 +8,8 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod block;
+pub mod ext2;
 pub mod framebuffer;
 pub mod fpu;
 pub mod fs;
@@ -20,6 +22,7 @@ pub mod pci;
 pub mod serial;
 pub mod syscall;
 pub mod task;
+pub mod virtio_blk;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +63,7 @@ pub fn init(boot_info: &mut BootInfo) {
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();
     pci::scan();
+    block::init();
 }
 
 pub fn hlt_loop() -> ! {

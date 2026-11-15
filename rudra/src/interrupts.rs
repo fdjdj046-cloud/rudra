@@ -72,6 +72,25 @@ pub unsafe fn init_pics() {
     PICS.lock().initialize();
 }
 
+/// Замаскировать линию IRQ на PIC. Таймер (0), клавиатура (1) и каскад (2)
+/// не трогаем: virtio опрашивается, а его INTx не должен останавливать PIC.
+pub fn mask_irq(irq: u8) {
+    if !(3..16).contains(&irq) {
+        return;
+    }
+    unsafe {
+        let mut pics = PICS.lock();
+        let masks = pics.read_masks();
+        let (mut m0, mut m1) = (masks[0], masks[1]);
+        if irq < 8 {
+            m0 |= 1 << irq;
+        } else {
+            m1 |= 1 << (irq - 8);
+        }
+        pics.write_masks(m0, m1);
+    }
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }

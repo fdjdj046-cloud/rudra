@@ -28,4 +28,25 @@
 
 Каталоги RFS2 — отдельные записи: `mkdir` создаёт узел, файл без родителя не появляется, `rmdir` удаляет только пустой каталог. Имя в таблице по-прежнему полный путь.
 
-Шина PCI 0 читается (`pci.rs`): в QEMU видны мост i440FX, PIIX IDE, VGA и e1000. VirtIO-blk и SMP ещё впереди.
+Шина PCI 0 читается (`pci.rs`): в QEMU видны мост i440FX, PIIX IDE, VGA и e1000.
+
+## Диск: virtio-blk и ext2 только на чтение
+
+Проверено в QEMU с `-device virtio-blk-pci,drive=vd0,disable-modern=on` и образом `target/images/data.img` (1 МиБ, `scripts/mk_ext2.py`):
+
+```
+[pci] 00:04.0 1af4:1001 class 010000
+[virtio-blk] io 0xc000 queue 256 capacity 2048 host-features 0x71006ed4 guest-features 0x0 irq 11
+[virtio-blk] LBA0: RUDRA-DISK
+[block] write/read LBA 200: ok
+[ext2] magic ok block 1024 inode-table 5
+[ext2] /hello.txt
+[ext2] /readme.txt
+[ext2] /hello.txt: hello from ext2
+```
+
+Дальше приходит приглашение `rudra:/$`.
+
+Корень шелла — по-прежнему RFS2 в памяти. ext2 не смонтирован в шелл: это второй том, ядро читает его один раз при старте. Гостевые features оставлены 0: базовый `VIRTIO_BLK_T_IN` / `T_OUT` от флага не зависит. Очередь одна, запрос один за раз. IRQ virtio (в этом прогоне 11) замаскирован, завершение — опрос used-кольца.
+
+Без второго диска serial пишет `[virtio-blk] no device`. Юнит-тесты ядра на образе без virtio проходят (`isa-debug-exit`, код 33). `scripts/run-bios.sh` подключает `data.img`, только если файл уже собран. SMP ещё впереди.

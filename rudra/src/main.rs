@@ -26,7 +26,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     rudra::println!("rudra kernel v0.6.0");
     rudra::println!("subsystems: gdt/idt, paging, heap, framebuffer: ok");
     rudra::println!("features: Linux ABI (static glibc/musl bins), threads (CLONE_VM+futex),");
-    rudra::println!("          fork/execve/wait4, pipe/poll, dirs, ramdisk fs, round-robin");
+    rudra::println!("          fork/execve/wait4, pipe/poll, dirs, ramdisk fs, virtio-blk, ext2");
     serial_println!("rudra: serial output alive");
 
     // Пользовательский шелл ring 3 + планировщик.
