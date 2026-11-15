@@ -6,7 +6,7 @@ fn main() {
     write_handoff_elfs(Path::new(&out_dir));
 
     // 1) User-программы: копируем ELF'ы (build.sh собирает их до ядра).
-    for name in ["shell", "hello", "counter", "fizzbuzz", "threads", "signal", "epoll"] {
+    for name in ["shell", "hello", "counter", "fizzbuzz", "threads", "signal", "tick", "epoll"] {
         let src = Path::new("target/x86_64-unknown-none/release").join(name);
         let out = Path::new(&out_dir).join(format!("{name}.elf"));
         if src.exists() {

@@ -1,9 +1,11 @@
 //! Сигналы 1–31 для текущего потока.
 //!
-//! Доставка — только на возврате из syscall, не из тика таймера и не из
-//! середины блокирующего read. Обработчику нужен `SA_RESTORER`: на стеке
-//! нет исполняемого трамплина. `SIGKILL` нельзя перехватить. `SIGSTOP` и
-//! сигналы остановки сбрасываются: останавливать задачи мы не умеем.
+//! Перехваченный сигнал с `SA_RESTORER` ставится и на возврате из syscall,
+//! и когда тик таймера возвращается в ring 3. Кадр тика — не кадр syscall:
+//! `deliver_pending` туда писать нельзя. Смертельный сигнал и `SIGKILL`
+//! с тика не забираются: `sys_exit` встал бы в `hlt` при выключенном IF.
+//! Блокирующий `read` и `nanosleep` не прерываются. На стеке нет
+//! исполняемого трамплина. `SIGSTOP` и сигналы остановки сбрасываются.
 //! Смерть по умолчанию — `exit(128+sig)`, статус wait выглядит как обычный
 //! код выхода, не как `WIFSIGNALED`.
 
@@ -156,6 +158,113 @@ fn read_frame_u64(frame: *mut u64, slot: usize) -> u64 {
 
 fn write_slot(frame: *mut u64, slot: usize, val: u64) {
     unsafe { core::ptr::write(frame.add(slot), val) }
+}
+
+/// Один перехваченный сигнал в кадр `timer_entry` / `lapic_timer_entry`.
+///
+/// `kernel_rsp` — указатель, который asm передал в `timer_switch`: на +0
+/// лежит r15, на +120 user RIP, на +128 CS, на +136 RFLAGS, на +144 user RSP.
+/// Смертельный сигнал остаётся в `pending` до возврата из syscall.
+pub fn deliver_timer(kernel_rsp: u64) {
+    if kernel_rsp < 0x1000 || task::current_slot() < 0 {
+        return;
+    }
+    let cs = tread(kernel_rsp, T_CS);
+    if cs & 3 != 3 {
+        return;
+    }
+    for _ in 0..32 {
+        let popped = task::with_current_task(|t| t.signals.pop());
+        let Some(popped) = popped else {
+            return;
+        };
+        match popped {
+            None => return,
+            Some(Pop::Ignored) => continue,
+            Some(Pop::Fatal(sig)) => {
+                let _ = task::with_current_task(|t| t.signals.pending |= bit(sig));
+                return;
+            }
+            Some(Pop::Catch(caught)) => {
+                if !arm_timer(kernel_rsp, &caught) {
+                    let _ = task::with_current_task(|t| t.signals.undo(&caught));
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Слоты кадра тика, в байтах от `kernel_rsp`. Совпадают с синтетическим
+/// кадром `sys_clone`: 15 push, затем iret (rip, cs, rflags, rsp, ss).
+const T_R15: usize = 0;
+const T_R14: usize = 8;
+const T_R13: usize = 16;
+const T_R12: usize = 24;
+const T_RBP: usize = 32;
+const T_RBX: usize = 40;
+const T_R9: usize = 64;
+const T_R8: usize = 72;
+const T_RDI: usize = 80;
+const T_RSI: usize = 88;
+const T_RDX: usize = 96;
+const T_RAX: usize = 112;
+const T_RIP: usize = 120;
+const T_CS: usize = 128;
+const T_RFLAGS: usize = 136;
+const T_RSP: usize = 144;
+
+fn tread(kernel_rsp: u64, off: usize) -> u64 {
+    unsafe { core::ptr::read_unaligned((kernel_rsp + off as u64) as *const u64) }
+}
+
+fn twrite(kernel_rsp: u64, off: usize, val: u64) {
+    unsafe { core::ptr::write_unaligned((kernel_rsp + off as u64) as *mut u64, val) }
+}
+
+fn arm_timer(kernel_rsp: u64, caught: &Catch) -> bool {
+    let user_rsp = tread(kernel_rsp, T_RSP);
+    let rip = tread(kernel_rsp, T_RIP);
+    let rflags = tread(kernel_rsp, T_RFLAGS);
+    let rax = tread(kernel_rsp, T_RAX);
+    let mut sp = user_rsp.saturating_sub(128 + FRAME_BYTES as u64) & !15;
+    sp = sp.saturating_sub(8);
+    if sp < 0x1000 {
+        return false;
+    }
+    let mut raw = [0u8; FRAME_BYTES];
+    put_u64(&mut raw, 0, caught.restorer);
+    let sc = MCTX;
+    put_u64(&mut raw, sc + 0, tread(kernel_rsp, T_R8));
+    put_u64(&mut raw, sc + 8, tread(kernel_rsp, T_R9));
+    put_u64(&mut raw, sc + 24, rflags);
+    put_u64(&mut raw, sc + 32, tread(kernel_rsp, T_R12));
+    put_u64(&mut raw, sc + 40, tread(kernel_rsp, T_R13));
+    put_u64(&mut raw, sc + 48, tread(kernel_rsp, T_R14));
+    put_u64(&mut raw, sc + 56, tread(kernel_rsp, T_R15));
+    put_u64(&mut raw, sc + 64, tread(kernel_rsp, T_RDI));
+    put_u64(&mut raw, sc + 72, tread(kernel_rsp, T_RSI));
+    put_u64(&mut raw, sc + 80, tread(kernel_rsp, T_RBP));
+    put_u64(&mut raw, sc + 88, tread(kernel_rsp, T_RBX));
+    put_u64(&mut raw, sc + 96, tread(kernel_rsp, T_RDX));
+    put_u64(&mut raw, sc + 104, rax);
+    put_u64(&mut raw, sc + 112, rip);
+    put_u64(&mut raw, sc + 120, user_rsp);
+    put_u64(&mut raw, sc + 128, rip);
+    put_u64(&mut raw, sc + 136, rflags);
+    put_u64(&mut raw, SIGMASK_AT, caught.old_mask);
+    put_u32(&mut raw, SIGINFO_AT, caught.sig);
+    put_u32(&mut raw, SIGINFO_AT + 16, task::current_tid() as u32);
+    if !user_write(sp, &raw) {
+        return false;
+    }
+    twrite(kernel_rsp, T_RDI, u64::from(caught.sig));
+    twrite(kernel_rsp, T_RSI, sp + SIGINFO_AT as u64);
+    twrite(kernel_rsp, T_RDX, sp + 8);
+    twrite(kernel_rsp, T_RIP, caught.handler);
+    twrite(kernel_rsp, T_RSP, sp);
+    twrite(kernel_rsp, T_RFLAGS, 0x202);
+    true
 }
 
 /// Поставить один ожидающий сигнал в пользовательский кадр syscall.

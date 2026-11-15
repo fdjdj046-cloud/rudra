@@ -1,6 +1,7 @@
 //! IPv4 и UDP. Петля `127.0.0.0/8` живёт без карты.
-//! В провод уходит кадр через virtio-net: ARP, DHCP и один кэш соседа.
-//! IPv6, TCP и netlink здесь нет.
+//! В провод уходит кадр через virtio-net: ARP на восемь соседей и DHCP.
+//! Исходящий UDP считает сумму. Входящая сумма 0 на IPv4 значит «не считали»
+//! и принимается: так QEMU отдаёт DHCP. IPv6, TCP и netlink здесь нет.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -36,14 +37,22 @@ struct Sock {
     q: Vec<Dgram>,
 }
 
+const ARP_SLOTS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ArpSlot {
+    ip: u32,
+    mac: [u8; 6],
+}
+
 struct Iface {
     mac: [u8; 6],
     up: bool,
     ip: u32,
     mask: u32,
     gw: u32,
-    arp_ip: u32,
-    arp_mac: [u8; 6],
+    arp: [ArpSlot; ARP_SLOTS],
+    arp_hand: usize,
 }
 
 static SOCKS_TAB: Mutex<[Option<Sock>; SOCKS]> = Mutex::new([None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None]);
@@ -53,8 +62,11 @@ static IFACE: Mutex<Iface> = Mutex::new(Iface {
     ip: 0,
     mask: 0,
     gw: 0,
-    arp_ip: 0,
-    arp_mac: [0; 6],
+    arp: [ArpSlot {
+        ip: 0,
+        mac: [0; 6],
+    }; ARP_SLOTS],
+    arp_hand: 0,
 });
 static NEXT_PORT: Mutex<u16> = Mutex::new(49152);
 
@@ -366,13 +378,28 @@ pub fn arp_resolve(ip: u32) -> Result<[u8; 6], &'static str> {
 }
 
 fn arp_cached(ip: u32) -> Option<[u8; 6]> {
-    with_iface(|iface| {
-        if iface.arp_ip == ip && iface.arp_mac != [0; 6] {
-            Some(iface.arp_mac)
-        } else {
-            None
-        }
-    })
+    with_iface(|iface| arp_find(iface, ip))
+}
+
+fn arp_find(iface: &Iface, ip: u32) -> Option<[u8; 6]> {
+    iface.arp.iter().find(|s| s.ip == ip && s.mac != [0; 6]).map(|s| s.mac)
+}
+
+fn arp_learn(iface: &mut Iface, ip: u32, mac: [u8; 6]) {
+    if ip == 0 || mac == [0; 6] {
+        return;
+    }
+    if let Some(slot) = iface.arp.iter_mut().find(|s| s.ip == ip) {
+        slot.mac = mac;
+        return;
+    }
+    if let Some(slot) = iface.arp.iter_mut().find(|s| s.ip == 0) {
+        *slot = ArpSlot { ip, mac };
+        return;
+    }
+    let hand = iface.arp_hand % ARP_SLOTS;
+    iface.arp[hand] = ArpSlot { ip, mac };
+    iface.arp_hand = (hand + 1) % ARP_SLOTS;
 }
 
 fn iface_up() -> bool {
@@ -487,10 +514,7 @@ fn handle_arp(frame: &[u8]) {
     let spa = be32(frame, 28);
     let tpa = be32(frame, 38);
     if op == 2 && spa != 0 {
-        with_iface(|iface| {
-            iface.arp_ip = spa;
-            iface.arp_mac = sha;
-        });
+        with_iface(|iface| arp_learn(iface, spa, sha));
     }
     let (mac, ip) = with_iface(|iface| (iface.mac, iface.ip));
     if op == 1 && ip != 0 && tpa == ip {
@@ -527,6 +551,9 @@ fn handle_ipv4(frame: &[u8]) {
     }
     let ours = with_iface(|iface| iface.ip);
     if dst != ours && dst != 0xffff_ffff && !is_loopback(dst) {
+        return;
+    }
+    if !udp_sum_ok(src, dst, &frame[udp..udp + ulen]) {
         return;
     }
     deliver(dst, dport, src, sport, &frame[udp + 8..udp + ulen]);
@@ -693,7 +720,62 @@ fn build_udp_frame(
     put_be16(&mut f, 36, dport);
     put_be16(&mut f, 38, udp_len as u16);
     f[42..42 + payload.len()].copy_from_slice(payload);
+    let udp_sum = udp_checksum(src, dst, &f[34..]);
+    put_be16(&mut f, 40, udp_sum);
     f
+}
+
+/// Сумма UDP вместе с псевдозаголовком. Поле суммы в `segment` должно быть 0.
+/// Результат 0 заменяется на 0xFFFF: ноль в кадре значит «суммы нет».
+fn udp_checksum(src: u32, dst: u32, segment: &[u8]) -> u16 {
+    let sum = finish_sum(pseudo_sum(src, dst, segment.len()) + csum_add(0, segment));
+    if sum == 0 {
+        0xffff
+    } else {
+        sum
+    }
+}
+
+/// `true`, если сумма 0 (IPv4: не считали) или сошлась.
+fn udp_sum_ok(src: u32, dst: u32, segment: &[u8]) -> bool {
+    if segment.len() < 8 {
+        return false;
+    }
+    let field = u16::from_be_bytes([segment[6], segment[7]]);
+    if field == 0 {
+        return true;
+    }
+    finish_sum(pseudo_sum(src, dst, segment.len()) + csum_add(0, segment)) == 0
+}
+
+fn pseudo_sum(src: u32, dst: u32, udp_len: usize) -> u32 {
+    let mut sum = 0u32;
+    sum += (src >> 16) as u32;
+    sum += (src & 0xffff) as u32;
+    sum += (dst >> 16) as u32;
+    sum += (dst & 0xffff) as u32;
+    sum += 17;
+    sum += udp_len as u32;
+    sum
+}
+
+fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    sum
+}
+
+fn finish_sum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Сумма RFC 1071. Для исходящего заголовка поле контрольной суммы — нули.
@@ -744,6 +826,52 @@ mod tests {
         hdr[10] = 0xb1;
         hdr[11] = 0xe6;
         assert_eq!(internet_checksum(&hdr), 0);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn udp_checksum_rejects_a_bad_wire_sum() {
+        serial_print!("test udp_checksum_rejects_a_bad_wire_sum... ");
+        let mac = [2u8, 0, 0, 0, 0, 1];
+        let frame = build_udp_frame(&mac, &mac, 0x0a00_020f, 0x0a00_0202, 1234, 53, b"hi");
+        let segment = &frame[34..];
+        assert_ne!(u16::from_be_bytes([segment[6], segment[7]]), 0);
+        assert!(udp_sum_ok(0x0a00_020f, 0x0a00_0202, segment));
+        let mut bad = frame.clone();
+        bad[42] ^= 0xff;
+        assert!(!udp_sum_ok(0x0a00_020f, 0x0a00_0202, &bad[34..]));
+        let mut open = frame.clone();
+        open[40] = 0;
+        open[41] = 0;
+        open[42] ^= 0xff;
+        assert!(udp_sum_ok(0x0a00_020f, 0x0a00_0202, &open[34..]));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn arp_table_keeps_eight_then_evicts() {
+        serial_print!("test arp_table_keeps_eight_then_evicts... ");
+        let mut iface = Iface {
+            mac: [0; 6],
+            up: false,
+            ip: 0,
+            mask: 0,
+            gw: 0,
+            arp: [ArpSlot { ip: 0, mac: [0; 6] }; ARP_SLOTS],
+            arp_hand: 0,
+        };
+        for i in 1..=8u32 {
+            arp_learn(&mut iface, i, [i as u8, 0, 0, 0, 0, 1]);
+        }
+        assert_eq!(arp_find(&iface, 1).map(|m| m[0]), Some(1));
+        assert_eq!(arp_find(&iface, 8).map(|m| m[0]), Some(8));
+        arp_learn(&mut iface, 9, [9, 0, 0, 0, 0, 1]);
+        assert!(arp_find(&iface, 1).is_none());
+        assert_eq!(arp_find(&iface, 2).map(|m| m[0]), Some(2));
+        assert_eq!(arp_find(&iface, 9).map(|m| m[0]), Some(9));
+        arp_learn(&mut iface, 9, [9, 1, 0, 0, 0, 2]);
+        assert_eq!(arp_find(&iface, 9).map(|m| m[0]), Some(9));
+        assert_eq!(arp_find(&iface, 2).map(|m| m[0]), Some(2));
         serial_println!("[ok]");
     }
 

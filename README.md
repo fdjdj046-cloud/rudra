@@ -156,7 +156,7 @@ Linux x86_64. Номер в `rax`, возврат в `rax`, аргументы:
 
 Частые номера: 0 read, 1 write, 2 open, 9 mmap, 12 brk, 56 clone, 57 fork,
 41 socket, 44 sendto, 45 recvfrom, 49 bind, 59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
-UDP `AF_INET`: петля и virtio-net. TCP, IPv6 и netlink возвращают ошибку.
+UDP `AF_INET`: петля и virtio-net, сумма на проводе (0 на IPv4 принимается). TCP, IPv6 и netlink возвращают ошибку.
 Полный разбор — `rudra/src/linux.rs`. `SFMask` гасит IF на время entry.
 
 syscall не переключает CR3: kernel-половина замаплена в каждом адресном пространстве,

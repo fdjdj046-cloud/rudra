@@ -678,6 +678,7 @@ static COUNTER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/counter.el
 static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"));
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
 static SIGNAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/signal.elf"));
+static TICK_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tick.elf"));
 static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
 static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"));
 static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
@@ -685,13 +686,14 @@ static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 9] = [
+    const BINS: [(&str, &[u8]); 10] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
         ("/bin/fizzbuzz.elf", FIZZ_ELF),
         ("/bin/threads.elf", THREADS_ELF),
         ("/bin/signal.elf", SIGNAL_ELF),
+        ("/bin/tick.elf", TICK_ELF),
         ("/bin/epoll.elf", EPOLL_ELF),
         ("/bin/interp.elf", INTERP_ELF),
         ("/bin/dyn.elf", DYN_ELF),
@@ -1168,6 +1170,20 @@ pub fn current_tid() -> u64 {
         return 0;
     }
     with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.tid).unwrap_or(0))
+}
+
+/// Сколько tid выдано и сколько задач сейчас `Runnable`.
+/// Для `/proc/stat`: это не jiffies и не число процессов Linux.
+pub fn proc_counts() -> (u64, u64) {
+    let created = NEXT_TID.load(Ordering::Relaxed).saturating_sub(1);
+    let running = with_tasks(|tasks| {
+        tasks
+            .iter()
+            .flatten()
+            .filter(|t| matches!(t.state, TaskState::Runnable))
+            .count() as u64
+    });
+    (created, running)
 }
 
 /// Доступ к текущей задаче под TASKS-локом.
@@ -1999,6 +2015,11 @@ fn schedule(current_rsp: u64) -> u64 {
     unsafe { Msr::new(0xC000_0100).write(next_fs) };
     gdt::set_kernel_stack(VirtAddr::new(next_kstack_top));
     syscall::set_current_kstack(next_kstack_top);
+
+    // Кадр next — тот, в который iret. rseq уже сдвинул rip уходящей
+    // задачи; если это та же задача, обработчик сохранит уже abort.
+    // CR3 уже её: user_write идёт в её страницы. TASKS здесь не держим.
+    crate::signal::deliver_timer(next_rsp);
 
     next_rsp
 }

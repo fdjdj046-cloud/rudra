@@ -108,6 +108,51 @@ impl BootInfoFrameAllocator {
         self.bump_count
     }
 
+    /// Usable из карты загрузчика и ещё не выданные кадры плюс свободный список.
+    /// Дыра трамплина может попасть в свободные. Это не MemAvailable.
+    pub fn bytes_total_free(&self) -> (u64, u64) {
+        let mut total = 0u64;
+        for i in 0..self.region_count {
+            let region = self.memory_regions[i];
+            if region.kind == MemoryRegionKind::Usable && region.end > region.start {
+                total = total.saturating_add(region.end - region.start);
+            }
+        }
+        let mut free_pages = 0u64;
+        let mut region_i = self.cursor_region;
+        let mut cursor = self.cursor;
+        while region_i < self.region_count {
+            let region = self.memory_regions[region_i];
+            if region.kind == MemoryRegionKind::Usable {
+                let start = if cursor < region.start {
+                    align4k(region.start)
+                } else {
+                    cursor
+                };
+                if start < region.end {
+                    free_pages = free_pages.saturating_add((region.end - start) / 4096);
+                }
+            }
+            region_i += 1;
+            cursor = 0;
+        }
+        let mut phys = self.free_head;
+        let cap = total / 4096 + 1;
+        let mut seen = 0u64;
+        let off = crate::PHYS_OFFSET.load(Ordering::Relaxed);
+        while phys != FREE_EMPTY && seen < cap && off != 0 {
+            free_pages = free_pages.saturating_add(1);
+            let virt = off.wrapping_add(phys);
+            phys = unsafe { core::ptr::read_volatile(virt as *const u64) };
+            seen += 1;
+        }
+        let mut free = free_pages.saturating_mul(4096);
+        if free > total {
+            free = total;
+        }
+        (total, free)
+    }
+
     fn skip_to_frame(&mut self) {
         while self.cursor_region < self.region_count {
             let region = self.memory_regions[self.cursor_region];
@@ -180,6 +225,11 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         }
         self.bump_frame()
     }
+}
+
+/// Байты usable и оценка свободных кадров. Для `/proc/meminfo`.
+pub fn mem_bytes() -> (u64, u64) {
+    with_frame_allocator(|fa| fa.bytes_total_free())
 }
 
 /// Несколько подряд идущих кадров. Нужны virtqueue и DMA: устройство видит

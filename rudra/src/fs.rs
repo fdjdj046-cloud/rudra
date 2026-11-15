@@ -483,7 +483,7 @@ fn ext2_on() -> bool {
 /// Синтетические `/proc` и `/sys`. На диск не пишутся: ни на ext2, ни на ramdisk.
 fn synth_children(name: &str) -> Option<&'static [&'static str]> {
     match name {
-        "/proc" => Some(&["cpuinfo", "uptime"]),
+        "/proc" => Some(&["cpuinfo", "meminfo", "stat", "uptime"]),
         "/sys" => Some(&["devices", "kernel"]),
         "/sys/devices" => Some(&["system"]),
         "/sys/devices/system" => Some(&["cpu"]),
@@ -506,6 +506,23 @@ fn synth_body(name: &str) -> Option<String> {
             "processor\t: 0\nsiblings\t: {}\n",
             crate::smp::cpu_count()
         )),
+        "/proc/meminfo" => {
+            let (total, free) = crate::memory::mem_bytes();
+            Some(format!(
+                "MemTotal: {} kB\nMemFree: {} kB\n",
+                total / 1024,
+                free / 1024
+            ))
+        }
+        "/proc/stat" => {
+            let ticks = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+            let (created, running) = crate::task::proc_counts();
+            // user, nice и idle не считаем. Тики планировщика лежат в system.
+            Some(format!(
+                "cpu  0 0 {} 0 0 0 0 0 0 0\nprocesses {}\nprocs_running {}\n",
+                ticks, created, running
+            ))
+        }
         // Задачи крутит только BSP, даже если AP уже подняты.
         "/sys/devices/system/cpu/online" => Some("0\n".into()),
         "/sys/kernel/hostname" => Some("rudra\n".into()),
@@ -851,6 +868,8 @@ mod tests {
         let names = list_dir("/proc");
         assert!(names.iter().any(|n| n == "uptime"));
         assert!(names.iter().any(|n| n == "cpuinfo"));
+        assert!(names.iter().any(|n| n == "meminfo"));
+        assert!(names.iter().any(|n| n == "stat"));
         assert!(list_dir("/").iter().any(|n| n == "proc"));
         let mut buf = [0u8; 64];
         let n = read_at("/proc/uptime", 0, &mut buf);
@@ -858,6 +877,19 @@ mod tests {
         assert!(buf[0].is_ascii_digit());
         assert!(buf[..n as usize].contains(&b' '));
         assert!(read_at("/proc/cpuinfo", 0, &mut buf) > 0);
+        let mut wide = [0u8; 128];
+        let n = read_at("/proc/meminfo", 0, &mut wide);
+        assert!(n > 0);
+        let text = core::str::from_utf8(&wide[..n as usize]).unwrap();
+        let total = kb_field(text, "MemTotal:");
+        let free = kb_field(text, "MemFree:");
+        assert!(total > 0);
+        assert!(free <= total);
+        let n = read_at("/proc/stat", 0, &mut wide);
+        let text = core::str::from_utf8(&wide[..n as usize]).unwrap();
+        assert!(text.starts_with("cpu  "));
+        assert!(text.contains("processes "));
+        assert!(text.contains("procs_running "));
         assert_eq!(unlink("/proc/uptime"), Err(FsError::Perm));
         assert!(write_canon("/proc/uptime", b"x") < 0);
         serial_println!("[ok]");
@@ -884,5 +916,11 @@ mod tests {
         assert_eq!(unlink("/sys/kernel/hostname"), Err(FsError::Perm));
         assert!(write_canon("/sys/kernel/hostname", b"x") < 0);
         serial_println!("[ok]");
+    }
+
+    fn kb_field(text: &str, key: &str) -> u64 {
+        let line = text.lines().find(|l| l.starts_with(key)).expect(key);
+        let num = line.split_whitespace().nth(1).expect("kb");
+        num.parse().expect("kb number")
     }
 }
