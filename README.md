@@ -4,7 +4,7 @@
 
 *by Cisco*
 
-![Rust](https://img.shields.io/badge/rust-n nightly-orange)
+![Rust](https://img.shields.io/badge/rust-nightly-orange)
 ![Target](https://img.shields.io/badge/target-x86__64--unknown--none-blue)
 ![QEMU](https://img.shields.io/badge/runs%20on-QEMU%2011-green)
 ![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-lightgrey)
