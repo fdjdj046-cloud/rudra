@@ -16,6 +16,7 @@ pub mod input;
 pub mod interrupts;
 pub mod linux;
 pub mod memory;
+pub mod pci;
 pub mod serial;
 pub mod syscall;
 pub mod task;
@@ -58,6 +59,7 @@ pub fn init(boot_info: &mut BootInfo) {
 
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();
+    pci::scan();
 }
 
 pub fn hlt_loop() -> ! {

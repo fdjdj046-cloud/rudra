@@ -74,6 +74,7 @@
   файл создаётся только внутри существующего родителя. Имя по-прежнему полный путь.
   Образ `rootfs/` собирается `scripts/pack_rfs.py` и вшивается в ядро
   (`include_bytes!`, не ramdisk bootloader'а)
+- **PCI**: обход шины 0 (мост, IDE, VGA, e1000 в QEMU). VirtIO-поверх этого ещё нет
 - **Тесты прямо в ядре**: `cargo test` собирает тестовый бинарь ядра и гоняет его
   в QEMU через `isa-debug-exit` — код 33 = pass, 35 = fail
 
@@ -116,6 +117,7 @@ rudra/
     ├── linux.rs        # номера syscall'ов Linux x86_64
     ├── task.rs         # ELF, fork/clone/execve, адресные пространства, round-robin
     ├── fs.rs           # RFS2, 8 МиБ, каталоги — отдельные записи
+    ├── pci.rs          # обход шины 0 через 0xCF8/0xCFC
     ├── memory.rs       # OffsetPageTable, frame allocator (глобальный, один)
     ├── allocator.rs    # bump-аллокатор кучи (48 МиБ)
     ├── framebuffer.rs  # DrawTarget + текстовый писатель (baseline-семантика!)
