@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Сборка ядра + создание boot-образов (BIOS/UEFI).
+# Сборка user-программы + ядра + boot-образов (BIOS/UEFI).
 set -e
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo build --target x86_64-unknown-none
+echo "== building user program (ring 3, static relocation)"
+# Статическая релокация: без PIE/GOT, иначе нужен обход динамических релокаций.
+RUSTFLAGS="-C relocation-model=static" cargo build -p user --release --target x86_64-unknown-none
+
+echo "== building kernel"
+cargo build -p rudra --target x86_64-unknown-none
+
+echo "== creating disk images"
 (cd builder && cargo run --release)
 echo "images: target/images/rudra-bios.img, target/images/rudra-uefi.img"

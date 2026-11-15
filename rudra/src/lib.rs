@@ -13,6 +13,8 @@ pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
+pub mod syscall;
+pub mod task;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +24,10 @@ use x86_64::VirtAddr;
 pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Общая инициализация ядра: serial, GDT/TSS, IDT, framebuffer, пейджинг, куча, PIC.
-pub fn init(boot_info: &'static mut BootInfo) {
+pub fn init(boot_info: &mut BootInfo) {
     serial::init();
     gdt::init();
+    syscall::init();
     interrupts::init_idt();
 
     if let Some(fb) = boot_info.framebuffer.take() {
@@ -38,8 +41,10 @@ pub fn init(boot_info: &'static mut BootInfo) {
     PHYS_OFFSET.store(phys_offset, Ordering::Relaxed);
 
     let mut mapper = unsafe { memory::init(VirtAddr::new(phys_offset)) };
-    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    memory::init_frame_allocator(&boot_info.memory_regions);
+    memory::with_frame_allocator(|fa| {
+        allocator::init_heap(&mut mapper, fa).expect("heap initialization failed");
+    });
 
     unsafe {
         interrupts::init_pics();

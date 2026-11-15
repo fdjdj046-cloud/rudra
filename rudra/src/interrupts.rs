@@ -21,7 +21,7 @@ pub enum InterruptIndex {
 }
 
 impl InterruptIndex {
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         self as u8
     }
 }
@@ -37,7 +37,12 @@ lazy_static! {
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
-        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+        // Таймер — asm-обработчик (полное сохранение регистров + переключение задач).
+        unsafe {
+            idt[InterruptIndex::Timer.as_u8()].set_handler_addr(x86_64::VirtAddr::new(
+                crate::task::timer_handler_addr(),
+            ));
+        }
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt
     };
@@ -74,8 +79,42 @@ extern "x86-interrupt" fn page_fault_handler(
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("  accessed address (CR2): {:?}", accessed);
     serial_println!("  error code: {:?}", error_code);
+    if let Ok(addr) = accessed {
+        dump_page_tables(addr.as_u64());
+    }
     serial_println!("  {:#?}", stack_frame);
     panic!("page fault at {:?}, code {:?}", accessed, error_code);
+}
+
+/// Обход таблиц страниц для адреса: печатаем present-флаги по уровням.
+fn dump_page_tables(addr: u64) {
+    use x86_64::structures::paging::PageTable;
+    use x86_64::structures::paging::page_table::PageTableLevel;
+    let phys_offset = x86_64::VirtAddr::new(crate::PHYS_OFFSET.load(core::sync::atomic::Ordering::Relaxed));
+    let (l4_frame, _) = x86_64::registers::control::Cr3::read();
+    serial_println!("  [pt] CR3 = {:?}", l4_frame.start_address());
+    let mut frame = l4_frame;
+    for level in [PageTableLevel::Four, PageTableLevel::Three, PageTableLevel::Two, PageTableLevel::One] {
+        let table = unsafe { &*((phys_offset + frame.start_address().as_u64()).as_mut_ptr() as *const PageTable) };
+        let idx = match level {
+            PageTableLevel::Four => (addr >> 39) & 0x1ff,
+            PageTableLevel::Three => (addr >> 30) & 0x1ff,
+            PageTableLevel::Two => (addr >> 21) & 0x1ff,
+            PageTableLevel::One => (addr >> 12) & 0x1ff,
+        };
+        let entry = &table[idx as usize];
+        serial_println!(
+            "  [pt] L{}[{}] = {:#x} present={}",
+            level as u8, idx, entry.addr().as_u64(), entry.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+        );
+        if !entry.flags().contains(x86_64::structures::paging::PageTableFlags::PRESENT) {
+            return;
+        }
+        match x86_64::structures::paging::PhysFrame::from_start_address(entry.addr()) {
+            Ok(f) => frame = f,
+            Err(_) => return, // huge page
+        }
+    }
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
@@ -85,20 +124,6 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT, code {:#x}", error_code);
     serial_println!("  {:#?}", stack_frame);
     panic!("general protection fault, code {:#x}", error_code);
-}
-
-static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    let ticks = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    // PIT по умолчанию ~18.2 Гц: раз в ~100 тиков (~5 с) печатаем heartbeat.
-    if ticks % 100 == 0 {
-        serial_println!("timer: {} ticks (~{} s)", ticks, ticks / 18);
-    }
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
