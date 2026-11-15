@@ -2,6 +2,8 @@
 
 **Учебная x86-64 операционная система на Rust** — с нуля, без `std`, с настоящим userspace в ring 3, вытесняющим планировщиком и framebuffer-консолью.
 
+*by Cisco*
+
 ![Rust](https://img.shields.io/badge/rust-n nightly-orange)
 ![Target](https://img.shields.io/badge/target-x86__64--unknown--none-blue)
 ![QEMU](https://img.shields.io/badge/runs%20on-QEMU%2011-green)
