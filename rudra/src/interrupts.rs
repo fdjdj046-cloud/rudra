@@ -46,6 +46,8 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.device_not_available.set_handler_fn(device_not_available_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
         // Таймер — asm-обработчик (полное сохранение регистров + переключение задач).
         unsafe {
@@ -90,16 +92,14 @@ extern "x86-interrupt" fn page_fault_handler(
     // управление на другую задачу (см. task::exit_current).
     if stack_frame.code_segment.0 & 0x3 == 3 {
         serial_println!(
-            "[task {}] PAGE FAULT at {:?}, code {:?}, rip {:#x} — killing task",
+            "[task {}] PAGE FAULT at {:?}, code {:?}, rip {:#x} rsp {:#x} — killing task",
             crate::task::current_slot(),
             accessed,
             error_code,
             stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64(),
         );
-        crate::task::exit_current();
-        loop {
-            x86_64::instructions::hlt();
-        }
+        kill_user_and_yield();
     }
     serial_println!("EXCEPTION: PAGE FAULT");
     serial_println!("  accessed address (CR2): {:?}", accessed);
@@ -109,6 +109,16 @@ extern "x86-interrupt" fn page_fault_handler(
     }
     serial_println!("  {:#?}", stack_frame);
     panic!("page fault at {:?}, code {:?}", accessed, error_code);
+}
+
+/// Задача в ring 3 смертельна для себя, но не для ядра: помечаем её
+/// завершённой и открываем прерывания, чтобы таймер переключил контекст.
+fn kill_user_and_yield() -> ! {
+    crate::task::exit_current();
+    x86_64::instructions::interrupts::enable();
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 /// Обход таблиц страниц для адреса: печатаем present-флаги по уровням.
@@ -142,20 +152,46 @@ fn dump_page_tables(addr: u64) {
     }
 }
 
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    if stack_frame.code_segment.0 & 0x3 == 3 {
+        serial_println!(
+            "[task {}] #UD rip {:#x} rsp {:#x} — killing task",
+            crate::task::current_slot(),
+            stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64(),
+        );
+        kill_user_and_yield();
+    }
+    serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+    panic!("invalid opcode");
+}
+
+extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
+    if stack_frame.code_segment.0 & 0x3 == 3 {
+        serial_println!(
+            "[task {}] #NM rip {:#x} — killing task",
+            crate::task::current_slot(),
+            stack_frame.instruction_pointer.as_u64(),
+        );
+        kill_user_and_yield();
+    }
+    serial_println!("EXCEPTION: DEVICE NOT AVAILABLE\n{:#?}", stack_frame);
+    panic!("device not available");
+}
+
 extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
     if stack_frame.code_segment.0 & 0x3 == 3 {
         serial_println!(
-            "[task {}] GENERAL PROTECTION FAULT, code {:#x} — killing task",
+            "[task {}] GENERAL PROTECTION FAULT, code {:#x} rip {:#x} rsp {:#x} — killing task",
             crate::task::current_slot(),
-            error_code
+            error_code,
+            stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64(),
         );
-        crate::task::exit_current();
-        loop {
-            x86_64::instructions::hlt();
-        }
+        kill_user_and_yield();
     }
     serial_println!("EXCEPTION: GENERAL PROTECTION FAULT, code {:#x}", error_code);
     serial_println!("  {:#?}", stack_frame);

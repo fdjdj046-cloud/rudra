@@ -272,19 +272,24 @@ fn copy_user_space(
     Ok(new_l4)
 }
 
-/// Писать байты в user-память чужого/своего АП через translate (physmap).
+/// Писать байты в user-память АП `l4` через physmap.
+///
+/// `translate_addr` уже возвращает физический адрес байта, а не базы
+/// страницы. Смещение прибавлять второй раз нельзя: запись уезжала в
+/// следующий физический кадр (страница ELF сразу за вершиной стека) и
+/// затирала GOT парой auxv `AT_BASE, 0`.
 fn write_user(l4: PhysFrame, addr: u64, data: &[u8]) -> Result<(), MapToError<Size4KiB>> {
-    let mut mapper = unsafe { mapper_for(l4) };
+    let mapper = unsafe { mapper_for(l4) };
     let mut done = 0usize;
     while done < data.len() {
         let a = addr + done as u64;
-        let frame = mapper
+        let phys = mapper
             .translate_addr(VirtAddr::new(a))
             .ok_or(MapToError::FrameAllocationFailed)?;
         let page_off = (a & 0xFFF) as usize;
         let n = (4096 - page_off).min(data.len() - done);
-        let dst = (phys_offset() + frame.as_u64()).as_u64() + page_off as u64;
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), dst as *mut u8, n) };
+        let dst = (phys_offset().as_u64() + phys.as_u64()) as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), dst, n) };
         done += n;
     }
     Ok(())
@@ -319,6 +324,8 @@ pub struct Task {
     pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
     pub cwd: String,
     pub umask: u32,
+    /// Сохранённые xmm/x87. Пустой образ = чистый FPU при первом входе.
+    fx: crate::fpu::FxState,
 }
 
 static TASKS: Mutex<[Option<Task>; MAX_TASKS]> = Mutex::new([
@@ -609,6 +616,16 @@ pub fn load_elf_image(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
+    // На входе в _start %rsp обязан быть кратен 16 (psABI): первый call
+    // тогда входит в функцию с (%rsp+8) кратным 16. Иначе glibc ловит #GP
+    // на выровненных movaps. Все куски ниже кратны 8, так что хватает 0 или 8.
+    let vectors = auxv_bytes.len()
+        + (envp_ptrs.len() + 1) * 8
+        + (argv_ptrs.len() + 1) * 8
+        + 8;
+    if sp.wrapping_sub(vectors as u64) & 0xF != 0 {
+        sp -= 8;
+    }
     sp -= auxv_bytes.len() as u64;
     write_user(l4, sp, &auxv_bytes)?;
 
@@ -676,6 +693,7 @@ fn finish_task(
         fds: default_fds(),
         cwd: String::from("/"),
         umask: 0o022,
+        fx: crate::fpu::FxState::new(),
     })
 }
 
@@ -880,7 +898,7 @@ pub fn sys_clone(
             Arc::new(Mutex::new(cloned))
         };
 
-        let task = Task {
+        let mut task = Task {
             tid: child_tid,
             aspace: child_as,
             cr3: child_l4,
@@ -895,7 +913,10 @@ pub fn sys_clone(
             fds,
             cwd: if flags & CLONE_FS != 0 { parent_cwd } else { parent_cwd },
             umask: parent_umask,
+            fx: crate::fpu::FxState::new(),
         };
+        // Ребёнок должен увидеть те же xmm, что и родитель в точке clone.
+        crate::fpu::save(&mut task.fx);
         unsafe {
             let f = rsp as *const u64;
             crate::serial_println!(
@@ -992,13 +1013,30 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         let n = nb.len().min(23);
         t.name = [0u8; 24];
         t.name[..n].copy_from_slice(&nb[..n]);
+        // Старые xmm предыдущего образа новому процессу не принадлежат.
+        crate::fpu::forget(&mut t.fx);
     });
+    crate::fpu::reset_cpu();
     unsafe {
         Cr3::write(l4, Cr3Flags::empty());
         let f = frame;
+        // ELF_PLAT_INIT: на входе в _start регистры нулевые. Иначе glibc
+        // принимает rdx за rtld_fini и на exit зовёт мусор (часто адрес стека).
+        *f.add(FRAME::R15) = 0;
+        *f.add(FRAME::R14) = 0;
+        *f.add(FRAME::R13) = 0;
+        *f.add(FRAME::R12) = 0;
+        *f.add(FRAME::RBP) = 0;
+        *f.add(FRAME::RBX) = 0;
+        *f.add(FRAME::R9) = 0;
+        *f.add(FRAME::R8) = 0;
+        *f.add(FRAME::RDX) = 0;
+        *f.add(FRAME::RSI) = 0;
+        *f.add(FRAME::RDI) = 0;
+        *f.add(FRAME::RAX) = 0;
+        *f.add(FRAME::RFLAGS) = 0x202;
         *f.add(FRAME::RIP) = img.entry;
         *f.add(FRAME::RSP) = img.user_rsp;
-        *f.add(FRAME::RAX) = 0;
     }
     0
 }
@@ -1324,6 +1362,14 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
         if prev >= 0 {
             if let Some(t) = tasks[prev as usize].as_mut() {
                 t.kernel_rsp = current_rsp;
+                if prev as usize != next {
+                    crate::fpu::save(&mut t.fx);
+                }
+            }
+        }
+        if prev < 0 || prev as usize != next {
+            if let Some(t) = tasks[next].as_ref() {
+                crate::fpu::restore(&t.fx);
             }
         }
         let task = tasks[next].as_ref().expect("runnable task disappeared");
@@ -1362,7 +1408,12 @@ timer_entry:
     push r13
     push r14
     push r15
-    mov rdi, rsp
+    # Тот же контракт, что у syscall_entry: перед call выровнять rsp вниз
+    # до 16, чтобы Rust вошёл с rsp ≡ 8 (mod 16). Сохранённый контекст — rbx,
+    # он callee-saved и не входит в выравнивание.
+    mov rbx, rsp
+    mov rdi, rbx
+    and rsp, -16
     call timer_switch
     mov rsp, rax
     pop r15

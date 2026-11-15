@@ -394,6 +394,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             0
         }
         39 => task::current_tid(),
+        102 | 104 | 107 | 108 => 1000, // getuid/getgid/geteuid/getegid
+        105 | 106 => 0,                 // setuid/setgid: один пользователь
+        157 => 0,                     // prctl: PR_SET_NAME и прочее — no-op
         56 => task::sys_clone(a1, a2, a3, a4, a5, frame),
         57 | 58 => {
             // fork / vfork: clone без флагов
@@ -587,8 +590,6 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             0
         }
         100 => crate::interrupts::TICKS.load(Ordering::Relaxed) as u64, // times
-        102 | 107 => 1000,  // getuid / geteuid
-        104 | 108 => 1000,  // getgid / getegid
         110 => {
             // getppid
             let parent = task::with_current_task(|t| t.parent).unwrap_or(-1);

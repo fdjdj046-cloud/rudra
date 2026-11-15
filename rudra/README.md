@@ -1,18 +1,29 @@
+# rudra
 
----
+Заметки к ядру. Общий обзор, скриншоты и сборка — в [README](../README.md) репозитория.
 
-## v0.6 (WIP): Linux ABI + многопоточность + busybox
+## v0.6: Linux ABI, SSE, busybox, потоки
 
-В разработке. Сделано: RFS2 (каталоги, 8MiB, длинные имена), адресные
-пространства с refcount, fork/clone/execve/wait4, слой Linux syscall'ов
-(файлы, brk/mmap, pipe, poll, futex-spin, stat), шелл на execve с
-busybox-fallback, статический busybox в /bin/busybox, threads.elf.
+Проверено в QEMU на `target/images/rudra-bios.img`:
 
-Работает: `run /bin/hello.elf` (fork+execve+wait4, вывод в консоль).
-Известные баги: (1) `println!("pid = {}", getpid())` — user fault rip=0x7
-после первой строки hello (вторая println с форматированием числа);
-(2) `ls /` — PF at 0x58 в шелле; (3) threads.elf молчит (вероятно тот же
-баг форматирования). Диагностические логи: [clone] child frame, [execve].
-Ключевой фикс этого релиза: remap регистров syscall_entry→timer_entry
-в sys_clone (раскладки push/pop разные!) + стартовый фрейм на T-320
-(верхние 160 байт kernel-стека затирает первое прерывание).
+- `hello.elf` печатает `pid = 2` и выходит с кодом 0
+- шелл: `ls /`, `pwd`, `echo`, `cat /motd.txt`, `ps`, `uname` возвращаются к приглашению
+- `/bin/busybox`: `ls /`, `cat /motd.txt`, `echo hi`, `wc -c /motd.txt` (291 байт), `true` — код 0
+- `/bin/busybox yes` печатает `y`, пока жива ВМ
+- `threads.elf`: четыре `clone`, общий счётчик `400000`, строка `OK, race-free`, код 0
+
+Ядро принимает **Linux x86_64 syscall ABI** (`rax` — номер, аргументы `rdi/rsi/rdx/r10/r8/r9`). В `/bin/busybox` лежит статический glibc-бинарь (`ET_EXEC`, без `PT_INTERP`). Внешняя команда шелла — это `execve` busybox с argv `busybox <cmd>`.
+
+Что это держит:
+
+- SSE включает само ядро (`fpu.rs`): bootloader 0.11 его не включает. На смене задачи — `fxsave64` / `fxrstor64`. `CR4.OSXSAVE` не ставится, чтобы glibc не выбирал AVX-ifunc.
+- Перед `call` из `syscall_entry` и `timer_entry` стек выравнивается на 16 байт. Иначе `fxsave64` ловит `#GP` с кодом 0.
+- `execve` обнуляет регистры общего назначения (ELF_PLAT_INIT). Иначе glibc принимает `rdx` за `rtld_fini` и на выходе прыгает в мусор.
+- `write_user` пишет по физическому адресу байта и не прибавляет смещение в странице второй раз. Иначе хвост auxv затирал GOT, и `println!("pid = {}", …)` падал на `rip = 0x7`.
+- Стартовый кадр задачи лежит на `T-320`: первое аппаратное прерывание затирает верхние ~160 байт kernel-стека.
+- `sys_clone` собирает кадр ребёнка в раскладке `timer_entry`, не `syscall_entry`.
+- Мьютекс в `threads.elf` — спинлок. Futex в ядре есть, но на одном CPU с тиком PIT ~55 мс сон на каждую короткую секцию не успевает открутить 400 тысяч итераций.
+
+Ещё возвращают `ENOSYS`, и программы при этом доживают до `exit 0`: `readlinkat` (267), `sendfile` (40), `time` (201). `rseq` (334) — тоже `ENOSYS`, специально.
+
+Каталоги RFS2 пока синтетические: файл хранится по полному пути, а `ls /bin` — это префикс имён. Настоящие каталоги, VirtIO-blk и SMP в этот коммит не входят.

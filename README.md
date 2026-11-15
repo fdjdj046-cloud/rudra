@@ -26,6 +26,12 @@
 
 ![fs shell](doc/shell-fs-v0.5.0.png)
 
+**Linux ABI и статический busybox** (v0.6): ядро говорит на syscall'ах Linux x86_64.
+`ls /` в шелле, `hello` печатает `pid`, `/bin/busybox` (`ls`, `cat`, `echo`, `wc`, `true`, `yes`)
+и `threads.elf` (четыре `clone`, общий счётчик без гонки) доходят до `exit 0`.
+
+![shell v0.6](doc/shell-v0.6.png)
+
 Две задачи в ring 3 работают одновременно — планировщик на таймере PIT вытесняет их
 посимвольно (в serial вывод перемешивается: `uusseerr ttaasskk...`), на экране строки
 целые, потому что framebuffer-писатель под мьютексом.
@@ -35,45 +41,57 @@
 - **Загрузка** через [bootloader](https://github.com/rust-osdev/bootloader) 0.11
   (BIOS и UEFI/OVMF), собственный builder диск-образов
 - **Память**: пейджинг поверх маппинга всей физической памяти, frame allocator
-  по карте памяти от bootloader'а, куча 1 МиБ со своим bump-аллокатором
+  по карте памяти от bootloader'а, куча 48 МиБ со своим bump-аллокатором
 - **Прерывания**: IDT с обработчиками breakpoint / double fault (отдельный IST-стек) /
-  **page fault с дампом обхода таблиц L4→L1 и адресом CR2** / general protection fault;
-  PIC ремапплен на векторы 32–47; PS/2 клавиатура; PIT
+  **page fault с дампом обхода таблиц L4→L1 и адресом CR2** / general protection /
+  `#UD` / `#NM`; PIC ремапплен на векторы 32–47; PS/2 клавиатура; PIT.
+  Пользовательский fault убивает задачу и возвращает шелл, ядровой — паника
 - **Framebuffer-консоль**: свой `DrawTarget` поверх framebuffer от bootloader'а,
   растеризация через [embedded-graphics](https://github.com/embedded-graphics/embedded-graphics)
   + шрифт 8×13, скроллинг, `print!/println!` пишут **одновременно** в serial и на экран
 - **Userspace (ring 3)**:
   - GDT с user code/data-сегментами, TSS с переключаемым kernel-стеком
-  - интерфейс **syscall/sysret** (LSTAR/STAR/SFMask), syscall'ы:
-    `write`, `read` (блокирующий, клавиатура), `yield`, `spawn`, `exit`
-  - загрузка ELF, у каждой задачи **своё адресное пространство**
+  - интерфейс **syscall/sysret** (LSTAR/STAR/SFMask) с **Linux x86_64 ABI**:
+    `read/write/openat/close/stat/brk/mmap/clone/execve/wait4/futex/getdents64`
+    и соседние номера. `r10` — четвёртый аргумент, entry его не затирает
+  - **SSE/FPU**: ядро само включает FXSAVE (`CR0.EM=0`, `CR4.OSFXSR`, без `OSXSAVE`).
+    У каждой задачи свой 512-байтный образ, снимок на `clone` и на смене контекста
+  - загрузка ELF `ET_EXEC`, у каждой задачи **своё адресное пространство**
     (своя L4: kernel-половина + user-страницы `USER_ACCESSIBLE` в low entry —
-    ring 3 не может тронуть страницы ядра); парсер ELF64 — свой, минимальный
-  - user-программы собираются отдельным no_std-крейтом со статической релокацией
-    (без PIE/GOT — релокации не нужны)
-  - **интерактивный шелл** с эхом, backspace и командами
-    (`hello`, `counter`, `help`, `clear`, `exit`); завершённые задачи
-    освобождают слоты, `spawn` их переиспользует
-- **Планировщик**: вытесняющий round-robin на PIT (4 слота задач, Runnable/Exited). Переключение контекста —
-  сохранение 15 регистров в asm, смена CR3 + TSS.rsp0 + syscall-стека, `iretq`.
+    ring 3 не может тронуть страницы ядра); парсер ELF64 — свой, минимальный.
+    Статический glibc (busybox) применяет свои `R_X86_64_IRELATIVE` сам
+  - user-программы на Rust собираются отдельным no_std-крейтом со статической
+    релокацией (`-C relocation-model=static`, скрипт `user/user.ld`)
+  - **интерактивный шелл** с эхом и backspace. Встроенные команды ниже;
+    внешняя — `execve` файла, `/bin/<cmd>`, `/bin/<cmd>.elf` или
+    `/bin/busybox` с argv `busybox <cmd>`. Завершённые задачи освобождают слоты
+- **Планировщик**: вытесняющий round-robin на PIT (~18.2 Гц). Переключение контекста —
+  сохранение 15 регистров в asm, `fxsave64`/`fxrstor64` при смене задачи,
+  смена CR3 + TSS.rsp0 + syscall-стека, `iretq`.
   Корректно работает и при вложенном прерывании внутри syscall
-- **Ramdisk-ФС** (RFS1, 256 KiB в куче, плоское пространство имён): read / write /
-  create-or-replace / delete / list. Образ `rootfs/` собирается `scripts/pack_rfs.py`
-  на хосте; user-программы — файлы `/bin/*.elf`, `spawn_path` грузит ELF из ФС
+- **Ramdisk-ФС** (RFS2, 8 МиБ в куче): полные пути до 64 байт, read / write /
+  create-or-replace / delete / list. Каталоги пока синтетические — это префикс
+  имени (`/bin/shell.elf` лежит плоско, `ls /bin` режет по префиксу).
+  Образ `rootfs/` собирается `scripts/pack_rfs.py` и вшивается в ядро
+  (`include_bytes!`, не ramdisk bootloader'а)
 - **Тесты прямо в ядре**: `cargo test` собирает тестовый бинарь ядра и гоняет его
   в QEMU через `isa-debug-exit` — код 33 = pass, 35 = fail
 
 ### Шелл и команды (ring 3)
 
 ```
-ls [фильтр]               список файлов ramdisk'а
+ls [путь]                 список (каталоги — префиксы имён)
 cat <файл>                напечатать файл
 echo <текст>              напечатать текст
-echo <текст> > <файл>     записать в файл
-run <программа>           запустить /bin/<программа>.elf
-rm <файл>                 удалить
-uname / pwd / help / clear / exit
+pwd / cd / mkdir / rm
+ps / uname / clear / exit
+run <программа>           execve пути, /bin/<имя> или /bin/<имя>.elf
+<команда> [аргументы]     то же, иначе /bin/busybox <команда>
 ```
+
+Прогнанный статический busybox: `ls`, `cat`, `echo`, `wc`, `true`, `yes`.
+`threads.elf` — четыре потока через `clone(CLONE_VM)` и спин-мьютекс,
+счётчик доходит до 400000 без гонки.
 
 ## Архитектура
 
@@ -82,19 +100,24 @@ rudra/
 ├── builder/            # сборка boot-образов (BIOS/UEFI) из ELF ядра
 ├── user/               # userspace-программы (ring 3, no_std, стат. релокация)
 │   └── user.ld         # линковка по 0x400000
+├── rootfs/             # то, что pack_rfs.py кладёт в RFS2 (bin/busybox, motd)
 ├── scripts/
 │   ├── build.sh        # user → kernel → образы
 │   ├── run-bios.sh     # QEMU, serial → stdout
 │   ├── run-uefi.sh     # QEMU + OVMF (q35)
+│   ├── pack_rfs.py     # rootfs/ → образ RFS2
 │   └── test.sh         # юнит-тесты ядра в QEMU (isa-debug-exit)
 └── src/
     ├── main.rs         # entry_point (bootloader_api), общий поток инициализации
-    ├── lib.rs          # init(): gdt → syscall → idt → fb → paging → heap → PIC
+    ├── lib.rs          # init(): gdt → fpu → syscall → idt → fb → paging → heap → PIC
     ├── gdt.rs          # kernel/user-сегменты, TSS (IST + privilege stack)
-    ├── syscall.rs      # EFER/LSTAR/STAR/SFMask, asm entry, dispatch
-    ├── task.rs         # ELF-загрузчик, адресные пространства, round-robin
+    ├── fpu.rs          # CR0/CR4, FXSAVE-образ задачи
+    ├── syscall.rs      # EFER/LSTAR/STAR/SFMask, asm entry, Linux-dispatch
+    ├── linux.rs        # номера syscall'ов Linux x86_64
+    ├── task.rs         # ELF, fork/clone/execve, адресные пространства, round-robin
+    ├── fs.rs           # RFS2, 8 МиБ, синтетические каталоги
     ├── memory.rs       # OffsetPageTable, frame allocator (глобальный, один)
-    ├── allocator.rs    # bump-аллокатор кучи (1 МиБ)
+    ├── allocator.rs    # bump-аллокатор кучи (48 МиБ)
     ├── framebuffer.rs  # DrawTarget + текстовый писатель (baseline-семантика!)
     ├── interrupts.rs   # IDT, PIC, клавиатура, page fault с дампом таблиц
     └── serial.rs       # COM1 (uart_16550), основной канал отладки
@@ -102,10 +125,17 @@ rudra/
 
 ### Конвенция syscall'ов
 
+Linux x86_64. Номер в `rax`, возврат в `rax`, аргументы:
+
 | Регистр | Назначение |
 |---|---|
-| `rax` | номер (1=write, 2=exit, 3=read, 4=yield, 6=read_file, 7=write_file, 8=list, 9=delete, 10=spawn_path), возврат в `rax` |
-| `rdi`, `rsi`, `rdx`, `r8` | аргументы 1–4 |
+| `rdi`, `rsi`, `rdx` | аргументы 1–3 |
+| `r10` | аргумент 4 (не `rcx`: `syscall` кладёт туда user `rip`) |
+| `r8`, `r9` | аргументы 5–6 |
+
+Частые номера: 0 read, 1 write, 2 open, 9 mmap, 12 brk, 56 clone, 57 fork,
+59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
+Полный разбор — `rudra/src/linux.rs`. `SFMask` гасит IF на время entry.
 
 syscall не переключает CR3: kernel-половина замаплена в каждом адресном пространстве,
 а entry переключается на kernel-стек текущей задачи (обновляется планировщиком).
@@ -113,8 +143,8 @@ syscall не переключает CR3: kernel-половина замапле�
 ### Как устроено переключение задач
 
 ```
-PIT IRQ0 → timer_entry (asm): push 15 регистров
-         → timer_switch (Rust): EOI, save rsp в текущую задачу,
+PIT IRQ0 → timer_entry (asm): push 15 регистров, rsp &= -16
+         → timer_switch (Rust): EOI, fxsave уходящей / fxrstor входящей,
            Cr3::write, TSS.rsp0 = kstack, syscall-стек = kstack,
            вернуть rsp следующей задачи
          → (asm): pop 15 регистров, iretq
@@ -165,11 +195,22 @@ QEMU ожидается в `C:\Program Files\qemu`.
    иначе первое же hardware interrupt ловит GPF на селекторе-фантоме.
 5. Сегменты ELF из `lld` **могут делить страницы** — маппить надо уникальные
    страницы, а копировать данные всех сегментов уже потом.
-6. Сегменты ELF из `lld` **могут делить страницы** — маппить надо уникальные
-   страницы, а копировать данные всех сегментов уже потом.
-7. xmas-elf 0.8 в no_std-сборке уходил в `unreachable!()` при обходе program
+6. xmas-elf 0.8 в no_std-сборке уходил в `unreachable!()` при обходе program
    headers (на хосте с тем же файлом — не воспроизводилось). Свой парсер
    ELF64-заголовка — 40 строк и ноль магии.
+7. **`translate_addr` возвращает физический адрес байта**, не базы кадра.
+   Второй раз прибавлять смещение внутри страницы нельзя: запись в хвост
+   пользовательского стека уезжает в следующий кадр и затирает чужой GOT.
+8. **На входе в `_start` регистры нулевые** (ELF_PLAT_INIT). Статический glibc
+   копирует `rdx` в `rtld_fini` и зовёт его на `exit`. Мусор в `rdx` — это
+   прыжок в стек уже после того, как программа отработала.
+9. **`fxsave64` требует 16-байтного выравнивания.** Пятнадцать `push` с
+   выровненного верха стека оставляют `rsp ≡ 8 (mod 16)`, голый `call` входит
+   в Rust с `rsp ≡ 0`, и снимок FPU ловит `#GP` с кодом 0. Перед `call` нужен
+   `and rsp, -16`.
+10. bootloader 0.11 **не включает SSE**. Первая `movd` у glibc — это `#UD`,
+    а без гейта `#UD` она превращается в double fault. `OSXSAVE` лучше не
+    ставить: glibc тогда выберет AVX-ifunc, которого ядро не ждёт.
 
 ## Дорожная карта
 
@@ -177,14 +218,13 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] Framebuffer-консоль, тесты в QEMU, клавиатура, таймер
 - [x] Ring 3: syscall/sysret, ELF, изоляция адресных пространств, round-robin
 - [x] Интерактивный шелл: клавиатура → read, spawn, exit с переиспользованием слотов
-- [x] Ramdisk-ФС: ls/cat/echo>/rm/run, программы как файлы /bin/*.elf, загрузка ELF из ФС
-- [ ] Каталоги в ФС и пути, загрузка программ с диска (VirtIO-blk), ext2 read-only
-- [ ] IPC и/или файловые дескрипторы вместо голого write
-- [ ] VirtIO-blk + простая FS (или ramdisk с ext2-readonly)
-- [ ] Драйвер диска → загрузка программ с диска, а не из образа ядра
-- [ ] Раздельные ядровые/пользовательские ELF, сложный (proper) ELF loader
+- [x] Ramdisk-ФС: ls/cat/echo/rm/run, программы как файлы /bin/*.elf, загрузка ELF из ФС
+- [x] Linux x86_64 ABI, fork/clone/execve/wait4, pipe, brk/mmap, статический busybox
+- [x] SSE/FXSAVE на задачу, `threads.elf` (clone + общий счётчик)
+- [ ] Настоящие каталоги вместо префиксов путей, VirtIO-blk, ext2 read-only
+- [ ] SMP: APIC, startup IPI, второй CPU
+- [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра
-- [ ] SMP: второй CPU, spinlocks
 - [ ] Сеть (virtio-net → UDP/TCP)
 
 ## Благодарности

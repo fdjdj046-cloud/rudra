@@ -14,7 +14,8 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
 /// Смещения (в u64-слотах от rsp) в сохранённом фрейме syscall_entry.
-/// Порядок push'ей: r10,rcx,r11,rax,rdi,rsi,rdx,r8,r9,rbx,rbp,r12..r15.
+/// Порядок push'ей: user-rsp, rcx, r11, rax, rdi, rsi, rdx, r8, r9, rbx, rbp, r12..r15.
+/// Слот RSP — это user-rsp, не исходный r10: arg4 передаётся в диспетчер из регистра.
 pub mod FRAME {
     pub const R15: usize = 0;
     pub const R14: usize = 1;
@@ -47,19 +48,24 @@ core::arch::global_asm!(r#"
 syscall_boot_stack:
     .space 32768
 syscall_boot_stack_top:
+    # Одноядерный scratch: user-rsp на время переключения стека.
+    # IF сброшен SFMask'ом до sti, поэтому гонки нет.
+syscall_scratch_rsp:
+    .quad 0
 
     .text
     .global syscall_entry
 syscall_entry:
     # На входе: rax=nr, rdi/rsi/rdx/r10/r8/r9=args, rcx=user rip, r11=user
     # rflags, IF очищен через SFMask. Стек — пользовательский.
-    mov r10, rsp
+    # r10 — это Linux-arg4, его НЕЛЬЗЯ затирать: сохраняем user-rsp в scratch.
+    mov qword ptr [rip + syscall_scratch_rsp], rsp
     mov rsp, qword ptr [rip + CURRENT_KSTACK]
     test rsp, rsp
     jnz 1f
     lea rsp, [rip + syscall_boot_stack_top]
 1:
-    push r10                    # user rsp
+    push qword ptr [rip + syscall_scratch_rsp]  # user rsp
     push rcx                    # user rip
     push r11                    # user rflags
     push rax                    # nr
@@ -75,16 +81,23 @@ syscall_entry:
     push r14
     push r15
 
-    # Стек (top=rsp): r15,r14,r13,r12,rbp,rbx,r9,r8,rdx,rsi,rdi,rax,r11,rcx,r10
-    mov rdi, [rsp + 11*8]       # nr
-    mov rsi, [rsp + 10*8]       # arg1 (rdi)
-    mov rdx, [rsp + 9*8]        # arg2 (rsi)
-    mov rcx, [rsp + 8*8]        # arg3 (rdx)
-    mov r8,  [rsp + 14*8]       # arg4 (r10 по Linux ABI)
-    mov r9, rsp                 # arg6: указатель на фрейм (arg5/6 оттуда)
+    # Стек (top=rsp): r15,r14,r13,r12,rbp,rbx,r9,r8,rdx,rsi,rdi,rax,r11,rcx,user-rsp
+    # r10 всё ещё содержит настоящий arg4.
+    # 15 пушей оставляют rsp кратным 8, но не 16. call тогда входит в Rust
+    # с rsp ≡ 0 (mod 16), а psABI требует ≡ 8 — иначе align(16) локали
+    # (образ FXSAVE) попадают на #GP. rbx уже сохранён, держим в нём фрейм.
+    mov rbx, rsp
+    mov rdi, [rbx + 11*8]       # nr
+    mov rsi, [rbx + 10*8]       # arg1 (rdi)
+    mov rdx, [rbx + 9*8]        # arg2 (rsi)
+    mov rcx, [rbx + 8*8]        # arg3 (rdx)
+    mov r8, r10                 # arg4 (настоящий r10, не user-rsp)
+    mov r9, rbx                 # arg6: указатель на фрейм (arg5/6 оттуда)
+    and rsp, -16
     sti
     call syscall_dispatch
     cli
+    mov rsp, rbx
     # rax = возврат, кладём в слот rax на стеке
     mov [rsp + 11*8], rax
 

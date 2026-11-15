@@ -401,7 +401,10 @@ unsafe fn raw_clone_thread(stack_top: u64, cleartid: u64, f: u64, arg: u64) -> u
     tid
 }
 
-/// Спин-мьютекс на futex.
+/// Спин-мьютекс. На одном ядре с тиком PIT ~55 мс futex-сон на каждую
+/// короткую критическую секцию не успевает отпустить 400 тысяч итераций:
+/// ждущий помечает «есть waiters», и каждый unlock становится syscall.
+/// Планировщик и так вытесняет по таймеру, поэтому достаточно pause.
 pub struct Mutex {
     lock: core::sync::atomic::AtomicU32,
 }
@@ -418,27 +421,13 @@ impl Mutex {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Ждём, пока владелец не отпустит (futex-подобный спин).
-            unsafe {
-                syscall6(
-                    SYS_FUTEX,
-                    &self.lock as *const _ as u64,
-                    FUTEX_WAIT_PRIVATE,
-                    1,
-                    0,
-                    0,
-                    0,
-                )
-            };
+            core::hint::spin_loop();
         }
     }
 
     pub fn unlock(&self) {
         use core::sync::atomic::Ordering;
         self.lock.store(0, Ordering::Release);
-        unsafe {
-            syscall6(SYS_FUTEX, &self.lock as *const _ as u64, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
-        };
     }
 }
 

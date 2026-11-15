@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod framebuffer;
+pub mod fpu;
 pub mod fs;
 pub mod gdt;
 pub mod input;
@@ -30,6 +31,7 @@ pub static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub fn init(boot_info: &mut BootInfo) {
     serial::init();
     gdt::init();
+    fpu::enable();
     syscall::init();
     interrupts::init_idt();
 
