@@ -62,7 +62,7 @@ qemu-system-x86_64 -m 256M -serial stdio -drive if=none,id=vd0,format=raw,file=r
 - **Userspace (ring 3)**:
   - GDT с user code/data-сегментами, TSS с переключаемым kernel-стеком
   - интерфейс **syscall/sysret** (LSTAR/STAR/SFMask) с **Linux x86_64 ABI**:
-    `read/write/openat/close/stat/brk/mmap/clone/execve/wait4/futex/getdents64`
+    `read/write/openat/close/stat/brk/mmap/clone/execve/wait4/futex/getdents64/socket`
     и соседние номера. `r10` — четвёртый аргумент, entry его не затирает
   - **SSE/FPU**: ядро само включает FXSAVE (`CR0.EM=0`, `CR4.OSFXSR`, без `OSXSAVE`).
     У каждой задачи свой 512-байтный образ, снимок на `clone` и на смене контекста
@@ -155,7 +155,8 @@ Linux x86_64. Номер в `rax`, возврат в `rax`, аргументы:
 | `r8`, `r9` | аргументы 5–6 |
 
 Частые номера: 0 read, 1 write, 2 open, 9 mmap, 12 brk, 56 clone, 57 fork,
-59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
+41 socket, 44 sendto, 45 recvfrom, 49 bind, 59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
+UDP `AF_INET`: петля и virtio-net. TCP, IPv6 и netlink возвращают ошибку.
 Полный разбор — `rudra/src/linux.rs`. `SFMask` гасит IF на время entry.
 
 syscall не переключает CR3: kernel-половина замаплена в каждом адресном пространстве,

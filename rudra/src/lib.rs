@@ -19,6 +19,7 @@ pub mod input;
 pub mod interrupts;
 pub mod linux;
 pub mod memory;
+pub mod net;
 pub mod pci;
 pub mod serial;
 pub mod smp;
@@ -26,6 +27,7 @@ pub mod syscall;
 pub mod task;
 pub mod time;
 pub mod virtio_blk;
+pub mod virtio_net;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +76,7 @@ pub fn init(boot_info: &mut BootInfo) {
     fs::init();
     pci::scan();
     block::init();
+    net::init();
 }
 
 pub fn hlt_loop() -> ! {

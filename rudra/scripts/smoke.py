@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke rudra 1.0.1: boot, записать файл, много hello.elf, reboot, прочитать обратно.
 
-Образ не портится: работа идёт на копии. QEMU — один virtio-blk, bootindex=0.
+Образ не портится: работа идёт на копии. QEMU — virtio-blk (корень) и virtio-net.
 QEMU берётся из переменной QEMU, из PATH или из стандартного пути Windows.
 Число запусков hello — SMOKE_HELLOS (по умолчанию 40). Пауза клавиш — SMOKE_GAP.
 """
@@ -126,6 +126,8 @@ def main():
             "-monitor", "tcp:127.0.0.1:%d,server,nowait" % MONITOR,
             "-drive", "if=none,id=vd0,format=raw,file=" + COPY,
             "-device", "virtio-blk-pci,drive=vd0,disable-modern=on,bootindex=0",
+            "-netdev", "user,id=n0",
+            "-device", "virtio-net-pci,netdev=n0,disable-modern=on",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

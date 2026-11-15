@@ -8,7 +8,7 @@
 |---|---|---|
 | 1.0.0, 1.0.1 | ext2-корень, проверка указателей, возврат кадров | теги стоят, не двигаются |
 | 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; таймер BSP LAPIC ~250 Гц; AP паркуются и отвечают на IPI; RTC в `CLOCK_REALTIME`; `futex WAIT/WAKE`; `rseq` на вытеснении из ring 3. Нет очереди задач на AP, x2APIC, per-CPU TSS, `FUTEX_REQUEUE`/PI |
-| 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | нет |
+| 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | начато: legacy virtio-net, DHCP и ARP в QEMU user-net, UDP `AF_INET` и петля `127.0.0.0/8`. Нет IPv6, TCP, netlink, проверки UDP-суммы |
 | 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | нет |
 | 1.4 | блочный слой, NVMe/AHCI, page cache, ext4 | нет |
 | 1.5 | PID1, пользователи, пакеты | нет |
@@ -21,3 +21,5 @@
 Пункты 0.1–0.9 записаны в `doc/`: [compat-contract](doc/compat-contract.md), [profiles](doc/profiles.md), [architecture](doc/architecture.md), [unsafe](doc/unsafe.md), [governance](doc/governance.md). aarch64 (0.10) и HCL (0.11) в 2.0.0 не обязательны и не начаты.
 
 Долг 1.1: задачи исполняет только BSP. AP подняты и стоят в `hlt`, своего TSS и тика у них нет. Пока `sys_clone` и разбор адресного пространства держат IF выключенным, тик LAPIC на BSP не приходит и квант сдвигается. `nanosleep` и `CLOCK_MONOTONIC` на TSC. `CLOCK_REALTIME` — CMOS RTC, без NTP. `FUTEX_REQUEUE` и PI нет. `rseq` не обрывает критическую секцию на входе в syscall.
+
+Долг 1.2: один слот ARP. `SO_REUSEADDR` и `SO_BROADCAST` принимаются и не запоминаются. Датаграмма UDP не длиннее 1280 байт. Адрес с карты появляется после DHCP, сам по себе при загрузке не запрашивается. `SOCK_STREAM` возвращает `EPROTONOSUPPORT`.
