@@ -10,7 +10,9 @@
 //! uname, reboot, getrandom и мелочь.
 //!
 //! UDP/`AF_INET` есть (петля и virtio-net). TCP, IPv6 и netlink нет.
-//! Сигналы 1–31 доставляются на возврате из syscall, если задан `SA_RESTORER`.
+//! Сигналы 1–31 доставляются на возврате из syscall и с тика в ring 3, если
+//! задан `SA_RESTORER`. Блокирующий сон, futex, pipe, poll и recvfrom
+//! возвращают `EINTR`. Чтение консоли — нет.
 //! epoll — level-triggered по номеру fd: `EPOLLET` принимается и ведёт себя
 //! как level, `epoll_pwait` маску не ставит, poll самого epoll-fd пуст.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
@@ -227,6 +229,9 @@ fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
         if writers == 0 {
             return 0; // EOF
         }
+        if crate::signal::pending_interrupts() {
+            return EINTR;
+        }
         x86_64::instructions::hlt(); // ждём писателя (таймер разбудит)
     }
 }
@@ -245,6 +250,9 @@ fn pipe_write(id: usize, buf: &[u8]) -> u64 {
             return EPIPE;
         }
         if space == 0 {
+            if crate::signal::pending_interrupts() {
+                return if done == 0 { EINTR } else { done as u64 };
+            }
             x86_64::instructions::hlt();
             continue;
         }
@@ -456,11 +464,11 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         28 => 0, // madvise
         32 => sys_dup(a1),
         33 => sys_dup2(a1, a2),
-        35 => sleep_timespec(a1, false),
+        35 => sleep_timespec(a1, a2, false),
         230 => {
             // clock_nanosleep(clockid, flags, req, rem). TIMER_ABSTIME = 1.
-            // Часы пока одни: монотонный TSC. rem не пишем, сон не прерывается.
-            sleep_timespec(a3, a2 & 1 != 0)
+            // Часы пока одни: монотонный TSC. При EINTR в rem пишется остаток.
+            sleep_timespec(a3, a4, a2 & 1 != 0)
         }
         39 => task::current_tid(),
         41 => sys_socket(a1, a2, a3),
@@ -778,7 +786,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
 const ENAMETOOLONG: u64 = (-(36i64)) as u64;
 const AT_FDCWD: u64 = (-100i64) as u64;
 
-fn sleep_timespec(ptr: u64, absolute: bool) -> u64 {
+fn sleep_timespec(ptr: u64, rem: u64, absolute: bool) -> u64 {
     let mut raw = [0u8; 16];
     if !u_read(ptr, &mut raw) {
         return EFAULT;
@@ -795,6 +803,9 @@ fn sleep_timespec(ptr: u64, absolute: bool) -> u64 {
         crate::time::monotonic_ns().saturating_add(span)
     };
     while crate::time::monotonic_ns() < deadline {
+        if crate::signal::pending_interrupts() {
+            return sleep_interrupted(deadline, rem);
+        }
         let left = deadline - crate::time::monotonic_ns();
         // Короткий хвост докручиваем по TSC, не дожидаясь тика планировщика.
         if left > 2_000_000 && x86_64::instructions::interrupts::are_enabled() {
@@ -804,6 +815,22 @@ fn sleep_timespec(ptr: u64, absolute: bool) -> u64 {
         }
     }
     0
+}
+
+fn sleep_interrupted(deadline: u64, rem: u64) -> u64 {
+    let now = crate::time::monotonic_ns();
+    let left = deadline.saturating_sub(now);
+    if rem != 0 {
+        let sec = left / 1_000_000_000;
+        let nsec = left % 1_000_000_000;
+        let mut raw = [0u8; 16];
+        raw[0..8].copy_from_slice(&sec.to_le_bytes());
+        raw[8..16].copy_from_slice(&nsec.to_le_bytes());
+        if !u_write(rem, &raw) {
+            return EFAULT;
+        }
+    }
+    EINTR
 }
 
 fn neg_err(e: i32) -> u64 {
@@ -976,6 +1003,9 @@ fn sys_recvfrom(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, srclen: u64)
                 return n as u64;
             }
             Err(crate::net::EAGAIN) if !nonblock => {
+                if crate::signal::pending_interrupts() {
+                    return EINTR;
+                }
                 x86_64::instructions::hlt();
             }
             Err(e) => return neg_err(e),
@@ -1126,6 +1156,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 }
 
 /// Упрощённое чтение консоли: побайтово из очереди клавиатуры.
+/// Сигнал это чтение не прерывает: здесь блокируется строка шелла.
 fn console_read(buf: u64, len: u64) -> u64 {
     for i in 0..len {
         let b = console_read_byte();
@@ -1752,7 +1783,12 @@ fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
         }
         match deadline {
             Some(d) if crate::interrupts::uptime_ms() >= d => return 0,
-            _ => x86_64::instructions::hlt(),
+            _ => {
+                if crate::signal::pending_interrupts() {
+                    return EINTR;
+                }
+                x86_64::instructions::hlt();
+            }
         }
     }
 }
@@ -2079,6 +2115,9 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             }
             return n as u64;
         }
+        if crate::signal::pending_interrupts() {
+            return EINTR;
+        }
         x86_64::instructions::hlt();
     }
 }
@@ -2117,7 +2156,12 @@ fn sys_select(nfds: u64, readfds: u64, _writefds: u64, _exceptfds: u64, timeout:
         }
         match deadline {
             Some(d) if crate::interrupts::uptime_ms() >= d => return 0,
-            _ => x86_64::instructions::hlt(),
+            _ => {
+                if crate::signal::pending_interrupts() {
+                    return EINTR;
+                }
+                x86_64::instructions::hlt();
+            }
         }
     }
 }
@@ -2198,6 +2242,11 @@ fn sys_wait4(pid: u64, status: u64, options: u64) -> u64 {
         }
         if wnohang {
             return 0;
+        }
+        // Зомби забираем выше. Пойманный сигнал без зомби — EINTR.
+        // SIGCHLD по умолчанию сюда не попадает: он не interrupts().
+        if crate::signal::pending_interrupts() {
+            return EINTR;
         }
         x86_64::instructions::hlt();
     }
@@ -2331,6 +2380,12 @@ fn futex_wait(addr: u64, val: u32) -> u64 {
         });
         if let Some(rc) = done {
             return rc;
+        }
+        if crate::signal::pending_interrupts() {
+            with_futex(|waiters| {
+                waiters[idx] = None;
+            });
+            return EINTR;
         }
         x86_64::instructions::hlt();
     }

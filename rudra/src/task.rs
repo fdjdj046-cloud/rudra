@@ -635,6 +635,8 @@ pub struct Task {
     pub exit_code: i64,
     /// Слот родителя (-1 = родитель не отслеживается).
     pub parent: isize,
+    /// Поток `CLONE_VM`. Такой exit не шлёт родителю `SIGCHLD`.
+    thread: bool,
     /// FS BASE (TLS) — восстанавливается планировщиком.
     pub fs_base: u64,
     /// Адрес для CLONE_CHILD_CLEARTID: при exit записать 0 и разбудить futex.
@@ -679,6 +681,7 @@ static FIZZ_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fizzbuzz.elf"
 static THREADS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.elf"));
 static SIGNAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/signal.elf"));
 static TICK_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tick.elf"));
+static INTR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/intr.elf"));
 static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
 static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"));
 static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
@@ -686,7 +689,7 @@ static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 10] = [
+    const BINS: [(&str, &[u8]); 11] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -694,6 +697,7 @@ pub fn init() {
         ("/bin/threads.elf", THREADS_ELF),
         ("/bin/signal.elf", SIGNAL_ELF),
         ("/bin/tick.elf", TICK_ELF),
+        ("/bin/intr.elf", INTR_ELF),
         ("/bin/epoll.elf", EPOLL_ELF),
         ("/bin/interp.elf", INTERP_ELF),
         ("/bin/dyn.elf", DYN_ELF),
@@ -1144,6 +1148,7 @@ fn finish_task(
         state: TaskState::Runnable,
         exit_code: 0,
         parent: -1,
+        thread: false,
         fs_base: 0,
         clear_tid: 0,
         rseq: 0,
@@ -1393,6 +1398,7 @@ pub fn sys_clone(
             state: TaskState::Runnable,
             exit_code: 0,
             parent: cur as isize,
+            thread: flags & CLONE_VM != 0,
             fs_base: if flags & CLONE_SETTLS != 0 { tls } else { parent_fs },
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
             rseq: 0,
@@ -1749,6 +1755,8 @@ pub fn exit_current() {
                     t.parent = -1;
                 }
             }
+            let mut parent = -1isize;
+            let mut thread = true;
             if let Some(t) = tasks[cur as usize].as_mut() {
                 // CLONE_CHILD_CLEARTID: pthread join ждёт обнуления.
                 if t.clear_tid != 0 {
@@ -1757,7 +1765,17 @@ pub fn exit_current() {
                     let _ = user_write(addr, &zero);
                     crate::linux::futex_wake(addr, 1);
                 }
+                parent = t.parent;
+                thread = t.thread;
                 t.state = TaskState::Exited;
+            }
+            // Процесс, не поток. Бит только помечаем: доставка — на тике или syscall.
+            if !thread && parent >= 0 {
+                if let Some(p) = tasks[parent as usize].as_mut() {
+                    if p.state == TaskState::Runnable {
+                        p.signals.raise(17);
+                    }
+                }
             }
         }
     });

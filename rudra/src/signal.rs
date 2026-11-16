@@ -4,10 +4,11 @@
 //! и когда тик таймера возвращается в ring 3. Кадр тика — не кадр syscall:
 //! `deliver_pending` туда писать нельзя. Смертельный сигнал и `SIGKILL`
 //! с тика не забираются: `sys_exit` встал бы в `hlt` при выключенном IF.
-//! Блокирующий `read` и `nanosleep` не прерываются. На стеке нет
-//! исполняемого трамплина. `SIGSTOP` и сигналы остановки сбрасываются.
-//! Смерть по умолчанию — `exit(128+sig)`, статус wait выглядит как обычный
-//! код выхода, не как `WIFSIGNALED`.
+//! `nanosleep`, futex, pipe, poll, select, epoll и recvfrom возвращают
+//! `EINTR`, если сигнал надо доставить. Чтение консоли не прерывается.
+//! `SA_RESTART` нет. На стеке нет исполняемого трамплина. `SIGSTOP` и
+//! сигналы остановки сбрасываются. Смерть по умолчанию — `exit(128+sig)`,
+//! статус wait выглядит как обычный код выхода, не как `WIFSIGNALED`.
 
 use crate::syscall::FRAME;
 use crate::task::{self, user_read, user_write};
@@ -117,6 +118,36 @@ impl Signals {
         }))
     }
 
+    pub fn raise(&mut self, sig: u32) {
+        if (1..=31).contains(&sig) {
+            self.pending |= bit(sig);
+        }
+    }
+
+    /// Сигнал, из-за которого блокирующий syscall должен вернуться.
+    /// Игнорируемые по умолчанию (`SIGCHLD` без обработчика) — нет.
+    /// `SIGKILL` прерывает даже из-под маски.
+    pub fn interrupts(&self) -> bool {
+        let blocked = self.mask & !(bit(SIGKILL) | bit(SIGSTOP));
+        let mut bits = self.pending & !blocked;
+        while bits != 0 {
+            let sig = bits.trailing_zeros() + 1;
+            bits &= bits - 1;
+            if sig == SIGKILL {
+                return true;
+            }
+            let handler = self.handler[sig as usize];
+            let restorer = self.restorer[sig as usize];
+            if handler > 1 && handler >= 0x1000 && restorer >= 0x1000 {
+                return true;
+            }
+            if handler == 0 && fatal_default(sig) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn undo(&mut self, caught: &Catch) {
         self.pending |= bit(caught.sig);
         self.mask = caught.old_mask;
@@ -126,6 +157,11 @@ impl Signals {
             self.sa_flags[caught.sig as usize] = caught.flags;
         }
     }
+}
+
+/// Есть сигнал, который должен прервать блокирующий syscall текущей задачи.
+pub fn pending_interrupts() -> bool {
+    task::with_current_task(|t| t.signals.interrupts()).unwrap_or(false)
 }
 
 fn bit(sig: u32) -> u64 {
@@ -485,6 +521,14 @@ mod tests {
             _ => panic!("SIGCHLD default"),
         }
         assert!(signals.pop().is_none());
+        signals.raise(17);
+        assert!(!signals.interrupts());
+        signals.raise(10);
+        assert!(signals.interrupts());
+        signals.mask = bit(10);
+        assert!(!signals.interrupts());
+        signals.raise(SIGKILL);
+        assert!(signals.interrupts());
         signals.pending = bit(SIGSTOP);
         match signals.pop() {
             Some(Pop::Ignored) => {}
