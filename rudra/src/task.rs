@@ -22,7 +22,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::Msr;
@@ -769,6 +769,10 @@ static IDLE_RSP: [AtomicU64; crate::cpu::MAX_CPUS] = [
     AtomicU64::new(0),
 ];
 static SCHED_INITED: AtomicBool = AtomicBool::new(false);
+/// tid PID1 (init.elf, а при его отсутствии — шелл). -1 — не назначен.
+/// Именно по tid, а не по «Runnable без родителя»: init может спать в
+/// wait4 на своём CPU, когда сирота рождается на AP.
+static INIT_TID: AtomicI64 = AtomicI64::new(-1);
 
 /// Syscall входит с `sti`, поэтому лок берём при выключенных прерываниях
 /// на этом CPU. Спинлок сериализует CPU, пока секция не ждёт другой CPU
@@ -844,6 +848,7 @@ pub fn init() {
     };
     match spawned {
         s if s != u64::MAX => {
+            INIT_TID.store(s as i64, Ordering::Release);
             SCHED_INITED.store(true, Ordering::Release);
             serial_println!(
                 "[task] {} spawned (tid {}), round-robin on {}",
@@ -2212,18 +2217,30 @@ pub fn exit_current() {
     with_tasks(|tasks| {
         let cur = current_slot();
         if cur >= 0 {
-            // Детей отдаём задаче без родителя (init). Иначе слот родителя
-            // достанется чужому, и wait заберёт не того.
             let cur_u = cur as usize;
+            let cur_tid = tasks[cur_u].as_ref().map(|t| t.tid).unwrap_or(0);
+            let init_tid = INIT_TID.load(Ordering::Relaxed);
+            // Смерть PID1: репарентить и reap'ать больше некому. Честная
+            // паника, а не тихий раскол, на который потом встанут cgroups.
+            if init_tid >= 0 && cur_tid as i64 == init_tid {
+                serial_println!("[task] PID1 (tid {}) exited — system halt", cur_tid);
+                panic!("PID1 exited");
+            }
+            // Детей отдаём PID1 по tid. Поиск по «Runnable без родителя»
+            // снят: init может спать в wait4 на своём CPU, когда сирота
+            // рождается на AP, — тогда сирота оставалась с parent = -1,
+            // её зомби никто не reap'ал, слот тек.
             let mut init_slot = -1isize;
-            for i in 0..tasks.len() {
-                if i == cur_u {
-                    continue;
-                }
-                if let Some(t) = tasks[i].as_ref() {
-                    if t.parent < 0 && t.state == TaskState::Runnable {
-                        init_slot = i as isize;
-                        break;
+            if init_tid >= 0 {
+                for (i, t) in tasks.iter().enumerate() {
+                    if i == cur_u {
+                        continue;
+                    }
+                    if let Some(t) = t.as_ref() {
+                        if t.tid as i64 == init_tid {
+                            init_slot = i as isize;
+                            break;
+                        }
                     }
                 }
             }
@@ -2236,11 +2253,11 @@ pub fn exit_current() {
                     }
                 }
             }
+            // raise только OR'ит pending — безопасно ставить спящей задаче:
+            // доставка всё равно на её тике или syscall.
             if zombie && init_slot >= 0 {
                 if let Some(p) = tasks[init_slot as usize].as_mut() {
-                    if p.state == TaskState::Runnable {
-                        p.signals.raise(17);
-                    }
+                    p.signals.raise(17);
                 }
             }
             let mut parent = -1isize;
@@ -2258,11 +2275,10 @@ pub fn exit_current() {
                 t.state = TaskState::Exited;
             }
             // Процесс, не поток. Бит только помечаем: доставка — на тике или syscall.
+            // Тот же приём, что и для init: родитель может спать в wait4.
             if !thread && parent >= 0 {
                 if let Some(p) = tasks[parent as usize].as_mut() {
-                    if p.state == TaskState::Runnable {
-                        p.signals.raise(17);
-                    }
+                    p.signals.raise(17);
                 }
             }
         }

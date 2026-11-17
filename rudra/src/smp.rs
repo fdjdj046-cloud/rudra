@@ -320,7 +320,15 @@ extern "C" {
 /// Уже на своём стеке 32 КиБ. Индекс выдал `ap_entry`.
 #[no_mangle]
 extern "C" fn ap_main(index: u64) -> ! {
-    let index = (index as usize).min(MAX_CPUS - 1);
+    let index = index as usize;
+    if index >= MAX_CPUS {
+        // Кламп хуже остановки: два ядра на одном GS-слоте молча порушили
+        // бы друг другу kstack-указатели. start() такое не шлёт — страховка.
+        crate::serial_println!("[smp] ap index {} >= MAX_CPUS, halting", index);
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
     x86_64::instructions::interrupts::disable();
     crate::fpu::enable();
     let top = idle_stack_top(index);
@@ -349,13 +357,18 @@ ap_entry:
     # Трамплин оставил маленький стек. До Rust его меняем.
     mov eax, 1
     lock xadd dword ptr [rip + AP_INDEX_ALLOC], eax
+    # Лишний AP (за пределами MAX_CPUS) останавливаем здесь, до Rust:
+    # AP_IDLE_TOP короче, а кламп индекса алиасил бы GS-слот чужого ядра.
+    cmp eax, 8
+    jae 2f
     lea rcx, [rip + AP_IDLE_TOP]
     mov rsp, qword ptr [rcx + rax*8]
     mov rdi, rax
     call ap_main
+2:
     cli
     hlt
-    jmp ap_entry
+    jmp 2b
 "#
 );
 

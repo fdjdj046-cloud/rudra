@@ -242,6 +242,10 @@ fn arm_periodic(count: u32) {
 pub fn arm_ap_timer() {
     let count = TIMER_COUNT.load(Ordering::Relaxed);
     if count == 0 {
+        // Калибровки не было (BSP ещё не дошёл): у этого AP не будет тика,
+        // и задача, привязанная к нему, не исполнится никогда. Молчать тут —
+        // ловушка; пусть в логе видно.
+        crate::serial_println!("[apic] ap timer not armed: no calibration yet");
         return;
     }
     let svr = read32(0xF0);
