@@ -186,6 +186,7 @@ def main():
             "run /bin/tcp.elf",
             "run /bin/seek.elf",
             "run /bin/proc.elf",
+            "run /bin/mode.elf",
             "run /bin/epoll.elf",
             "run /bin/dyn.elf",
             "ls /",
@@ -216,6 +217,11 @@ def main():
         text = wait_prompts(mon, n + 1, 40)
         if "persist-ok" not in text:
             raise SystemExit("keep.txt missing after reboot\n" + text[-2000:])
+        n = text.count("rudra:/$")
+        send_line(mon, "run /bin/mode.elf")
+        text = wait_prompts(mon, n + 1, 40)
+        if "mode-kept" not in text or "mode-bad" in text:
+            raise SystemExit("mode did not persist\n" + text[-2000:])
         bad = []
         for needle in (
             "PAGE FAULT",
@@ -263,6 +269,8 @@ def main():
             raise SystemExit("seek.elf did not report seek-ok\n" + text[-1500:])
         if "proc-ok" not in text or "proc-bad" in text:
             raise SystemExit("proc.elf did not report proc-ok\n" + text[-1500:])
+        if "mode-ok" not in text or "mode-bad" in text:
+            raise SystemExit("mode.elf did not report mode-ok\n" + text[-1500:])
         if "[task] init spawned" not in text:
             raise SystemExit("init was not pid1\n" + text[-1500:])
         if "epoll-ok" not in text:

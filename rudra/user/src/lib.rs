@@ -184,9 +184,8 @@ pub fn openat(dirfd: u64, path: &str, flags: u64) -> isize {
         return -1;
     }
     p[..pb.len()].copy_from_slice(pb);
-    unsafe {
-        syscall6(SYS_OPENAT, dirfd, p.as_ptr() as u64, flags, 0, 0, 0) as isize
-    }
+    let mode = if flags & O_CREAT != 0 { 0o666 } else { 0 };
+    unsafe { syscall6(SYS_OPENAT, dirfd, p.as_ptr() as u64, flags, mode, 0, 0) as isize }
 }
 
 pub fn close(fd: u64) {
@@ -224,7 +223,7 @@ pub fn mkdir(path: &str) -> i64 {
         return -1;
     }
     p[..pb.len()].copy_from_slice(pb);
-    unsafe { syscall6(83, p.as_ptr() as u64, 0, 0, 0, 0, 0) as i64 }
+    unsafe { syscall6(83, p.as_ptr() as u64, 0o777, 0, 0, 0, 0) as i64 }
 }
 
 pub fn delete(path: &str) -> bool {

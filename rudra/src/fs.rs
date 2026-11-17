@@ -48,6 +48,9 @@ static BASE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rfs.img"));
 
 pub struct RamFs {
     storage: Box<[u8]>,
+    /// Режим inode, 0 — значение по умолчанию (0644 у файла, 0755 у каталога).
+    /// В образ не входит: слот живёт, пока жива запись.
+    modes: [u16; MAX_FILES],
 }
 
 static FS: Once<Mutex<RamFs>> = Once::new();
@@ -77,7 +80,10 @@ pub fn init_from(base_image: &[u8]) {
         }
         wr32(&mut storage, 0, MAGIC);
     }
-    let mut ram = RamFs { storage };
+    let mut ram = RamFs {
+        storage,
+        modes: [0; MAX_FILES],
+    };
     ram.materialize_parents();
     let _ = FS.call_once(|| Mutex::new(ram));
 }
@@ -159,6 +165,7 @@ impl RamFs {
     fn clear_slot(&mut self, slot: usize) {
         let base = TABLE_OFF + slot * ENTRY_SIZE;
         self.storage[base] = 0;
+        self.modes[slot] = 0;
     }
 
     /// Свободный слот: дырка от удаления или новый в конце таблицы.
@@ -276,7 +283,68 @@ impl RamFs {
         let base = TABLE_OFF + slot * ENTRY_SIZE;
         wr32(&mut self.storage, base + NAME_LEN, DIR_BIT);
         wr32(&mut self.storage, base + NAME_LEN + 4, 0);
+        self.modes[slot] = 0o040755;
         Ok(())
+    }
+
+    /// Режим с типом. У записи из образа, которую не трогал chmod, — 0644 или 0755.
+    fn stored_mode(&self, name: &str) -> Option<u32> {
+        if name == "/" {
+            return Some(0o040755);
+        }
+        let slot = self.find_slot(name)?;
+        let stored = self.modes[slot];
+        if stored != 0 {
+            return Some(stored as u32);
+        }
+        if self.is_dir_slot(slot) {
+            Some(0o040755)
+        } else {
+            Some(0o100644)
+        }
+    }
+
+    /// Меняет биты 07777. Тип файла остаётся.
+    fn set_perm(&mut self, name: &str, perm: u16) -> Result<(), FsError> {
+        if name == "/" {
+            return Err(FsError::Perm);
+        }
+        let slot = self.find_slot(name).ok_or(FsError::NoEnt)?;
+        let typ = if self.modes[slot] & 0xF000 != 0 {
+            self.modes[slot] & 0xF000
+        } else if self.is_dir_slot(slot) {
+            0o040000
+        } else {
+            0o100000
+        };
+        self.modes[slot] = typ | (perm & 0o7777);
+        Ok(())
+    }
+
+    /// Пустой новый файл с заданными битами доступа. Существующий не перезаписывается.
+    fn make_file(&mut self, name: &str, perm: u16) -> Result<(), FsError> {
+        if name.is_empty() || name == "/" || name.len() >= NAME_LEN || name.contains('\0') {
+            return Err(FsError::Inval);
+        }
+        if let Some(slot) = self.find_slot(name) {
+            return Err(if self.is_dir_slot(slot) {
+                FsError::IsDir
+            } else {
+                FsError::Exist
+            });
+        }
+        self.parent_ok(name)?;
+        if self.write(name, &[]) < 0 {
+            return Err(FsError::NoSpc);
+        }
+        let slot = self.find_slot(name).ok_or(FsError::Io)?;
+        self.modes[slot] = 0o100000 | (perm & 0o777);
+        Ok(())
+    }
+
+    fn mkdir_perm(&mut self, name: &str, perm: u16) -> Result<(), FsError> {
+        self.mkdir(name)?;
+        self.set_perm(name, perm & 0o777)
     }
 
     /// Удалить пустой каталог. Корень удалить нельзя.
@@ -819,6 +887,11 @@ pub fn parent_ok(name: &str) -> Result<(), FsError> {
 }
 
 pub fn mkdir(name: &str) -> Result<(), FsError> {
+    mkdir_mode(name, 0o755)
+}
+
+/// `perm` — уже после umask, только биты 0777. Тип каталога ставит слой.
+pub fn mkdir_mode(name: &str, perm: u16) -> Result<(), FsError> {
     if synth_mut(name) {
         return Err(if synth_children(name).is_some() {
             FsError::Exist
@@ -827,9 +900,48 @@ pub fn mkdir(name: &str) -> Result<(), FsError> {
         });
     }
     if ext2_on() {
-        crate::ext2::mkdir(name)
+        crate::ext2::mkdir_mode(name, perm)
     } else {
-        fs().mkdir(name)
+        fs().mkdir_perm(name, perm)
+    }
+}
+
+/// Полный режим с типом. Синтетика: каталог 0755, файл 0644.
+pub fn mode_of(name: &str) -> Option<u32> {
+    if synth_children(name).is_some() {
+        return Some(0o040755);
+    }
+    if synth_body(name).is_some() {
+        return Some(0o100644);
+    }
+    if ext2_on() {
+        crate::ext2::mode_of(name)
+    } else {
+        fs().stored_mode(name)
+    }
+}
+
+/// Пишет биты 07777, тип не трогает. Проверки владельца нет.
+pub fn chmod(name: &str, perm: u16) -> Result<(), FsError> {
+    if synth_children(name).is_some() || synth_body(name).is_some() || synth_mut(name) {
+        return Err(FsError::Perm);
+    }
+    if ext2_on() {
+        crate::ext2::chmod(name, perm)
+    } else {
+        fs().set_perm(name, perm)
+    }
+}
+
+/// Создать пустой обычный файл. Если путь уже есть — `Exist` или `IsDir`.
+pub fn create_file(name: &str, perm: u16) -> Result<(), FsError> {
+    if synth_mut(name) {
+        return Err(FsError::Perm);
+    }
+    if ext2_on() {
+        crate::ext2::create_file(name, perm)
+    } else {
+        fs().make_file(name, perm)
     }
 }
 
@@ -1079,6 +1191,36 @@ mod tests {
         assert_eq!(resolve("/bin", "..").unwrap(), "/");
         assert_eq!(resolve("/", ".").unwrap(), "/");
         assert_eq!(resolve("/a/b", "../../c").unwrap(), "/c");
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn file_mode_survives_rewrite() {
+        serial_print!("test file_mode_survives_rewrite... ");
+        assert!(write_path(b"/mode-new.txt", b"ab") > 0);
+        assert_eq!(mode_of("/mode-new.txt"), Some(0o100644));
+        assert!(chmod("/mode-new.txt", 0o600).is_ok());
+        assert_eq!(mode_of("/mode-new.txt"), Some(0o100600));
+        assert!(write_path(b"/mode-new.txt", b"abcd") > 0);
+        assert_eq!(mode_of("/mode-new.txt"), Some(0o100600));
+        assert!(create_file("/mode-new.txt", 0o700).is_err());
+        assert!(unlink("/mode-new.txt").is_ok());
+        assert!(create_file("/mode-c.txt", 0o711).is_ok());
+        assert_eq!(mode_of("/mode-c.txt"), Some(0o100711));
+        assert!(write_path(b"/mode-c.txt", b"z") > 0);
+        assert_eq!(mode_of("/mode-c.txt"), Some(0o100711));
+        assert!(chmod("/mode-c.txt", 0o4755).is_ok());
+        assert_eq!(mode_of("/mode-c.txt"), Some(0o104755));
+        assert!(mkdir_mode("/mode-d", 0o700).is_ok());
+        assert_eq!(mode_of("/mode-d"), Some(0o040700));
+        assert!(chmod("/mode-d", 0o750).is_ok());
+        assert_eq!(mode_of("/mode-d"), Some(0o040750));
+        assert_eq!(chmod("/no-mode-file", 0o644), Err(FsError::NoEnt));
+        assert!(chmod("/proc/uptime", 0o777).is_err());
+        assert_eq!(mode_of("/proc/uptime"), Some(0o100644));
+        assert_eq!(mode_of("/proc"), Some(0o040755));
+        assert!(unlink("/mode-c.txt").is_ok());
+        assert!(rmdir("/mode-d").is_ok());
         serial_println!("[ok]");
     }
 

@@ -172,7 +172,31 @@ pub fn parent_ok(path: &str) -> Result<(), FsError> {
 }
 
 pub fn mkdir(path: &str) -> Result<(), FsError> {
-    with_vol(|v| v.mkdir_at(path)).unwrap_or(Err(FsError::Io))
+    mkdir_mode(path, 0o755)
+}
+
+/// `perm` — биты 0777 после umask. Тип каталога — 0x4000.
+pub fn mkdir_mode(path: &str, perm: u16) -> Result<(), FsError> {
+    with_vol(|v| v.mkdir_at(path, perm)).unwrap_or(Err(FsError::Io))
+}
+
+pub fn mode_of(path: &str) -> Option<u32> {
+    with_vol(|v| {
+        let ino = v.lookup(path).ok()?;
+        let inode = v.read_inode(ino).ok()?;
+        Some(get_u16(&inode, 0) as u32)
+    })
+    .flatten()
+}
+
+/// Пишет биты 07777. Старшая тетрада типа остаётся.
+pub fn chmod(path: &str, perm: u16) -> Result<(), FsError> {
+    with_vol(|v| v.chmod_at(path, perm)).unwrap_or(Err(FsError::Io))
+}
+
+/// Пустой новый обычный файл. Существующий путь не трогает.
+pub fn create_file(path: &str, perm: u16) -> Result<(), FsError> {
+    with_vol(|v| v.create_reg(path, perm)).unwrap_or(Err(FsError::Io))
 }
 
 pub fn rmdir(path: &str) -> Result<(), FsError> {
@@ -927,7 +951,7 @@ impl Vol {
         self.flush()
     }
 
-    fn mkdir_at(&mut self, path: &str) -> Result<(), FsError> {
+    fn mkdir_at(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
         if path.is_empty() || path == "/" {
             return Err(FsError::Inval);
         }
@@ -957,7 +981,7 @@ impl Vol {
         );
         self.write_block(block, &db)?;
         let mut inode = vec![0u8; 128];
-        put_u16(&mut inode, 0, 0x41ED);
+        put_u16(&mut inode, 0, 0x4000 | (perm & 0o777));
         put_u32(&mut inode, 4, self.block_size as u32);
         put_u16(&mut inode, 26, 2);
         put_u32(&mut inode, 28, (self.block_size / 512) as u32);
@@ -970,6 +994,45 @@ impl Vol {
         }
         self.bump_links(pino, 1)?;
         self.used_dirs = self.used_dirs.saturating_add(1);
+        self.flush()
+    }
+
+    fn chmod_at(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
+        let ino = self.lookup(path)?;
+        let mut inode = self.read_inode(ino)?;
+        let old = get_u16(&inode, 0);
+        let typ = old & 0xF000;
+        if typ == 0 {
+            return Err(FsError::Io);
+        }
+        put_u16(&mut inode, 0, typ | (perm & 0o7777));
+        self.write_inode(ino, &inode)
+    }
+
+    fn create_reg(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
+        if path.is_empty() || path == "/" {
+            return Err(FsError::Inval);
+        }
+        let (dir, name) = split(path)?;
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(FsError::Inval);
+        }
+        let pino = self.lookup(dir)?;
+        if !self.is_dir_ino(pino)? {
+            return Err(FsError::NotDir);
+        }
+        if self.find_in_dir(pino, name)?.is_some() {
+            return Err(FsError::Exist);
+        }
+        let ino = self.alloc_ino()?;
+        let mut fresh = vec![0u8; 128];
+        put_u16(&mut fresh, 0, 0x8000 | (perm & 0o777));
+        put_u16(&mut fresh, 26, 1);
+        self.write_inode(ino, &fresh)?;
+        if let Err(e) = self.add_dirent(pino, ino, name, EXT2_FT_REG) {
+            self.free_ino(ino);
+            return Err(e);
+        }
         self.flush()
     }
 

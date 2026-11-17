@@ -674,7 +674,7 @@ pub fn strict_permits(nr: u64) -> bool {
 }
 
 /// Каталог и umask. `CLONE_FS` делит эту структуру, обычный fork копирует.
-/// umask хранится и наследуется; режим новых файлов его пока не применяет.
+/// umask хранится и наследуется. `mkdir` и создание нового файла срезают им биты.
 pub struct FsCtx {
     pub cwd: String,
     pub umask: u32,
@@ -771,11 +771,12 @@ static FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fs.elf"));
 static TCP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tcp.elf"));
 static SEEK_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seek.elf"));
 static PROC_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/proc.elf"));
+static MODE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mode.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 18] = [
+    const BINS: [(&str, &[u8]); 19] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -794,6 +795,7 @@ pub fn init() {
         ("/bin/tcp.elf", TCP_ELF),
         ("/bin/seek.elf", SEEK_ELF),
         ("/bin/proc.elf", PROC_ELF),
+        ("/bin/mode.elf", MODE_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -1306,6 +1308,11 @@ pub fn swap_umask(next: u32) -> u32 {
         old
     })
     .unwrap_or(0o022)
+}
+
+/// Текущий umask. Без задачи — 022, как у новой `FsCtx`.
+pub fn current_umask() -> u32 {
+    with_current_task(|t| t.fsctx.lock().umask).unwrap_or(0o022)
 }
 
 /// tid родителя. У init и без задачи — 0. Отдельного пространства gettid нет:

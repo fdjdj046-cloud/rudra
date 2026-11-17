@@ -387,11 +387,12 @@ fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
 }
 
 fn stat_of(path: &str) -> Option<(u64, u32, u64)> {
+    let mode = crate::fs::mode_of(path)?;
     if crate::fs::is_dir(path) {
-        Some((0, S_IFDIR | 0o755, crate::fs::nlink_of(path).max(2)))
+        Some((0, mode, crate::fs::nlink_of(path).max(2)))
     } else if crate::fs::exists(path) {
         let sz = crate::fs::size_of(path).max(0) as u64;
-        Some((sz, S_IFREG | 0o644, crate::fs::nlink_of(path).max(1)))
+        Some((sz, mode, crate::fs::nlink_of(path).max(1)))
     } else {
         None
     }
@@ -584,7 +585,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             // mkdir
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            match crate::fs::mkdir(&canon) {
+            let perm = ((a2 as u32) & 0o777) & !task::current_umask();
+            match crate::fs::mkdir_mode(&canon, perm as u16) {
                 Ok(()) => 0,
                 Err(e) => fs_err(e),
             }
@@ -613,7 +615,12 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 return EPERM;
             }
             match crate::fs::read_canon(&o) {
-                Some(data) if crate::fs::write_canon(&n, &data) >= 0 => 0,
+                Some(data) if crate::fs::write_canon(&n, &data) >= 0 => {
+                    if let Some(m) = crate::fs::mode_of(&o) {
+                        let _ = crate::fs::chmod(&n, (m as u16) & 0o7777);
+                    }
+                    0
+                }
                 Some(_) => ENOSPC,
                 None => ENOENT,
             }
@@ -653,7 +660,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 None => EINVAL,
             }
         }
-        90 | 91 => 0, // chmod / fchmod
+        90 => sys_chmod(a1, a2),
+        91 => sys_fchmod(a1, a2),
         95 => {
             // umask
             task::swap_umask(a1 as u32) as u64
@@ -1491,7 +1499,33 @@ fn sys_close(fd: u64) -> u64 {
     0
 }
 
-fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
+fn sys_chmod(path_ptr: u64, mode: u64) -> u64 {
+    let Some(path) = task::copy_user_cstr(path_ptr, 256) else { return EFAULT };
+    let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
+    // Биты пишутся и читаются через stat. Проверки доступа по ним нет.
+    match crate::fs::chmod(&canon, (mode as u32 & 0o7777) as u16) {
+        Ok(()) => 0,
+        Err(e) => fs_err(e),
+    }
+}
+
+fn sys_fchmod(fd: u64, mode: u64) -> u64 {
+    let path = with_fd(fd, |f| match f {
+        Fd::File { name, .. } => Some(name.clone()),
+        Fd::Dir { prefix, .. } => Some(prefix.clone()),
+        _ => None,
+    });
+    match path {
+        Ok(Some(p)) => match crate::fs::chmod(&p, (mode as u32 & 0o7777) as u16) {
+            Ok(()) => 0,
+            Err(e) => fs_err(e),
+        },
+        Ok(None) => EINVAL,
+        Err(e) => e,
+    }
+}
+
+fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
     const O_ACCMODE: u64 = 3;
     const O_CREAT: u64 = 0x40;
     const O_TRUNC: u64 = 0x200;
@@ -1553,14 +1587,10 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
         if let Err(e) = crate::fs::parent_ok(&canon) {
             return fs_err(e);
         }
-        let mut slot = Some(Fd::File {
-            name: canon,
-            offset: 0,
-            accmode: accmode as u8,
-            append: flags & O_APPEND != 0,
-            dirty: Some(Vec::new()),
-        });
-        return with_current_fds(|fds| alloc_fd(&mut slot, fds)).unwrap_or(EMFILE);
+        let perm = ((mode as u32) & 0o777) & !task::current_umask();
+        if let Err(e) = crate::fs::create_file(&canon, perm as u16) {
+            return fs_err(e);
+        }
     }
     // Существующий файл.
     if accmode == 0 && flags & O_TRUNC != 0 {
@@ -1582,29 +1612,38 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
 }
 
 fn sys_fstat(fd: u64, buf: u64) -> u64 {
-    let st = with_fd(fd, |f| match f {
-        Fd::Console { .. } => Some((0u64, S_IFCHR | 0o620, 1u64)),
-        Fd::File { name, dirty, .. } => {
-            let size = match dirty {
-                Some(d) => d.len() as u64,
-                None => crate::fs::size_of(name).max(0) as u64,
-            };
-            Some((size, S_IFREG | 0o644, 1))
-        }        Fd::Dir { .. } => Some((0, S_IFDIR | 0o755, 2)),
-        Fd::Pipe { .. } => Some((0, S_IFCHR | 0o644, 1)),
-        Fd::Udp { .. } | Fd::Tcp { .. } => Some((0, 0o140000 | 0o666, 1)),
-        Fd::Epoll { .. } => Some((0, S_IFREG | 0o600, 1)),
-    });
-    match st {
-        Ok(Some((sz, mode, nlink))) => {
-            if !write_stat(buf, sz, mode, nlink) {
-                return EFAULT;
-            }
-            0
-        }
-        Ok(None) => EBADF,
-        Err(e) => e,
+    enum Hit {
+        Ready(u64, u32, u64),
+        File(String, Option<u64>),
+        Dir(String),
     }
+    let hit = with_fd(fd, |f| match f {
+        Fd::Console { .. } => Hit::Ready(0, S_IFCHR | 0o620, 1),
+        Fd::File { name, dirty, .. } => {
+            Hit::File(name.clone(), dirty.as_ref().map(|d| d.len() as u64))
+        }
+        Fd::Dir { prefix, .. } => Hit::Dir(prefix.clone()),
+        Fd::Pipe { .. } => Hit::Ready(0, S_IFCHR | 0o644, 1),
+        Fd::Udp { .. } | Fd::Tcp { .. } => Hit::Ready(0, 0o140000 | 0o666, 1),
+        Fd::Epoll { .. } => Hit::Ready(0, S_IFREG | 0o600, 1),
+    });
+    let st = match hit {
+        Ok(Hit::Ready(sz, mode, nlink)) => (sz, mode, nlink),
+        Ok(Hit::File(name, dirty_len)) => {
+            let size = dirty_len.unwrap_or_else(|| crate::fs::size_of(&name).max(0) as u64);
+            let mode = crate::fs::mode_of(&name).unwrap_or(S_IFREG | 0o644);
+            (size, mode, 1)
+        }
+        Ok(Hit::Dir(name)) => {
+            let mode = crate::fs::mode_of(&name).unwrap_or(S_IFDIR | 0o755);
+            (0, mode, crate::fs::nlink_of(&name).max(2))
+        }
+        Err(e) => return e,
+    };
+    if !write_stat(buf, st.0, st.1, st.2) {
+        return EFAULT;
+    }
+    0
 }
 
 fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> u64 {
