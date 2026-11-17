@@ -237,7 +237,7 @@ fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
         if writers == 0 {
             return 0; // EOF
         }
-        if crate::signal::pending_interrupts() {
+        if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
             return EINTR;
         }
         x86_64::instructions::hlt(); // ждём писателя (таймер разбудит)
@@ -258,7 +258,7 @@ fn pipe_write(id: usize, buf: &[u8]) -> u64 {
             return EPIPE;
         }
         if space == 0 {
-            if crate::signal::pending_interrupts() {
+            if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                 return if done == 0 { EINTR } else { done as u64 };
             }
             x86_64::instructions::hlt();
@@ -1037,7 +1037,7 @@ fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
                 }
             }
             Err(crate::net::EAGAIN) if !nonblock => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
                 x86_64::instructions::hlt();
@@ -1140,7 +1140,7 @@ fn sys_recvfrom(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, srclen: u64)
                 return n as u64;
             }
             Err(crate::net::EAGAIN) if !nonblock => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
                 x86_64::instructions::hlt();
@@ -1199,7 +1199,7 @@ fn tcp_write(id: usize, buf: u64, len: u64) -> u64 {
                 }
             }
             Err(crate::net::EAGAIN) if !nonblock => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return if off > 0 { off as u64 } else { EINTR };
                 }
                 x86_64::instructions::hlt();
@@ -1230,7 +1230,7 @@ fn tcp_read(id: usize, buf: u64, len: u64, src: u64, srclen: u64) -> u64 {
                 return n as u64;
             }
             Err(crate::net::EAGAIN) if !nonblock => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
                 x86_64::instructions::hlt();
@@ -2105,7 +2105,7 @@ fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
         match deadline {
             Some(d) if crate::interrupts::uptime_ms() >= d => return 0,
             _ => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
                 x86_64::instructions::hlt();
@@ -2444,7 +2444,7 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             }
             return n as u64;
         }
-        if crate::signal::pending_interrupts() {
+        if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
             return EINTR;
         }
         x86_64::instructions::hlt();
@@ -2486,7 +2486,7 @@ fn sys_select(nfds: u64, readfds: u64, _writefds: u64, _exceptfds: u64, timeout:
         match deadline {
             Some(d) if crate::interrupts::uptime_ms() >= d => return 0,
             _ => {
-                if crate::signal::pending_interrupts() {
+                if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
                 x86_64::instructions::hlt();
@@ -2574,7 +2574,7 @@ fn sys_wait4(pid: u64, status: u64, options: u64) -> u64 {
         }
         // Зомби забираем выше. Пойманный сигнал без зомби — EINTR.
         // SIGCHLD по умолчанию сюда не попадает: он не interrupts().
-        if crate::signal::pending_interrupts() {
+        if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
             return EINTR;
         }
         x86_64::instructions::hlt();
@@ -2723,7 +2723,7 @@ fn futex_wait(addr: u64, val: u32) -> u64 {
         if let Some(rc) = done {
             return rc;
         }
-        if crate::signal::pending_interrupts() {
+        if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
             with_futex(|waiters| {
                 waiters[idx] = None;
             });

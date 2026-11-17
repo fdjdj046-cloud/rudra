@@ -2212,77 +2212,113 @@ pub fn alloc_thread_stack() -> Option<u64> {
     r.ok().map(|_| top)
 }
 
+/// Книги смерти задачи в слоте (строго под локом TASKS): дети → PID1 по tid,
+/// SIGCHLD родителю или init, cleartid + futex wake. Состояние и код выхода
+/// не трогает — это выбирает вызывающий (exit от задачи, kill от планировщика).
+fn death_books(tasks: &mut [Option<Task>; MAX_TASKS], slot: usize) {
+    let cur = slot as isize;
+    let cur_tid = tasks[slot].as_ref().map(|t| t.tid).unwrap_or(0);
+    let init_tid = INIT_TID.load(Ordering::Relaxed);
+    // Смерть PID1: репарентить и reap'ать больше некому. Честная
+    // паника, а не тихий раскол, на который потом встанут cgroups.
+    if init_tid >= 0 && cur_tid as i64 == init_tid {
+        serial_println!("[task] PID1 (tid {}) exited — system halt", cur_tid);
+        panic!("PID1 exited");
+    }
+    // Детей отдаём PID1 по tid. Поиск по «Runnable без родителя»
+    // снят: init может спать в wait4 на своём CPU, когда сирота
+    // рождается на AP, — тогда сирота оставалась с parent = -1,
+    // её зомби никто не reap'ал, слот тек.
+    let mut init_slot = -1isize;
+    if init_tid >= 0 {
+        for (i, t) in tasks.iter().enumerate() {
+            if i == slot {
+                continue;
+            }
+            if let Some(t) = t.as_ref() {
+                if t.tid as i64 == init_tid {
+                    init_slot = i as isize;
+                    break;
+                }
+            }
+        }
+    }
+    let mut zombie = false;
+    for t in tasks.iter_mut().flatten() {
+        if t.parent == cur {
+            t.parent = init_slot;
+            if t.state == TaskState::Exited {
+                zombie = true;
+            }
+        }
+    }
+    // raise только OR'ит pending — безопасно ставить спящей задаче:
+    // доставка всё равно на её тике или syscall.
+    if zombie && init_slot >= 0 {
+        if let Some(p) = tasks[init_slot as usize].as_mut() {
+            p.signals.raise(17);
+        }
+    }
+    let mut parent = -1isize;
+    let mut thread = true;
+    if let Some(t) = tasks[slot].as_mut() {
+        // CLONE_CHILD_CLEARTID: pthread join ждёт обнуления.
+        if t.clear_tid != 0 {
+            let zero = 0u32.to_le_bytes();
+            let addr = t.clear_tid;
+            let _ = user_write(addr, &zero);
+            crate::linux::futex_wake(addr, 1);
+        }
+        parent = t.parent;
+        thread = t.thread;
+    }
+    if !thread && parent >= 0 {
+        if let Some(p) = tasks[parent as usize].as_mut() {
+            p.signals.raise(17);
+        }
+    }
+}
+
 /// Пометить текущую задачу завершённой. Планировщик больше в неё не вернётся.
 pub fn exit_current() {
     with_tasks(|tasks| {
         let cur = current_slot();
         if cur >= 0 {
-            let cur_u = cur as usize;
-            let cur_tid = tasks[cur_u].as_ref().map(|t| t.tid).unwrap_or(0);
-            let init_tid = INIT_TID.load(Ordering::Relaxed);
-            // Смерть PID1: репарентить и reap'ать больше некому. Честная
-            // паника, а не тихий раскол, на который потом встанут cgroups.
-            if init_tid >= 0 && cur_tid as i64 == init_tid {
-                serial_println!("[task] PID1 (tid {}) exited — system halt", cur_tid);
-                panic!("PID1 exited");
-            }
-            // Детей отдаём PID1 по tid. Поиск по «Runnable без родителя»
-            // снят: init может спать в wait4 на своём CPU, когда сирота
-            // рождается на AP, — тогда сирота оставалась с parent = -1,
-            // её зомби никто не reap'ал, слот тек.
-            let mut init_slot = -1isize;
-            if init_tid >= 0 {
-                for (i, t) in tasks.iter().enumerate() {
-                    if i == cur_u {
-                        continue;
-                    }
-                    if let Some(t) = t.as_ref() {
-                        if t.tid as i64 == init_tid {
-                            init_slot = i as isize;
-                            break;
-                        }
-                    }
-                }
-            }
-            let mut zombie = false;
-            for t in tasks.iter_mut().flatten() {
-                if t.parent == cur {
-                    t.parent = init_slot;
-                    if t.state == TaskState::Exited {
-                        zombie = true;
-                    }
-                }
-            }
-            // raise только OR'ит pending — безопасно ставить спящей задаче:
-            // доставка всё равно на её тике или syscall.
-            if zombie && init_slot >= 0 {
-                if let Some(p) = tasks[init_slot as usize].as_mut() {
-                    p.signals.raise(17);
-                }
-            }
-            let mut parent = -1isize;
-            let mut thread = true;
+            death_books(tasks, cur as usize);
             if let Some(t) = tasks[cur as usize].as_mut() {
-                // CLONE_CHILD_CLEARTID: pthread join ждёт обнуления.
-                if t.clear_tid != 0 {
-                    let zero = 0u32.to_le_bytes();
-                    let addr = t.clear_tid;
-                    let _ = user_write(addr, &zero);
-                    crate::linux::futex_wake(addr, 1);
-                }
-                parent = t.parent;
-                thread = t.thread;
                 t.state = TaskState::Exited;
-            }
-            // Процесс, не поток. Бит только помечаем: доставка — на тике или syscall.
-            // Тот же приём, что и для init: родитель может спать в wait4.
-            if !thread && parent >= 0 {
-                if let Some(p) = tasks[parent as usize].as_mut() {
-                    p.signals.raise(17);
-                }
             }
         }
     });
+}
+
+/// Убить текущую задачу сигналом из контекста тика: книги + Exited, без
+/// hlt-цикла sys_exit (IF в обработчике выключен — CPU встал бы навсегда).
+/// iret в ring 3 случится ещё раз, но schedule слот больше не выберет.
+pub fn kill_current_signal(code: u64) {
+    with_tasks(|tasks| {
+        let cur = current_slot();
+        if cur >= 0 {
+            if let Some(t) = tasks[cur as usize].as_mut() {
+                t.exit_code = code as i64;
+            }
+            death_books(tasks, cur as usize);
+            if let Some(t) = tasks[cur as usize].as_mut() {
+                t.state = TaskState::Exited;
+            }
+        }
+    });
+}
+
+/// Убить задачу в слоте сигналом: код 128+sig, книги, Exited. Под локом TASKS.
+fn kill_slot(tasks: &mut [Option<Task>; MAX_TASKS], slot: usize, sig: u32) {
+    if let Some(t) = tasks[slot].as_mut() {
+        t.exit_code = 128 + sig as i64;
+    }
+    death_books(tasks, slot);
+    if let Some(t) = tasks[slot].as_mut() {
+        t.state = TaskState::Exited;
+    }
 }
 
 /// sys_exit: код выхода → exit_code, дальше как exit_current.
@@ -2555,6 +2591,12 @@ fn schedule(current_rsp: u64) -> u64 {
                     continue;
                 };
                 if t.state != TaskState::Runnable {
+                    continue;
+                }
+                // Смертельный сигнал (SIGKILL / default-fatal) не ждёт
+                // syscall: задача умирает до выбора, слот reap'ает родитель.
+                if let Some(sig) = t.signals.fatal_pending() {
+                    kill_slot(tasks, i, sig);
                     continue;
                 }
                 if t.on_cpu >= 0 && t.on_cpu != me as i8 {

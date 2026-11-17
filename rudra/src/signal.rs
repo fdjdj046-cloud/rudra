@@ -3,12 +3,16 @@
 //! Перехваченный сигнал с `SA_RESTORER` ставится и на возврате из syscall,
 //! и когда тик таймера возвращается в ring 3. Кадр тика — не кадр syscall:
 //! `deliver_pending` туда писать нельзя. Смертельный сигнал и `SIGKILL`
-//! с тика не забираются: `sys_exit` встал бы в `hlt` при выключенном IF.
-//! `nanosleep`, futex, pipe, poll, select, epoll и recvfrom возвращают
-//! `EINTR`, если сигнал надо доставить. Чтение консоли не прерывается.
-//! `SA_RESTART` нет. На стеке нет исполняемого трамплина. `SIGSTOP` и
-//! сигналы остановки сбрасываются. Смерть по умолчанию — `exit(128+sig)`,
-//! статус wait выглядит как обычный код выхода, не как `WIFSIGNALED`.
+//! забираются без syscall: планировщик убивает помеченную задачу до выбора,
+//! а `deliver_timer` прибивает входящую сразу (iret в ring 3 случится ещё
+//! раз, но не дольше одного кванта). `nanosleep`, futex, pipe, poll,
+//! select, epoll и recvfrom возвращают `EINTR`, если сигнал надо доставить;
+//! с SA_RESTART у перехваченного обработчика эти же вызовы продолжают ждать
+//! (сон — исключение, как в Linux: nanosleep никогда не перезапускается).
+//! Чтение консоли не прерывается. На стеке нет исполняемого трамплина.
+//! `SIGSTOP` и сигналы остановки сбрасываются. Смерть по умолчанию —
+//! `exit(128+sig)`, статус wait выглядит как обычный код выхода,
+//! не как `WIFSIGNALED`.
 
 use crate::syscall::FRAME;
 use crate::task::{self, user_read, user_write};
@@ -148,6 +152,52 @@ impl Signals {
         false
     }
 
+    /// Номер ждущего смертельного сигнала: SIGKILL или default-fatal без
+    /// обработчика. Перехваченный не считается — его доставляют, а не убивают.
+    pub fn fatal_pending(&self) -> Option<u32> {
+        let blocked = self.mask & !(bit(SIGKILL) | bit(SIGSTOP));
+        let mut bits = self.pending & !blocked;
+        while bits != 0 {
+            let sig = bits.trailing_zeros() + 1;
+            bits &= bits - 1;
+            if sig == SIGKILL {
+                return Some(sig);
+            }
+            let handler = self.handler[sig as usize];
+            if handler > 1 {
+                return None;
+            }
+            if handler == 0 && fatal_default(sig) {
+                return Some(sig);
+            }
+        }
+        None
+    }
+
+    /// Следующий к доставке сигнал — перехваченный с SA_RESTART?
+    /// Блокирующий syscall вместо EINTR продолжает ждать.
+    pub fn restart_pending(&self) -> bool {
+        let blocked = self.mask & !(bit(SIGKILL) | bit(SIGSTOP));
+        let mut bits = self.pending & !blocked;
+        while bits != 0 {
+            let sig = bits.trailing_zeros() + 1;
+            bits &= bits - 1;
+            if sig == SIGKILL {
+                return false;
+            }
+            let handler = self.handler[sig as usize];
+            let restorer = self.restorer[sig as usize];
+            if handler > 1 && restorer >= 0x1000 {
+                return self.sa_flags[sig as usize] & SA_RESTART != 0;
+            }
+            if handler == 0 && fatal_default(sig) {
+                return false;
+            }
+            // Игнорируемый по умолчанию — смотрим следующий.
+        }
+        false
+    }
+
     fn undo(&mut self, caught: &Catch) {
         self.pending |= bit(caught.sig);
         self.mask = caught.old_mask;
@@ -162,6 +212,13 @@ impl Signals {
 /// Есть сигнал, который должен прервать блокирующий syscall текущей задачи.
 pub fn pending_interrupts() -> bool {
     task::with_current_task(|t| t.signals.interrupts()).unwrap_or(false)
+}
+
+/// Блокирующий syscall собирался вернуть EINTR. Если следующий к доставке
+/// сигнал — перехваченный с SA_RESTART, не прерываемся: продолжаем ждать.
+/// Сон (nanosleep) не перезапускается никогда — как в Linux.
+pub fn keep_waiting() -> bool {
+    task::with_current_task(|t| t.signals.restart_pending()).unwrap_or(false)
 }
 
 fn bit(sig: u32) -> u64 {
@@ -218,7 +275,9 @@ pub fn deliver_timer(kernel_rsp: u64) {
             None => return,
             Some(Pop::Ignored) => continue,
             Some(Pop::Fatal(sig)) => {
-                let _ = task::with_current_task(|t| t.signals.pending |= bit(sig));
+                // Умираем сразу, а не ждём syscall: kill_current_signal
+                // помечает Exited без hlt (IF в обработчике выключен).
+                task::kill_current_signal(128 + u64::from(sig));
                 return;
             }
             Some(Pop::Catch(caught)) => {
