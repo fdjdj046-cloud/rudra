@@ -2,7 +2,7 @@
 
 **Учебная x86-64 операционная система на Rust** — с нуля, без `std`, с настоящим userspace в ring 3, вытесняющим планировщиком и framebuffer-консолью.
 
-*by Cisco*
+*by Cisco (independent developer; not affiliated with Cisco Systems)*
 
 ![Rust](https://img.shields.io/badge/rust-nightly-orange)
 ![Target](https://img.shields.io/badge/target-x86__64--unknown--none-blue)
