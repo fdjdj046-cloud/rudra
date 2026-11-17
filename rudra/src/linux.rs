@@ -457,8 +457,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         14 => crate::signal::sys_rt_sigprocmask(a1, a2, a3, a4),
         15 => crate::signal::sys_rt_sigreturn(frame),
         16 => sys_ioctl(a1, a2, a3),
-        17 => sys_pread(a1, a2, a3, a5, a6),
-        18 => sys_pwrite(a1, a2, a3, a5, a6),
+        // pread64/pwrite64: смещение целиком в r10 (arg4). r8 — это arg5, не позиция.
+        17 => sys_pread(a1, a2, a3, a4),
+        18 => sys_pwrite(a1, a2, a3, a4),
         19 => sys_rwv(a1, a2, a3, false),
         20 => sys_rwv(a1, a2, a3, true),
         21 | 439 => {
@@ -1402,17 +1403,37 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         Ok(Kind::Tcp(id)) => tcp_write(id, buf, len),
         Ok(Kind::File) => {
             // Запись в буфер dirty (сброс при close) — под локом fd.
+            // Пустой dirty у уже существующего файла — это ещё не новый образ:
+            // сначала читаем старые байты, иначе close затирает хвост.
             with_fd(fd, |f| match f {
-                Fd::File { offset, accmode, append, dirty, .. } if *accmode != 0 => {
-                    let data = dirty.get_or_insert_with(Vec::new);
+                Fd::File {
+                    name,
+                    offset,
+                    accmode,
+                    append,
+                    dirty,
+                    ..
+                } if *accmode != 0 => {
+                    if let Err(e) = seed_dirty(name, dirty) {
+                        return e;
+                    }
+                    let data = dirty.as_mut().unwrap();
                     if *append {
+                        let end = data.len().saturating_add(bytes.len());
+                        if end > DIRTY_CAP {
+                            return EFBIG;
+                        }
                         data.extend_from_slice(&bytes);
                     } else {
                         let pos = *offset as usize;
-                        if data.len() < pos + bytes.len() {
-                            data.resize(pos + bytes.len(), 0);
+                        let end = pos.saturating_add(bytes.len());
+                        if end > DIRTY_CAP {
+                            return EFBIG;
                         }
-                        data[pos..pos + bytes.len()].copy_from_slice(&bytes);
+                        if data.len() < end {
+                            data.resize(end, 0);
+                        }
+                        data[pos..end].copy_from_slice(&bytes);
                         *offset += bytes.len() as u64;
                     }
                     bytes.len() as u64
@@ -1696,21 +1717,26 @@ fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
                 2 => size,            // SEEK_END
                 _ => return EINVAL,
             };
-            let new = base + offset;
+            let Some(new) = base.checked_add(offset) else {
+                return EINVAL;
+            };
             if new < 0 {
                 return EINVAL;
             }
             *cur = new as u64;
-            0
+            new as u64
         }
         Fd::Dir { .. } => {
             // SEEK_SET на индекс записи: разрешаем позиционирование каталога.
             match whence {
                 0 => {
-                    if let Fd::Dir { idx, .. } = f {
-                        *idx = offset.max(0) as usize;
+                    if offset < 0 {
+                        return EINVAL;
                     }
-                    0
+                    if let Fd::Dir { idx, .. } = f {
+                        *idx = offset as usize;
+                    }
+                    offset as u64
                 }
                 _ => ESPIPE,
             }
@@ -1718,15 +1744,12 @@ fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
         _ => ESPIPE,
     });
     match r {
-        Ok(code) => {
-            // Код 0 = успех; EINVAL/ESPIPE уже значения-ошибки.
-            code
-        }
+        Ok(code) => code,
         Err(e) => e,
     }
 }
 
-fn sys_pread(fd: u64, buf: u64, len: u64, pos: u64, _pos_hi: u64) -> u64 {
+fn sys_pread(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
     // x86_64: pread64(fd, buf, count, pos) — pos целиком в arg4 (r10).
     sys_pread_full(fd, buf, len, pos)
 }
@@ -1770,10 +1793,59 @@ fn sys_pread_full(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
     }
 }
 
-fn sys_pwrite(fd: u64, buf: u64, len: u64, pos_lo: u64, pos_hi: u64) -> u64 {
-    let _ = (pos_lo, pos_hi);
-    // pwrite: пишем по текущему offset (позиционные записи редки).
-    sys_write(fd, buf, len)
+fn sys_pwrite(fd: u64, buf: u64, len: u64, pos: u64) -> u64 {
+    if buf == 0 || len == 0 {
+        return 0;
+    }
+    if len as usize > MAX_IO {
+        return EFAULT;
+    }
+    let Some(bytes) = copy_from_user(buf, len as usize) else {
+        return EFAULT;
+    };
+    let Some(end) = (pos as usize).checked_add(bytes.len()) else {
+        return EINVAL;
+    };
+    if end > DIRTY_CAP {
+        return EFBIG;
+    }
+    let r = with_fd(fd, |f| match f {
+        Fd::File {
+            name, accmode, dirty, ..
+        } if *accmode != 0 => {
+            if let Err(e) = seed_dirty(name, dirty) {
+                return e;
+            }
+            let data = dirty.as_mut().unwrap();
+            if data.len() < end {
+                data.resize(end, 0);
+            }
+            data[pos as usize..end].copy_from_slice(&bytes);
+            bytes.len() as u64
+        }
+        _ => ESPIPE,
+    });
+    match r {
+        Ok(v) => v,
+        Err(e) => e,
+    }
+}
+
+/// Образ файла для отложенной записи. Больше 1 МиБ не держим: иначе close
+/// не сотрёт хвост молча, а вернёт ошибку ещё до изменения.
+const DIRTY_CAP: usize = 1024 * 1024;
+
+fn seed_dirty(name: &str, dirty: &mut Option<Vec<u8>>) -> Result<(), u64> {
+    if dirty.is_some() {
+        return Ok(());
+    }
+    let seeded = match crate::fs::read_canon(name) {
+        Some(v) if v.len() > DIRTY_CAP => return Err(EFBIG),
+        Some(v) => v,
+        None => Vec::new(),
+    };
+    *dirty = Some(seeded);
+    Ok(())
 }
 
 fn sys_rwv(fd: u64, iov: u64, iovcnt: u64, write: bool) -> u64 {

@@ -100,14 +100,14 @@ GitHub Actions после тестов ядра собирает образ и �
 | 3 | close |
 | 4, 6, 5, 262, 332 | stat, lstat, fstat, newfstatat, statx |
 | 7, 23 | poll, select |
-| 8 | lseek. Успех возвращает **0**, не новую позицию |
+| 8 | lseek. Успех возвращает новую позицию |
 | 9 | mmap анонимной памяти. Файл — `ENODEV` |
 | 10, 11, 28 | mprotect, munmap, madvise: успех, память не отдаётся |
 | 12 | brk |
 | 13, 14, 62 | сигналы и kill: успех, доставки нет |
 | 16 | ioctl консоли: TCGETS/TCSETS и TIOCGWINSZ |
 | 17 | pread64 |
-| 18 | pwrite64 пишет с текущего смещения и **игнорирует позицию** |
+| 18 | pwrite64 пишет по переданной позиции и не сдвигает смещение fd. Файл больше 1 МиБ — `EFBIG` |
 | 19, 20 | readv, writev |
 | 21, 439 | access, faccessat2 |
 | 22, 293 | pipe, pipe2 |
