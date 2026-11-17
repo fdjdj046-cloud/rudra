@@ -912,6 +912,21 @@ pub fn mkdir_mode(name: &str, perm: u16) -> Result<(), FsError> {
     }
 }
 
+/// Владелец (uid, gid) файла. ext2 читает inode; синтетика и RFS2 — root (0, 0):
+/// у них хранить владельца некуда.
+pub fn owner_of(name: &str) -> Option<(u32, u32)> {
+    if synth_children(name).is_some() || synth_body(name).is_some() {
+        return Some((0, 0));
+    }
+    if ext2_on() {
+        crate::ext2::owner_of(name)
+    } else if fs().exists(name) || fs().is_dir(name) {
+        Some((0, 0))
+    } else {
+        None
+    }
+}
+
 /// Полный режим с типом. Синтетика: каталог 0755, файл 0644.
 pub fn mode_of(name: &str) -> Option<u32> {
     if synth_children(name).is_some() {

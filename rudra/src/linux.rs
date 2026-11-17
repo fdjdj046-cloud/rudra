@@ -364,7 +364,7 @@ fn fake_ino(name: &str) -> u64 {
 }
 
 /// struct stat x86_64 (144 байта) в user-буфер. `false` — битый указатель.
-fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
+fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64, uid: u32, gid: u32) -> bool {
     if buf == 0 {
         return false;
     }
@@ -374,9 +374,8 @@ fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
     st[8..16].copy_from_slice(&fake_ino("stat").to_le_bytes());
     st[16..24].copy_from_slice(&nlink.to_le_bytes());
     st[24..28].copy_from_slice(&mode.to_le_bytes());
-    // У файла нет владельца. 0 — root, не uid вызывающего и не старая константа 1000.
-    st[28..32].copy_from_slice(&0u32.to_le_bytes());
-    st[32..36].copy_from_slice(&0u32.to_le_bytes());
+    st[28..32].copy_from_slice(&uid.to_le_bytes());
+    st[32..36].copy_from_slice(&gid.to_le_bytes());
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&((size + 511) / 512).to_le_bytes());
@@ -386,21 +385,30 @@ fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
     u_write(buf, &st)
 }
 
-fn stat_of(path: &str) -> Option<(u64, u32, u64)> {
+/// (size, mode, nlink, uid, gid). Владелец — из inode ext2, у остальных root.
+fn stat_of(path: &str) -> Option<(u64, u32, u64, u32, u32)> {
     let mode = crate::fs::mode_of(path)?;
+    let (uid, gid) = crate::fs::owner_of(path).unwrap_or((0, 0));
     if crate::fs::is_dir(path) {
-        Some((0, mode, crate::fs::nlink_of(path).max(2)))
+        Some((0, mode, crate::fs::nlink_of(path).max(2), uid, gid))
     } else if crate::fs::exists(path) {
         let sz = crate::fs::size_of(path).max(0) as u64;
-        Some((sz, mode, crate::fs::nlink_of(path).max(1)))
+        Some((sz, mode, crate::fs::nlink_of(path).max(1), uid, gid))
     } else {
         None
     }
 }
 
-/// Консоль stat: char device.
+/// Консоль stat: char device, владелец — текущая задача.
 fn write_console_stat(buf: u64) {
-    let _ = write_stat(buf, 0, S_IFCHR | 0o620, 1);
+    let _ = write_stat(
+        buf,
+        0,
+        S_IFCHR | 0o620,
+        1,
+        task::cred_euid() as u32,
+        task::cred_egid() as u32,
+    );
 }
 
 // ---- Диспетчер ----
@@ -426,8 +434,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
             match stat_of(&canon) {
-                Some((sz, mode, nlink)) => {
-                    if !write_stat(a2, sz, mode, nlink) {
+                Some((sz, mode, nlink, uid, gid)) => {
+                    if !write_stat(a2, sz, mode, nlink, uid, gid) {
                         return EFAULT;
                     }
                     0
@@ -1616,20 +1624,23 @@ fn sys_fstat(fd: u64, buf: u64) -> u64 {
         Fd::Udp { .. } | Fd::Tcp { .. } => Hit::Ready(0, 0o140000 | 0o666, 1),
         Fd::Epoll { .. } => Hit::Ready(0, S_IFREG | 0o600, 1),
     });
+    let (uid, gid) = (task::cred_euid() as u32, task::cred_egid() as u32);
     let st = match hit {
-        Ok(Hit::Ready(sz, mode, nlink)) => (sz, mode, nlink),
+        Ok(Hit::Ready(sz, mode, nlink)) => (sz, mode, nlink, uid, gid),
         Ok(Hit::File(name, dirty_len)) => {
             let size = dirty_len.unwrap_or_else(|| crate::fs::size_of(&name).max(0) as u64);
             let mode = crate::fs::mode_of(&name).unwrap_or(S_IFREG | 0o644);
-            (size, mode, 1)
+            let (fuid, fgid) = crate::fs::owner_of(&name).unwrap_or((0, 0));
+            (size, mode, 1, fuid, fgid)
         }
         Ok(Hit::Dir(name)) => {
             let mode = crate::fs::mode_of(&name).unwrap_or(S_IFDIR | 0o755);
-            (0, mode, crate::fs::nlink_of(&name).max(2))
+            let (fuid, fgid) = crate::fs::owner_of(&name).unwrap_or((0, 0));
+            (0, mode, crate::fs::nlink_of(&name).max(2), fuid, fgid)
         }
         Err(e) => return e,
     };
-    if !write_stat(buf, st.0, st.1, st.2) {
+    if !write_stat(buf, st.0, st.1, st.2, st.3, st.4) {
         return EFAULT;
     }
     0
@@ -1669,8 +1680,8 @@ fn sys_newfstatat(dirfd: u64, path_ptr: u64, buf: u64, flags: u64) -> u64 {
         }
     };
     match stat_of(&canon) {
-        Some((sz, mode, nlink)) => {
-            if !write_stat(buf, sz, mode, nlink) {
+        Some((sz, mode, nlink, uid, gid)) => {
+            if !write_stat(buf, sz, mode, nlink, uid, gid) {
                 return EFAULT;
             }
             0
@@ -1707,13 +1718,13 @@ fn sys_statx(dirfd: u64, path_ptr: u64, _flags: u64, _mask: u64, buf: u64) -> u6
     };
     let mut raw = [0u8; 256];
     match st {
-        Some((sz, mode, nlink)) => {
+        Some((sz, mode, nlink, uid, gid)) => {
             let now = crate::interrupts::uptime_ms();
             raw[0..4].copy_from_slice(&0x7ffu32.to_le_bytes());
             raw[4..8].copy_from_slice(&4096u32.to_le_bytes());
             raw[16..20].copy_from_slice(&(nlink as u32).to_le_bytes());
-            raw[20..24].copy_from_slice(&0u32.to_le_bytes());
-            raw[24..28].copy_from_slice(&0u32.to_le_bytes());
+            raw[20..24].copy_from_slice(&uid.to_le_bytes());
+            raw[24..28].copy_from_slice(&gid.to_le_bytes());
             raw[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
             raw[32..40].copy_from_slice(&fake_ino("statx").to_le_bytes());
             raw[40..48].copy_from_slice(&sz.to_le_bytes());

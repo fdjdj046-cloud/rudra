@@ -175,9 +175,12 @@ pub fn mkdir(path: &str) -> Result<(), FsError> {
     mkdir_mode(path, 0o755)
 }
 
-/// `perm` — биты 0777 после umask. Тип каталога — 0x4000.
+/// `perm` — биты 0777 после umask. Тип каталога — 0x4000. Владелец — euid/egid
+/// создавшей задачи: uid lo@2 hi@120, gid lo@24 hi@122 (rev 1, inode 128 B).
 pub fn mkdir_mode(path: &str, perm: u16) -> Result<(), FsError> {
-    with_vol(|v| v.mkdir_at(path, perm)).unwrap_or(Err(FsError::Io))
+    let uid = crate::task::cred_euid() as u32;
+    let gid = crate::task::cred_egid() as u32;
+    with_vol(|v| v.mkdir_at(path, perm, uid, gid)).unwrap_or(Err(FsError::Io))
 }
 
 pub fn mode_of(path: &str) -> Option<u32> {
@@ -194,9 +197,24 @@ pub fn chmod(path: &str, perm: u16) -> Result<(), FsError> {
     with_vol(|v| v.chmod_at(path, perm)).unwrap_or(Err(FsError::Io))
 }
 
-/// Пустой новый обычный файл. Существующий путь не трогает.
+/// Пустой новый обычный файл. Существующий путь не трогает. Владелец —
+/// euid/egid создавшей задачи.
 pub fn create_file(path: &str, perm: u16) -> Result<(), FsError> {
-    with_vol(|v| v.create_reg(path, perm)).unwrap_or(Err(FsError::Io))
+    let uid = crate::task::cred_euid() as u32;
+    let gid = crate::task::cred_egid() as u32;
+    with_vol(|v| v.create_reg(path, perm, uid, gid)).unwrap_or(Err(FsError::Io))
+}
+
+/// Владелец (uid, gid) из inode. Нет пути — None.
+pub fn owner_of(path: &str) -> Option<(u32, u32)> {
+    with_vol(|v| {
+        let ino = v.lookup(path).ok()?;
+        let inode = v.read_inode(ino).ok()?;
+        let uid = get_u16(&inode, 2) as u32 | ((get_u16(&inode, 120) as u32) << 16);
+        let gid = get_u16(&inode, 24) as u32 | ((get_u16(&inode, 122) as u32) << 16);
+        Some((uid, gid))
+    })
+    .flatten()
 }
 
 pub fn rmdir(path: &str) -> Result<(), FsError> {
@@ -951,7 +969,7 @@ impl Vol {
         self.flush()
     }
 
-    fn mkdir_at(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
+    fn mkdir_at(&mut self, path: &str, perm: u16, uid: u32, gid: u32) -> Result<(), FsError> {
         if path.is_empty() || path == "/" {
             return Err(FsError::Inval);
         }
@@ -982,6 +1000,10 @@ impl Vol {
         self.write_block(block, &db)?;
         let mut inode = vec![0u8; 128];
         put_u16(&mut inode, 0, 0x4000 | (perm & 0o777));
+        put_u16(&mut inode, 2, uid as u16);
+        put_u16(&mut inode, 24, gid as u16);
+        put_u16(&mut inode, 120, (uid >> 16) as u16);
+        put_u16(&mut inode, 122, (gid >> 16) as u16);
         put_u32(&mut inode, 4, self.block_size as u32);
         put_u16(&mut inode, 26, 2);
         put_u32(&mut inode, 28, (self.block_size / 512) as u32);
@@ -1009,7 +1031,7 @@ impl Vol {
         self.write_inode(ino, &inode)
     }
 
-    fn create_reg(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
+    fn create_reg(&mut self, path: &str, perm: u16, uid: u32, gid: u32) -> Result<(), FsError> {
         if path.is_empty() || path == "/" {
             return Err(FsError::Inval);
         }
@@ -1027,6 +1049,10 @@ impl Vol {
         let ino = self.alloc_ino()?;
         let mut fresh = vec![0u8; 128];
         put_u16(&mut fresh, 0, 0x8000 | (perm & 0o777));
+        put_u16(&mut fresh, 2, uid as u16);
+        put_u16(&mut fresh, 24, gid as u16);
+        put_u16(&mut fresh, 120, (uid >> 16) as u16);
+        put_u16(&mut fresh, 122, (gid >> 16) as u16);
         put_u16(&mut fresh, 26, 1);
         self.write_inode(ino, &fresh)?;
         if let Err(e) = self.add_dirent(pino, ino, name, EXT2_FT_REG) {
