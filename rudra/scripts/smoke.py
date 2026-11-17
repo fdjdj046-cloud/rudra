@@ -182,6 +182,7 @@ def main():
             "run /bin/intr.elf",
             "run /bin/cred.elf",
             "run /bin/seccomp.elf",
+            "run /bin/fs.elf",
             "run /bin/epoll.elf",
             "run /bin/dyn.elf",
             "ls /",
@@ -249,6 +250,12 @@ def main():
             raise SystemExit("cred.elf did not report cred-ok\n" + text[-1500:])
         if "seccomp-ok" not in text or "seccomp-bad" in text or "[exit 137]" not in text:
             raise SystemExit("seccomp.elf did not die on a forbidden syscall\n" + text[-1500:])
+        if "fs-ok" not in text or "fs-bad" in text:
+            raise SystemExit("fs.elf did not report fs-ok\n" + text[-1500:])
+        if "reparent-ok" not in text or "reparent-bad" in text:
+            raise SystemExit("fs.elf did not report reparent-ok\n" + text[-1500:])
+        if "[task] init spawned" not in text:
+            raise SystemExit("init was not pid1\n" + text[-1500:])
         if "epoll-ok" not in text:
             raise SystemExit("epoll.elf did not report epoll-ok\n" + text[-1500:])
         if "interp-ok" not in text or "interp-bad" in text:

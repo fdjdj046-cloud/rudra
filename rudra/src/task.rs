@@ -673,6 +673,22 @@ pub fn strict_permits(nr: u64) -> bool {
     matches!(nr, 0 | 1 | 15 | 60)
 }
 
+/// Каталог и umask. `CLONE_FS` делит эту структуру, обычный fork копирует.
+/// umask хранится и наследуется; режим новых файлов его пока не применяет.
+pub struct FsCtx {
+    pub cwd: String,
+    pub umask: u32,
+}
+
+impl FsCtx {
+    fn at_root() -> Self {
+        Self {
+            cwd: String::from("/"),
+            umask: 0o022,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Runnable,
@@ -709,8 +725,8 @@ pub struct Task {
     pub signals: crate::signal::Signals,
     pub name: [u8; 24],
     pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
-    pub cwd: String,
-    pub umask: u32,
+    /// `CLONE_FS` держит один и тот же `Arc`. fork без этого флага копирует.
+    pub fsctx: Arc<Mutex<FsCtx>>,
     pub cred: Cred,
     /// 0 — выключен, 1 — `SECCOMP_MODE_STRICT`. Фильтра BPF нет.
     pub seccomp: u8,
@@ -750,11 +766,13 @@ static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"
 static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
 static CRED_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cred.elf"));
 static SECCOMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp.elf"));
+static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
+static FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fs.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
-/// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
+/// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 13] = [
+    const BINS: [(&str, &[u8]); 15] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -768,6 +786,8 @@ pub fn init() {
         ("/bin/dyn.elf", DYN_ELF),
         ("/bin/cred.elf", CRED_ELF),
         ("/bin/seccomp.elf", SECCOMP_ELF),
+        ("/bin/init.elf", INIT_ELF),
+        ("/bin/fs.elf", FS_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -779,11 +799,19 @@ pub fn init() {
         }
     }
 
-    match spawn_path("/bin/shell.elf") {
+    // PID1 — init. Он поднимает шелл и забирает осиротевших. Если файла нет, шелл сам PID1.
+    let spawned = spawn_path("/bin/init.elf");
+    let (spawned, what) = if spawned == u64::MAX {
+        (spawn_path("/bin/shell.elf"), "shell")
+    } else {
+        (spawned, "init")
+    };
+    match spawned {
         s if s != u64::MAX => {
             SCHED_INITED.store(true, Ordering::Release);
             serial_println!(
-                "[task] shell spawned (slot {}), round-robin on {}",
+                "[task] {} spawned (tid {}), round-robin on {}",
+                what,
                 s,
                 if crate::apic::timer_armed() {
                     "lapic"
@@ -792,7 +820,7 @@ pub fn init() {
                 }
             );
         }
-        _ => serial_println!("[task] failed to spawn shell"),
+        _ => serial_println!("[task] failed to spawn init and shell"),
     }
 }
 
@@ -1232,8 +1260,7 @@ fn finish_task(
         signals: crate::signal::Signals::new(),
         name: name_buf,
         fds: default_fds(),
-        cwd: String::from("/"),
-        umask: 0o022,
+        fsctx: Arc::new(Mutex::new(FsCtx::at_root())),
         cred: Cred::root(),
         seccomp: 0,
         fx: crate::fpu::FxState::new(),
@@ -1253,6 +1280,26 @@ pub fn current_tid() -> u64 {
         return 0;
     }
     with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.tid).unwrap_or(0))
+}
+
+/// Рабочий каталог. Без задачи — `/`.
+pub fn current_cwd() -> String {
+    with_current_task(|t| t.fsctx.lock().cwd.clone()).unwrap_or_else(|| String::from("/"))
+}
+
+pub fn set_cwd(path: String) {
+    let _ = with_current_task(|t| t.fsctx.lock().cwd = path);
+}
+
+/// Ставит umask и возвращает прежний. Биты выше 0o777 отбрасываются.
+pub fn swap_umask(next: u32) -> u32 {
+    with_current_task(|t| {
+        let mut g = t.fsctx.lock();
+        let old = g.umask;
+        g.umask = next & 0o777;
+        old
+    })
+    .unwrap_or(0o022)
 }
 
 /// tid родителя. У init и без задачи — 0. Отдельного пространства gettid нет:
@@ -1489,6 +1536,7 @@ pub fn sys_clone(
             parent_as,
             parent_cr3,
             parent_fs,
+            parent_fsctx,
             parent_cwd,
             parent_umask,
             parent_fds,
@@ -1499,12 +1547,20 @@ pub fn sys_clone(
             parent_seccomp,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
+            let parent_fsctx = p.fsctx.clone();
+            // Один lock. Два `lock()` в одном выражении не отпускают guard и
+            // на spin::Mutex встают навсегда.
+            let (parent_cwd, parent_umask) = {
+                let g = parent_fsctx.lock();
+                (g.cwd.clone(), g.umask)
+            };
             (
                 p.aspace.clone(),
                 p.cr3,
                 p.fs_base,
-                p.cwd.clone(),
-                p.umask,
+                parent_fsctx,
+                parent_cwd,
+                parent_umask,
                 p.fds.clone(),
                 p.name,
                 p.signals.for_child(),
@@ -1612,12 +1668,14 @@ pub fn sys_clone(
             signals: parent_signals,
             name: parent_name,
             fds,
-            cwd: if flags & CLONE_FS != 0 {
-                parent_cwd
+            fsctx: if flags & CLONE_FS != 0 {
+                parent_fsctx
             } else {
-                parent_cwd
+                Arc::new(Mutex::new(FsCtx {
+                    cwd: parent_cwd,
+                    umask: parent_umask,
+                }))
             },
-            umask: parent_umask,
             cred: parent_cred,
             seccomp: parent_seccomp,
             fx: crate::fpu::FxState::new(),
@@ -1672,7 +1730,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
 
     // 2) Разрешить путь и прочитать ELF.
     let canon = {
-        let cwd = with_current_task(|t| t.cwd.clone()).unwrap_or_else(|| String::from("/"));
+        let cwd = current_cwd();
         match crate::fs::resolve(&cwd, &path) {
             Some(c) => c,
             None => return E2BIG,
@@ -1963,10 +2021,35 @@ pub fn exit_current() {
     with_tasks(|tasks| {
         let cur = CURRENT.load(Ordering::Relaxed);
         if cur >= 0 {
-            // Детей отцепляем: слот родителя может достаться новой задаче.
+            // Детей отдаём задаче без родителя (init). Иначе слот родителя
+            // достанется чужому, и wait заберёт не того.
+            let cur_u = cur as usize;
+            let mut init_slot = -1isize;
+            for i in 0..tasks.len() {
+                if i == cur_u {
+                    continue;
+                }
+                if let Some(t) = tasks[i].as_ref() {
+                    if t.parent < 0 && t.state == TaskState::Runnable {
+                        init_slot = i as isize;
+                        break;
+                    }
+                }
+            }
+            let mut zombie = false;
             for t in tasks.iter_mut().flatten() {
                 if t.parent == cur {
-                    t.parent = -1;
+                    t.parent = init_slot;
+                    if t.state == TaskState::Exited {
+                        zombie = true;
+                    }
+                }
+            }
+            if zombie && init_slot >= 0 {
+                if let Some(p) = tasks[init_slot as usize].as_mut() {
+                    if p.state == TaskState::Runnable {
+                        p.signals.raise(17);
+                    }
                 }
             }
             let mut parent = -1isize;
@@ -2409,6 +2492,29 @@ mod tests {
         assert!(st.contains("Uid:\t0\t0\t0\t0\n"));
         assert!(st.contains("Gid:\t0\t0\t0\t0\n"));
         assert!(st.contains("Seccomp:\t0\n"));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn clone_fs_shares_cwd_fork_copies() {
+        serial_print!("test clone_fs_shares_cwd_fork_copies... ");
+        let shared = Arc::new(Mutex::new(FsCtx::at_root()));
+        let alias = shared.clone();
+        shared.lock().cwd = String::from("/bin");
+        assert_eq!(alias.lock().cwd, "/bin");
+        let (cwd, umask) = {
+            let g = shared.lock();
+            (g.cwd.clone(), g.umask)
+        };
+        let copied = Arc::new(Mutex::new(FsCtx { cwd, umask }));
+        shared.lock().cwd = String::from("/");
+        shared.lock().umask = 0o077;
+        assert_eq!(copied.lock().cwd, "/bin");
+        assert_eq!(copied.lock().umask, 0o022);
+        assert_eq!(alias.lock().cwd, "/");
+        assert_eq!(alias.lock().umask, 0o077);
+        assert_eq!(current_cwd(), "/");
+        assert_eq!(swap_umask(0o777), 0o022);
         serial_println!("[ok]");
     }
 

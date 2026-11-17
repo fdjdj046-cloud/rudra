@@ -322,8 +322,7 @@ fn console_read_byte() -> u8 {
 // ---- Пути ----
 
 fn task_resolve(path: &str) -> Option<String> {
-    let cwd = task::with_current_task(|t| t.cwd.clone()).unwrap_or_else(|| String::from("/"));
-    crate::fs::resolve(&cwd, path)
+    crate::fs::resolve(&task::current_cwd(), path)
 }
 
 fn fs_err(e: crate::fs::FsError) -> u64 {
@@ -535,7 +534,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         78 | 217 => sys_getdents64(a1, a2, a3),
         79 => {
             // getcwd
-            let cwd = task::with_current_task(|t| t.cwd.clone()).unwrap_or_else(|| String::from("/"));
+            let cwd = task::current_cwd();
             let bytes = cwd.as_bytes();
             if a2 < bytes.len() as u64 + 1 {
                 return ERANGE;
@@ -552,7 +551,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
             if crate::fs::is_dir(&canon) {
-                task::with_current_task(|t| t.cwd = canon);
+                task::set_cwd(canon);
                 0
             } else if stat_of(&canon).is_some() {
                 ENOTDIR
@@ -648,9 +647,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         90 | 91 => 0, // chmod / fchmod
         95 => {
             // umask
-            let old = task::with_current_task(|t| t.umask).unwrap_or(0o022);
-            task::with_current_task(|t| t.umask = a1 as u32 & 0o777);
-            old as u64
+            task::swap_umask(a1 as u32) as u64
         }
         96 => {
             // gettimeofday. NULL tv — успех без записи.
