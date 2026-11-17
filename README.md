@@ -1,6 +1,6 @@
 # rudra
 
-**Учебная x86-64 операционная система на Rust** — с нуля, без `std`, с настоящим userspace в ring 3, вытесняющим планировщиком и framebuffer-консолью.
+**Серверная x86-64 операционная система на Rust** — своё ядро без `std`, userspace в ring 3, вытесняющий планировщик. Цель ветки `main` — профиль Server 2.x: сеть, ФС, init, изоляция. Десктоп сюда не входит, для него ветки `desktop-3.x`.
 
 *by Cisco (independent developer; not affiliated with Cisco Systems)*
 
@@ -9,7 +9,7 @@
 ![QEMU](https://img.shields.io/badge/runs%20on-QEMU%2011-green)
 ![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-lightgrey)
 
-**rudra 1.0.1 — research OS. Не ставьте образ на единственный диск с данными.**
+**rudra 1.0.1.** Образ загрузочный, корень ext2. Не ставьте его на единственный диск с данными. Тег 2.0.0 ещё не стоит.
 
 Дальше по `main` — серверный контракт 2.0.0, не десктоп. Решения и что уже обещано: [ROADMAP.md](ROADMAP.md), [doc/compat-contract.md](doc/compat-contract.md), [doc/profiles.md](doc/profiles.md). Тег 2.0.0 не стоит. Профиль Desktop пойдёт в ветки `desktop-3.x`.
 
@@ -156,7 +156,7 @@ Linux x86_64. Номер в `rax`, возврат в `rax`, аргументы:
 
 Частые номера: 0 read, 1 write, 2 open, 9 mmap, 12 brk, 56 clone, 57 fork,
 41 socket, 44 sendto, 45 recvfrom, 49 bind, 59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
-UDP `AF_INET`: петля и virtio-net, сумма на проводе (0 на IPv4 принимается). TCP, IPv6 и netlink возвращают ошибку.
+UDP `AF_INET`: петля и virtio-net, сумма на проводе (0 на IPv4 принимается). TCP — listen, accept, send и recv только на `127.0.0.0/8`; другой адрес даёт `ENETUNREACH`. IPv6 и netlink — ошибка.
 Полный разбор — `rudra/src/linux.rs`. `SFMask` гасит IF на время entry.
 
 syscall не переключает CR3: kernel-половина замаплена в каждом адресном пространстве,
@@ -250,7 +250,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [ ] SMP до конца: AP уже отвечают на IPI, но очередь задач и per-CPU TSS ещё не сделаны
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра
-- [ ] Сеть (virtio-net → UDP/TCP)
+- [ ] Серверный контур 2.x до конца: проводной TCP, IPv6, netlink, ext4, пакеты, namespaces. Петля UDP и TCP на `127.0.0.0/8`, кэш целого файла до 64 КиБ, virtio-net, PID1 и `CLONE_FS` уже в ядре
 
 ## Благодарности
 

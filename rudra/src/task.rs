@@ -768,11 +768,12 @@ static CRED_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cred.elf"));
 static SECCOMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp.elf"));
 static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 static FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fs.elf"));
+static TCP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tcp.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 15] = [
+    const BINS: [(&str, &[u8]); 16] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -788,6 +789,7 @@ pub fn init() {
         ("/bin/seccomp.elf", SECCOMP_ELF),
         ("/bin/init.elf", INIT_ELF),
         ("/bin/fs.elf", FS_ELF),
+        ("/bin/tcp.elf", TCP_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {

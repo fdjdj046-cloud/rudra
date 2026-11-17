@@ -36,7 +36,7 @@
 
 ## 1.0.0: ext2 read-write — это корень
 
-Research OS. Не ставьте образ на единственный диск с данными. Контракт, whitelist и `ENOSYS` — в [RELEASE_NOTES.md](../RELEASE_NOTES.md).
+Серверный контур на `main`, тег 2.0.0 ещё не стоит. Не ставьте образ на единственный диск с данными. Контракт, whitelist и `ENOSYS` — в [RELEASE_NOTES.md](../RELEASE_NOTES.md).
 
 Релизный файл — `target/images/rudra-1.0.0.img`, raw, не ISO. 32 МиБ: загрузчик в первых 16 МиБ, ext2 сразу после. QEMU грузит его одним virtio-blk (`disable-modern=on`, `bootindex=0`). Проверено на копии: запись `/keep.txt`, reboot, чтение того же текста; busybox `echo`/`cat`/`ls`/`wc`/`true`/`rmdir` и `hello.elf`/`threads.elf` выходят с кодом 0. Юнит-тесты без диска по-прежнему печатают `[virtio-blk] no device`, `[root] recovery ramdisk` и проходят (код выхода QEMU 33).
 

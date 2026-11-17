@@ -594,6 +594,105 @@ pub fn nlink_of(name: &str) -> u64 {
     }
 }
 
+/// Целый файл не длиннее 64 КиБ. Запись, unlink и rename слот выкидывают.
+/// Проверка записи ext2 идёт в блочный слой и этот кэш не видит.
+const PAGE_SLOTS: usize = 8;
+const PAGE_MAX: usize = 64 * 1024;
+
+struct PageSlot {
+    name: String,
+    data: Vec<u8>,
+}
+
+struct PageCache {
+    /// Каждая мутация увеличивает счётчик. Заполнение, начатое раньше, не записывается.
+    gen: u64,
+    next: usize,
+    slots: [Option<PageSlot>; PAGE_SLOTS],
+}
+
+static PAGE: Mutex<PageCache> = Mutex::new(PageCache {
+    gen: 0,
+    next: 0,
+    slots: [None, None, None, None, None, None, None, None],
+});
+
+fn with_page<R>(f: impl FnOnce(&mut PageCache) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut PAGE.lock()))
+}
+
+fn page_lookup(name: &str) -> Option<Vec<u8>> {
+    with_page(|c| {
+        for slot in c.slots.iter().flatten() {
+            if slot.name == name {
+                return Some(slot.data.clone());
+            }
+        }
+        None
+    })
+}
+
+fn page_gen() -> u64 {
+    with_page(|c| c.gen)
+}
+
+fn page_store(name: &str, data: &[u8], gen: u64) {
+    if data.len() > PAGE_MAX {
+        return;
+    }
+    with_page(|c| {
+        if c.gen != gen {
+            return;
+        }
+        for slot in c.slots.iter_mut().flatten() {
+            if slot.name == name {
+                slot.data.clear();
+                slot.data.extend_from_slice(data);
+                return;
+            }
+        }
+        let i = c.next % PAGE_SLOTS;
+        c.next = c.next.wrapping_add(1);
+        c.slots[i] = Some(PageSlot {
+            name: String::from(name),
+            data: data.to_vec(),
+        });
+    });
+}
+
+fn page_inval(name: &str) {
+    with_page(|c| {
+        c.gen = c.gen.wrapping_add(1);
+        for slot in c.slots.iter_mut() {
+            if slot.as_ref().map(|s| s.name == name).unwrap_or(false) {
+                *slot = None;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn page_cache_poke(name: &str, data: &[u8]) -> bool {
+    with_page(|c| {
+        for slot in c.slots.iter_mut().flatten() {
+            if slot.name == name {
+                slot.data.clear();
+                slot.data.extend_from_slice(data);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+fn device_read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
+    if ext2_on() {
+        crate::ext2::read_at(name, offset, buf)
+    } else {
+        fs().read_at(name, offset, buf)
+    }
+}
+
 pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
     if let Some(text) = synth_body(name) {
         let bytes = text.as_bytes();
@@ -605,11 +704,24 @@ pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
         buf[..n].copy_from_slice(&bytes[start..start + n]);
         return n as isize;
     }
-    if ext2_on() {
-        crate::ext2::read_at(name, offset, buf)
-    } else {
-        fs().read_at(name, offset, buf)
+    if let Some(data) = page_lookup(name) {
+        let start = offset as usize;
+        if start >= data.len() {
+            return 0;
+        }
+        let n = (data.len() - start).min(buf.len());
+        buf[..n].copy_from_slice(&data[start..start + n]);
+        return n as isize;
     }
+    let gen = page_gen();
+    let n = device_read_at(name, offset, buf);
+    if n > 0 && offset == 0 && (n as usize) <= buf.len() && (n as usize) <= PAGE_MAX {
+        let size = size_of(name);
+        if size > 0 && size as usize == n as usize {
+            page_store(name, &buf[..n as usize], gen);
+        }
+    }
+    n
 }
 
 pub fn list_dir(name: &str) -> Vec<String> {
@@ -673,22 +785,30 @@ pub fn unlink(name: &str) -> Result<(), FsError> {
     if synth_mut(name) {
         return Err(FsError::Perm);
     }
-    if ext2_on() {
+    page_inval(name);
+    let r = if ext2_on() {
         crate::ext2::unlink(name)
     } else {
         fs().unlink(name)
-    }
+    };
+    page_inval(name);
+    r
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), FsError> {
     if synth_mut(old) || synth_mut(new) {
         return Err(FsError::Perm);
     }
-    if ext2_on() {
+    page_inval(old);
+    page_inval(new);
+    let r = if ext2_on() {
         crate::ext2::rename(old, new)
     } else {
         fs().rename(old, new)
-    }
+    };
+    page_inval(old);
+    page_inval(new);
+    r
 }
 
 /// Разрешить путь относительно cwd в каноническое имя FS.
@@ -765,18 +885,30 @@ pub fn read_canon(name: &str) -> Option<Vec<u8>> {
     if let Some(text) = synth_body(name) {
         return Some(text.into_bytes());
     }
-    if ext2_on() {
-        return crate::ext2::read_file(name);
+    if let Some(data) = page_lookup(name) {
+        return Some(data);
     }
-    let size = fs().size_of(name);
-    if size <= 0 {
-        return None;
+    let gen = page_gen();
+    let data = if ext2_on() {
+        crate::ext2::read_file(name)
+    } else {
+        let size = fs().size_of(name);
+        if size <= 0 {
+            None
+        } else {
+            let mut v = vec![0u8; size as usize];
+            match fs().read(name, &mut v) {
+                n if n == size => Some(v),
+                _ => None,
+            }
+        }
+    };
+    if let Some(ref bytes) = data {
+        if bytes.len() <= PAGE_MAX {
+            page_store(name, bytes, gen);
+        }
     }
-    let mut v = vec![0u8; size as usize];
-    match fs().read(name, &mut v) {
-        n if n == size => Some(v),
-        _ => None,
-    }
+    data
 }
 
 /// Удалить файл по каноническому имени.
@@ -789,11 +921,16 @@ pub fn write_canon(name: &str, data: &[u8]) -> isize {
     if synth_mut(name) {
         return -1;
     }
-    if ext2_on() {
+    page_inval(name);
+    let n = if ext2_on() {
         crate::ext2::write_file(name, data)
     } else {
         fs().write(name, data)
+    };
+    if n >= 0 {
+        page_inval(name);
     }
+    n
 }
 
 #[cfg(test)]
@@ -813,6 +950,24 @@ mod tests {
         assert_eq!(&buf[..2], b"fs");
         assert!(delete_path(b"/test.txt"));
         assert_eq!(read_path(b"/test.txt", &mut buf), -1);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn page_cache_serves_reads_until_write() {
+        serial_print!("test page_cache_serves_reads_until_write... ");
+        assert!(write_path(b"/pcache.txt", b"one") > 0);
+        let mut buf = [0u8; 8];
+        let n = read_path(b"/pcache.txt", &mut buf) as usize;
+        assert_eq!(&buf[..n], b"one");
+        assert!(page_cache_poke("/pcache.txt", b"ZZZ"));
+        let n = read_path(b"/pcache.txt", &mut buf) as usize;
+        assert_eq!(&buf[..n], b"ZZZ");
+        assert!(write_path(b"/pcache.txt", b"two") > 0);
+        let n = read_path(b"/pcache.txt", &mut buf) as usize;
+        assert_eq!(&buf[..n], b"two");
+        assert!(delete_path(b"/pcache.txt"));
+        assert_eq!(read_path(b"/pcache.txt", &mut buf), -1);
         serial_println!("[ok]");
     }
 

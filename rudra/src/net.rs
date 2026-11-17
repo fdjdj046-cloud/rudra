@@ -1,7 +1,9 @@
-//! IPv4 и UDP. Петля `127.0.0.0/8` живёт без карты.
-//! В провод уходит кадр через virtio-net: ARP на восемь соседей и DHCP.
+//! IPv4, UDP и TCP на петле `127.0.0.0/8`.
+//! В провод уходит UDP через virtio-net: ARP на восемь соседей и DHCP.
 //! Исходящий UDP считает сумму. Входящая сумма 0 на IPv4 значит «не считали»
-//! и принимается: так QEMU отдаёт DHCP. IPv6, TCP и netlink здесь нет.
+//! и принимается: так QEMU отдаёт DHCP.
+//! TCP завершает рукопожатие только на петле. Адрес не из `127.0.0.0/8` —
+//! `ENETUNREACH`. Повторов, окна на проводе, IPv6 и netlink нет.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -17,9 +19,14 @@ pub const EINVAL: i32 = 22;
 pub const ENFILE: i32 = 23;
 pub const EDESTADDRREQ: i32 = 89;
 pub const EMSGSIZE: i32 = 90;
+pub const EPIPE: i32 = 32;
 pub const EADDRINUSE: i32 = 98;
 pub const EADDRNOTAVAIL: i32 = 99;
 pub const ENETDOWN: i32 = 100;
+pub const ENETUNREACH: i32 = 101;
+pub const EISCONN: i32 = 106;
+pub const ENOTCONN: i32 = 107;
+pub const ECONNREFUSED: i32 = 111;
 
 struct Dgram {
     src: u32,
@@ -809,6 +816,381 @@ fn put_be32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+const TCP_N: usize = 16;
+const TCP_RX: usize = 8192;
+
+struct TcpSock {
+    refs: u8,
+    listen: bool,
+    bound: bool,
+    nonblock: bool,
+    addr: u32,
+    port: u16,
+    peer_addr: u32,
+    peer_port: u16,
+    peer: Option<usize>,
+    parent: Option<usize>,
+    backlog_max: usize,
+    backlog: Vec<usize>,
+    rx: Vec<u8>,
+    eof: bool,
+}
+
+static TCP_TAB: Mutex<[Option<TcpSock>; TCP_N]> = Mutex::new([
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+]);
+
+fn with_tcp<R>(f: impl FnOnce(&mut [Option<TcpSock>; TCP_N]) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut TCP_TAB.lock()))
+}
+
+fn tcp_fresh(nonblock: bool) -> TcpSock {
+    TcpSock {
+        refs: 1,
+        listen: false,
+        bound: false,
+        nonblock,
+        addr: 0,
+        port: 0,
+        peer_addr: 0,
+        peer_port: 0,
+        peer: None,
+        parent: None,
+        backlog_max: 0,
+        backlog: Vec::new(),
+        rx: Vec::new(),
+        eof: false,
+    }
+}
+
+fn tcp_port_taken(tab: &[Option<TcpSock>; TCP_N], except: usize, port: u16) -> bool {
+    tab.iter().enumerate().any(|(i, s)| {
+        i != except
+            && s.as_ref()
+                .map(|s| s.bound && s.port == port && s.listen)
+                .unwrap_or(false)
+    })
+}
+
+fn tcp_alloc_port(tab: &[Option<TcpSock>; TCP_N]) -> u16 {
+    let mut next = NEXT_PORT.lock();
+    for _ in 0..1000 {
+        let port = *next;
+        *next = if port >= 65000 { 49152 } else { port + 1 };
+        if !tcp_port_taken(tab, TCP_N, port) {
+            return port;
+        }
+    }
+    0
+}
+
+pub fn tcp_open(nonblock: bool) -> Result<usize, i32> {
+    with_tcp(|tab| {
+        for (i, slot) in tab.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(tcp_fresh(nonblock));
+                return Ok(i);
+            }
+        }
+        Err(ENFILE)
+    })
+}
+
+pub fn tcp_addref(id: usize) {
+    with_tcp(|tab| {
+        if let Some(Some(s)) = tab.get_mut(id) {
+            s.refs = s.refs.saturating_add(1);
+        }
+    });
+}
+
+pub fn tcp_nonblock(id: usize) -> bool {
+    with_tcp(|tab| {
+        tab.get(id)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.nonblock)
+            .unwrap_or(false)
+    })
+}
+
+pub fn tcp_pending(id: usize) -> bool {
+    with_tcp(|tab| {
+        tab.get(id)
+            .and_then(|s| s.as_ref())
+            .map(|s| !s.rx.is_empty() || s.eof || (s.listen && !s.backlog.is_empty()))
+            .unwrap_or(false)
+    })
+}
+
+fn tcp_drop(tab: &mut [Option<TcpSock>; TCP_N], id: usize) {
+    let Some(Some(s)) = tab.get_mut(id) else {
+        return;
+    };
+    s.refs = s.refs.saturating_sub(1);
+    if s.refs > 0 {
+        return;
+    }
+    let sock = tab[id].take().unwrap();
+    if let Some(p) = sock.peer {
+        if let Some(Some(ps)) = tab.get_mut(p) {
+            if ps.peer == Some(id) {
+                ps.peer = None;
+            }
+            ps.eof = true;
+        }
+    }
+    if let Some(parent) = sock.parent {
+        if let Some(Some(ls)) = tab.get_mut(parent) {
+            ls.backlog.retain(|c| *c != id);
+        }
+    }
+    for child in sock.backlog {
+        if let Some(Some(c)) = tab.get_mut(child) {
+            c.refs = 1;
+            c.parent = None;
+        }
+        tcp_drop(tab, child);
+    }
+}
+
+pub fn tcp_close(id: usize) {
+    with_tcp(|tab| tcp_drop(tab, id));
+}
+
+pub fn tcp_bind(id: usize, addr: u32, port: u16) -> Result<(), i32> {
+    if !addr_ok(addr) {
+        return Err(EADDRNOTAVAIL);
+    }
+    with_tcp(|tab| {
+        if tab.get(id).and_then(|s| s.as_ref()).is_none() {
+            return Err(EFAULT);
+        }
+        if tab[id].as_ref().unwrap().listen || tab[id].as_ref().unwrap().peer.is_some() {
+            return Err(EINVAL);
+        }
+        let port = if port == 0 { tcp_alloc_port(tab) } else { port };
+        if port == 0 || tcp_port_taken(tab, id, port) {
+            return Err(EADDRINUSE);
+        }
+        let s = tab[id].as_mut().unwrap();
+        s.addr = addr;
+        s.port = port;
+        s.bound = true;
+        Ok(())
+    })
+}
+
+pub fn tcp_listen(id: usize, backlog: u64) -> Result<(), i32> {
+    with_tcp(|tab| {
+        let (bound, port, connected) = {
+            let Some(cur) = tab.get(id).and_then(|s| s.as_ref()) else {
+                return Err(EFAULT);
+            };
+            (cur.bound, cur.port, cur.peer.is_some())
+        };
+        if !bound || port == 0 {
+            return Err(EINVAL);
+        }
+        if connected {
+            return Err(EISCONN);
+        }
+        if tcp_port_taken(tab, id, port) {
+            return Err(EADDRINUSE);
+        }
+        let s = tab[id].as_mut().unwrap();
+        s.listen = true;
+        let n = if backlog == 0 { 1 } else { backlog as usize };
+        s.backlog_max = n.min(8);
+        Ok(())
+    })
+}
+
+pub fn tcp_accept(id: usize) -> Result<(usize, u32, u16), i32> {
+    with_tcp(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        if !s.listen {
+            return Err(EINVAL);
+        }
+        if s.backlog.is_empty() {
+            return Err(EAGAIN);
+        }
+        let child = s.backlog.remove(0);
+        let (addr, port) = match tab.get(child).and_then(|s| s.as_ref()) {
+            Some(c) => (c.peer_addr, c.peer_port),
+            None => return Err(EFAULT),
+        };
+        if let Some(c) = tab[child].as_mut() {
+            c.parent = None;
+        }
+        Ok((child, addr, port))
+    })
+}
+
+pub fn tcp_connect(id: usize, dst_ip: u32, dst_port: u16) -> Result<(), i32> {
+    if dst_port == 0 || dst_ip == 0 {
+        return Err(EINVAL);
+    }
+    if !is_loopback(dst_ip) {
+        return Err(ENETUNREACH);
+    }
+    with_tcp(|tab| {
+        let (listening, connected) = {
+            let Some(client) = tab.get(id).and_then(|s| s.as_ref()) else {
+                return Err(EFAULT);
+            };
+            (client.listen, client.peer.is_some())
+        };
+        if listening {
+            return Err(EINVAL);
+        }
+        if connected {
+            return Err(EISCONN);
+        }
+        let listener = tab.iter().position(|s| {
+            s.as_ref()
+                .map(|s| s.listen && s.port == dst_port && (s.addr == 0 || s.addr == dst_ip))
+                .unwrap_or(false)
+        });
+        let Some(lid) = listener else {
+            return Err(ECONNREFUSED);
+        };
+        if lid == id {
+            return Err(EINVAL);
+        }
+        let (queued, limit, local) = {
+            let ls = tab[lid].as_ref().unwrap();
+            let local = if ls.addr == 0 { dst_ip } else { ls.addr };
+            (ls.backlog.len(), ls.backlog_max, local)
+        };
+        if queued >= limit {
+            return Err(ECONNREFUSED);
+        }
+        let (already, existing) = {
+            let s = tab[id].as_ref().unwrap();
+            (s.bound, s.port)
+        };
+        let cport = if already {
+            existing
+        } else {
+            let port = tcp_alloc_port(tab);
+            if port == 0 {
+                return Err(EADDRINUSE);
+            }
+            port
+        };
+        let child = tab.iter().position(|s| s.is_none());
+        let Some(child) = child else {
+            return Err(ENFILE);
+        };
+        tab[child] = Some(TcpSock {
+            refs: 1,
+            listen: false,
+            bound: true,
+            // Принятый сокет блокирующий. Флага accept4 нет.
+            nonblock: false,
+            addr: local,
+            port: dst_port,
+            peer_addr: 0x7f00_0001,
+            peer_port: cport,
+            peer: Some(id),
+            parent: Some(lid),
+            backlog_max: 0,
+            backlog: Vec::new(),
+            rx: Vec::new(),
+            eof: false,
+        });
+        {
+            let s = tab[id].as_mut().unwrap();
+            s.bound = true;
+            s.addr = 0x7f00_0001;
+            s.port = cport;
+            s.peer_addr = dst_ip;
+            s.peer_port = dst_port;
+            s.peer = Some(child);
+            s.eof = false;
+        }
+        tab[lid].as_mut().unwrap().backlog.push(child);
+        Ok(())
+    })
+}
+
+pub fn tcp_name(id: usize) -> Option<(u32, u16)> {
+    with_tcp(|tab| {
+        tab.get(id)
+            .and_then(|s| s.as_ref())
+            .filter(|s| s.bound)
+            .map(|s| (s.addr, s.port))
+    })
+}
+
+pub fn tcp_peer(id: usize) -> Option<(u32, u16)> {
+    with_tcp(|tab| {
+        tab.get(id).and_then(|s| s.as_ref()).and_then(|s| {
+            if s.peer.is_some() || s.eof {
+                Some((s.peer_addr, s.peer_port))
+            } else {
+                None
+            }
+        })
+    })
+}
+
+pub fn tcp_send(id: usize, data: &[u8]) -> Result<usize, i32> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    with_tcp(|tab| {
+        let (listen, peer, eof) = {
+            let Some(s) = tab.get(id).and_then(|s| s.as_ref()) else {
+                return Err(EFAULT);
+            };
+            (s.listen, s.peer, s.eof)
+        };
+        if listen {
+            return Err(ENOTCONN);
+        }
+        let Some(p) = peer else {
+            return Err(if eof { EPIPE } else { ENOTCONN });
+        };
+        if eof {
+            return Err(EPIPE);
+        }
+        let Some(dest) = tab.get_mut(p).and_then(|s| s.as_mut()) else {
+            return Err(EPIPE);
+        };
+        let space = TCP_RX.saturating_sub(dest.rx.len());
+        if space == 0 {
+            return Err(EAGAIN);
+        }
+        let n = space.min(data.len());
+        dest.rx.extend_from_slice(&data[..n]);
+        Ok(n)
+    })
+}
+
+pub fn tcp_recv(id: usize, buf: &mut [u8]) -> Result<(usize, u32, u16), i32> {
+    with_tcp(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        if s.listen {
+            return Err(ENOTCONN);
+        }
+        if s.rx.is_empty() {
+            if s.eof {
+                return Ok((0, s.peer_addr, s.peer_port));
+            }
+            return Err(if s.peer.is_some() { EAGAIN } else { ENOTCONN });
+        }
+        let n = s.rx.len().min(buf.len());
+        buf[..n].copy_from_slice(&s.rx[..n]);
+        s.rx.drain(..n);
+        Ok((n, s.peer_addr, s.peer_port))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1275,41 @@ mod tests {
         assert_eq!(src, 0x7f00_0001);
         assert_eq!(port, 19000);
         udp_close(a);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn tcp_loopback_moves_bytes_and_refuses_the_wire() {
+        serial_print!("test tcp_loopback_moves_bytes_and_refuses_the_wire... ");
+        let listener = tcp_open(true).expect("listen open");
+        tcp_bind(listener, 0x7f00_0001, 19001).expect("bind");
+        tcp_listen(listener, 2).expect("listen");
+        let client = tcp_open(true).expect("client");
+        assert_eq!(
+            tcp_connect(client, 0x0a00_0202, 19001).expect_err("wire"),
+            ENETUNREACH
+        );
+        assert_eq!(
+            tcp_connect(client, 0x7f00_0001, 9).expect_err("closed"),
+            ECONNREFUSED
+        );
+        tcp_connect(client, 0x7f00_0001, 19001).expect("connect");
+        let (accepted, src, sport) = tcp_accept(listener).expect("accept");
+        assert_eq!(src, 0x7f00_0001);
+        assert_ne!(sport, 0);
+        let n = tcp_send(client, b"ping").expect("send");
+        assert_eq!(n, 4);
+        let mut buf = [0u8; 8];
+        let (rn, _, _) = tcp_recv(accepted, &mut buf).expect("recv");
+        assert_eq!(&buf[..rn], b"ping");
+        tcp_send(accepted, b"pong").expect("reply");
+        let (rn, _, _) = tcp_recv(client, &mut buf).expect("reply recv");
+        assert_eq!(&buf[..rn], b"pong");
+        tcp_close(client);
+        let (rn, _, _) = tcp_recv(accepted, &mut buf).expect("eof");
+        assert_eq!(rn, 0);
+        tcp_close(accepted);
+        tcp_close(listener);
         serial_println!("[ok]");
     }
 

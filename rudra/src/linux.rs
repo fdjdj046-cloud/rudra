@@ -98,6 +98,8 @@ pub enum Fd {
     Pipe { id: usize, writable: bool },
     /// UDP-сокет `AF_INET`. `id` — слот в `net`.
     Udp { id: usize },
+    /// TCP на петле `127.0.0.0/8`. Проводного TCP нет.
+    Tcp { id: usize },
     /// Набор epoll. `id` — слот в `EPOLLS`. Интерес хранит номер fd, не описание.
     Epoll { id: usize },
 }
@@ -117,6 +119,10 @@ impl Fd {
             Fd::Udp { id } => {
                 crate::net::udp_addref(*id);
                 Fd::Udp { id: *id }
+            }
+            Fd::Tcp { id } => {
+                crate::net::tcp_addref(*id);
+                Fd::Tcp { id: *id }
             }
             Fd::Epoll { id } => {
                 epoll_addref(*id);
@@ -479,9 +485,11 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         39 => task::current_tid(),
         41 => sys_socket(a1, a2, a3),
         42 => sys_connect(a1, a2, a3),
+        43 => sys_accept(a1, a2, a3),
         44 => sys_sendto(a1, a2, a3, a4, a5, a6),
         45 => sys_recvfrom(a1, a2, a3, a4, a5, a6),
         49 => sys_bind(a1, a2, a3),
+        50 => sys_listen(a1, a2),
         51 => sys_getsockname(a1, a2, a3),
         52 => sys_getpeername(a1, a2, a3),
         54 => sys_setsockopt(a1, a2, a3, a4, a5),
@@ -839,13 +847,30 @@ fn neg_err(e: i32) -> u64 {
 }
 
 fn udp_id(fd: u64) -> Result<usize, u64> {
-    with_fd(fd, |f| match f {
-        Fd::Udp { id } => Ok(*id),
+    match sock_kind(fd)? {
+        SockKind::Udp(id) => Ok(id),
+        SockKind::Tcp(_) => Err(ENOTSOCK),
+    }
+}
+
+enum SockKind {
+    Udp(usize),
+    Tcp(usize),
+}
+
+fn sock_kind(fd: u64) -> Result<SockKind, u64> {
+    match with_fd(fd, |f| match f {
+        Fd::Udp { id } => Ok(SockKind::Udp(*id)),
+        Fd::Tcp { id } => Ok(SockKind::Tcp(*id)),
         _ => Err(ENOTSOCK),
-    })?
+    }) {
+        Ok(inner) => inner,
+        Err(e) => Err(e),
+    }
 }
 
 const ENOTSOCK: u64 = (-(88i64)) as u64;
+const EOPNOTSUPP: u64 = (-(95i64)) as u64;
 
 fn read_sockaddr_in(ptr: u64, len: u64) -> Result<(u32, u16), u64> {
     if len < 16 {
@@ -889,66 +914,165 @@ fn sys_socket(domain: u64, typ: u64, proto: u64) -> u64 {
         // AF_INET. AF_INET6 и AF_NETLINK сюда же: их нет.
         return EAFNOSUPPORT;
     }
+    const SOCK_STREAM: u64 = 1;
     let flags = typ & (SOCK_NONBLOCK | SOCK_CLOEXEC);
     let kind = typ & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if kind != SOCK_DGRAM {
+    let nonblock = flags & SOCK_NONBLOCK != 0;
+    let (id, slot_fd) = if kind == SOCK_STREAM {
+        if proto != 0 && proto != 6 {
+            return EPROTONOSUPPORT;
+        }
+        match crate::net::tcp_open(nonblock) {
+            Ok(id) => (id, Fd::Tcp { id }),
+            Err(e) => return neg_err(e),
+        }
+    } else if kind == SOCK_DGRAM {
+        if proto != 0 && proto != 17 {
+            return EPROTONOSUPPORT;
+        }
+        match crate::net::udp_open(nonblock) {
+            Ok(id) => (id, Fd::Udp { id }),
+            Err(e) => return neg_err(e),
+        }
+    } else {
         return EPROTONOSUPPORT;
-    }
-    if proto != 0 && proto != 17 {
-        return EPROTONOSUPPORT;
-    }
-    let id = match crate::net::udp_open(flags & SOCK_NONBLOCK != 0) {
-        Ok(id) => id,
-        Err(e) => return neg_err(e),
     };
-    let mut slot = Some(Fd::Udp { id });
+    let id_close = id;
+    let is_tcp = matches!(slot_fd, Fd::Tcp { .. });
+    let mut slot = Some(slot_fd);
     match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
         Ok(fd) if fd == EMFILE => {
-            crate::net::udp_close(id);
+            if is_tcp {
+                crate::net::tcp_close(id_close);
+            } else {
+                crate::net::udp_close(id_close);
+            }
             EMFILE
         }
         Ok(fd) => fd,
         Err(e) => {
-            crate::net::udp_close(id);
+            if is_tcp {
+                crate::net::tcp_close(id_close);
+            } else {
+                crate::net::udp_close(id_close);
+            }
             e
         }
     }
 }
 
 fn sys_bind(fd: u64, addr: u64, len: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
         Err(e) => return e,
     };
     let (ip, port) = match read_sockaddr_in(addr, len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match crate::net::udp_bind(id, ip, port) {
+    let r = match kind {
+        SockKind::Udp(id) => crate::net::udp_bind(id, ip, port),
+        SockKind::Tcp(id) => crate::net::tcp_bind(id, ip, port),
+    };
+    match r {
         Ok(()) => 0,
         Err(e) => neg_err(e),
     }
 }
 
+fn sys_listen(fd: u64, backlog: u64) -> u64 {
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let SockKind::Tcp(id) = kind else {
+        return EOPNOTSUPP;
+    };
+    match crate::net::tcp_listen(id, backlog) {
+        Ok(()) => 0,
+        Err(e) => neg_err(e),
+    }
+}
+
+fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let SockKind::Tcp(id) = kind else {
+        return EOPNOTSUPP;
+    };
+    let nonblock = crate::net::tcp_nonblock(id);
+    loop {
+        match crate::net::tcp_accept(id) {
+            Ok((child, ip, port)) => {
+                let mut slot = Some(Fd::Tcp { id: child });
+                match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
+                    Ok(nfd) if nfd == EMFILE => {
+                        crate::net::tcp_close(child);
+                        return EMFILE;
+                    }
+                    Ok(nfd) => {
+                        if let Err(e) = write_sockaddr_in(addr, len, ip, port) {
+                            crate::net::tcp_close(child);
+                            let _ = with_current_fds(|fds| {
+                                if (nfd as usize) < fds.len() {
+                                    fds[nfd as usize] = None;
+                                }
+                            });
+                            return e;
+                        }
+                        return nfd;
+                    }
+                    Err(e) => {
+                        crate::net::tcp_close(child);
+                        return e;
+                    }
+                }
+            }
+            Err(crate::net::EAGAIN) if !nonblock => {
+                if crate::signal::pending_interrupts() {
+                    return EINTR;
+                }
+                x86_64::instructions::hlt();
+            }
+            Err(e) => return neg_err(e),
+        }
+    }
+}
+
 fn sys_connect(fd: u64, addr: u64, len: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
         Err(e) => return e,
     };
     let (ip, port) = match read_sockaddr_in(addr, len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match crate::net::udp_connect(id, ip, port) {
+    let r = match kind {
+        SockKind::Udp(id) => crate::net::udp_connect(id, ip, port),
+        SockKind::Tcp(id) => crate::net::tcp_connect(id, ip, port),
+    };
+    match r {
         Ok(()) => 0,
         Err(e) => neg_err(e),
     }
 }
 
 fn sys_sendto(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, destlen: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
         Err(e) => return e,
+    };
+    if let SockKind::Tcp(id) = kind {
+        if dest != 0 {
+            return EISCONN;
+        }
+        return tcp_write(id, buf, len);
+    }
+    let SockKind::Udp(id) = kind else {
+        return ENOTSOCK;
     };
     if len as usize > MAX_IO {
         return EFAULT;
@@ -979,9 +1103,15 @@ fn sys_sendto(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, destlen: u64)
 }
 
 fn sys_recvfrom(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, srclen: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
         Err(e) => return e,
+    };
+    if let SockKind::Tcp(id) = kind {
+        return tcp_read(id, buf, len, src, srclen);
+    }
+    let SockKind::Udp(id) = kind else {
+        return ENOTSOCK;
     };
     if buf == 0 || len == 0 {
         return 0;
@@ -1015,11 +1145,11 @@ fn sys_recvfrom(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, srclen: u64)
 }
 
 fn sys_getsockname(fd: u64, addr: u64, len: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let (ip, port) = match sock_kind(fd) {
+        Ok(SockKind::Udp(id)) => crate::net::udp_name(id).unwrap_or((0, 0)),
+        Ok(SockKind::Tcp(id)) => crate::net::tcp_name(id).unwrap_or((0, 0)),
         Err(e) => return e,
     };
-    let (ip, port) = crate::net::udp_name(id).unwrap_or((0, 0));
     match write_sockaddr_in(addr, len, ip, port) {
         Ok(()) => 0,
         Err(e) => e,
@@ -1027,11 +1157,12 @@ fn sys_getsockname(fd: u64, addr: u64, len: u64) -> u64 {
 }
 
 fn sys_getpeername(fd: u64, addr: u64, len: u64) -> u64 {
-    let id = match udp_id(fd) {
-        Ok(id) => id,
+    let peer = match sock_kind(fd) {
+        Ok(SockKind::Udp(id)) => crate::net::udp_peer(id),
+        Ok(SockKind::Tcp(id)) => crate::net::tcp_peer(id),
         Err(e) => return e,
     };
-    let Some((ip, port)) = crate::net::udp_peer(id) else {
+    let Some((ip, port)) = peer else {
         return ENOTCONN;
     };
     match write_sockaddr_in(addr, len, ip, port) {
@@ -1040,12 +1171,73 @@ fn sys_getpeername(fd: u64, addr: u64, len: u64) -> u64 {
     }
 }
 
+const EISCONN: u64 = (-(106i64)) as u64;
 const ENOTCONN: u64 = (-(107i64)) as u64;
+
+fn tcp_write(id: usize, buf: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let Some(bytes) = copy_from_user(buf, len as usize) else {
+        return EFAULT;
+    };
+    let nonblock = crate::net::tcp_nonblock(id);
+    let mut off = 0usize;
+    loop {
+        match crate::net::tcp_send(id, &bytes[off..]) {
+            Ok(0) => return off as u64,
+            Ok(n) => {
+                off += n;
+                if off == bytes.len() {
+                    return off as u64;
+                }
+            }
+            Err(crate::net::EAGAIN) if !nonblock => {
+                if crate::signal::pending_interrupts() {
+                    return if off > 0 { off as u64 } else { EINTR };
+                }
+                x86_64::instructions::hlt();
+            }
+            Err(e) => return if off > 0 { off as u64 } else { neg_err(e) },
+        }
+    }
+}
+
+fn tcp_read(id: usize, buf: u64, len: u64, src: u64, srclen: u64) -> u64 {
+    if buf == 0 || len == 0 {
+        return 0;
+    }
+    if len as usize > MAX_IO {
+        return EFAULT;
+    }
+    let mut tmp = alloc::vec![0u8; len as usize];
+    let nonblock = crate::net::tcp_nonblock(id);
+    loop {
+        match crate::net::tcp_recv(id, &mut tmp) {
+            Ok((n, addr, port)) => {
+                if n > 0 && !u_write(buf, &tmp[..n]) {
+                    return EFAULT;
+                }
+                if let Err(e) = write_sockaddr_in(src, srclen, addr, port) {
+                    return e;
+                }
+                return n as u64;
+            }
+            Err(crate::net::EAGAIN) if !nonblock => {
+                if crate::signal::pending_interrupts() {
+                    return EINTR;
+                }
+                x86_64::instructions::hlt();
+            }
+            Err(e) => return neg_err(e),
+        }
+    }
+}
 
 /// `SO_REUSEADDR` и `SO_BROADCAST` принимаем и нигде не храним: UDP и так
 /// может занять свободный порт и слать широковещательные кадры.
 fn sys_setsockopt(fd: u64, level: u64, opt: u64, _val: u64, _len: u64) -> u64 {
-    if udp_id(fd).is_err() {
+    if sock_kind(fd).is_err() {
         return ENOTSOCK;
     }
     if level == 1 && (opt == 2 || opt == 6) {
@@ -1055,12 +1247,17 @@ fn sys_setsockopt(fd: u64, level: u64, opt: u64, _val: u64, _len: u64) -> u64 {
 }
 
 fn sys_getsockopt(fd: u64, level: u64, opt: u64, val: u64, len_ptr: u64) -> u64 {
-    if udp_id(fd).is_err() {
-        return ENOTSOCK;
-    }
-    // SOL_SOCKET / SO_TYPE → SOCK_DGRAM.
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
+        Err(_) => return ENOTSOCK,
+    };
+    // SOL_SOCKET / SO_TYPE. TCP — 1, UDP — 2.
     if level == 1 && opt == 3 {
-        if !u_write(val, &2i32.to_le_bytes()) {
+        let typ: i32 = match kind {
+            SockKind::Tcp(_) => 1,
+            SockKind::Udp(_) => 2,
+        };
+        if !u_write(val, &typ.to_le_bytes()) {
             return EFAULT;
         }
         if len_ptr != 0 && !u_write(len_ptr, &4u32.to_le_bytes()) {
@@ -1086,12 +1283,14 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         Console,
         Pipe(usize),
         Udp,
+        Tcp(usize),
         File(String, u64, Option<Vec<u8>>),
         Bad(u64),
     }
     let kind = with_current_fds(|fds| match fds.get_mut(fd as usize).and_then(|x| x.as_mut()) {
         Some(Fd::Console { writable: false }) => Kind::Console,
         Some(Fd::Udp { .. }) => Kind::Udp,
+        Some(Fd::Tcp { id }) => Kind::Tcp(*id),
         Some(Fd::Pipe { id, writable: false }) => Kind::Pipe(*id),
         Some(Fd::File { name, offset, accmode, dirty, .. }) if *accmode != 1 => {
             Kind::File(name.clone(), *offset, dirty.clone())
@@ -1106,6 +1305,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     match kind {
         Err(e) => e,
         Ok(Kind::Udp) => sys_recvfrom(fd, buf, len, 0, 0, 0),
+        Ok(Kind::Tcp(id)) => tcp_read(id, buf, len, 0, 0),
         Ok(Kind::Console) => console_read(buf, len),
         Ok(Kind::Pipe(id)) => {
             let mut tmp = alloc::vec![0u8; len as usize];
@@ -1180,6 +1380,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         Console,
         Pipe(usize),
         Udp(usize),
+        Tcp(usize),
         File,
         Bad,
     }
@@ -1187,6 +1388,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         Some(Fd::Console { writable: true }) => Kind::Console,
         Some(Fd::Pipe { id, writable: true }) => Kind::Pipe(*id),
         Some(Fd::Udp { id }) => Kind::Udp(*id),
+        Some(Fd::Tcp { id }) => Kind::Tcp(*id),
         Some(Fd::File { accmode, .. }) if *accmode != 0 => Kind::File,
         _ => Kind::Bad,
     });
@@ -1197,6 +1399,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
             Ok(n) => n as u64,
             Err(e) => neg_err(e),
         },
+        Ok(Kind::Tcp(id)) => tcp_write(id, buf, len),
         Ok(Kind::File) => {
             // Запись в буфер dirty (сброс при close) — под локом fd.
             with_fd(fd, |f| match f {
@@ -1253,6 +1456,10 @@ fn sys_close(fd: u64) -> u64 {
         }
         Fd::Udp { id } => {
             crate::net::udp_close(*id);
+            None
+        }
+        Fd::Tcp { id } => {
+            crate::net::tcp_close(*id);
             None
         }
         Fd::Epoll { id } => Some(*id),
@@ -1364,7 +1571,7 @@ fn sys_fstat(fd: u64, buf: u64) -> u64 {
             Some((size, S_IFREG | 0o644, 1))
         }        Fd::Dir { .. } => Some((0, S_IFDIR | 0o755, 2)),
         Fd::Pipe { .. } => Some((0, S_IFCHR | 0o644, 1)),
-        Fd::Udp { .. } => Some((0, 0o140000 | 0o666, 1)),
+        Fd::Udp { .. } | Fd::Tcp { .. } => Some((0, 0o140000 | 0o666, 1)),
         Fd::Epoll { .. } => Some((0, S_IFREG | 0o600, 1)),
     });
     match st {
@@ -1628,6 +1835,7 @@ fn sys_dup2(old: u64, new: u64) -> u64 {
                     match &prev {
                         Fd::Pipe { id, writable } => pipe_close_end(*id, *writable),
                         Fd::Udp { id } => crate::net::udp_close(*id),
+                        Fd::Tcp { id } => crate::net::tcp_close(*id),
                         _ => {}
                     }
                     let ep = match prev {
@@ -1682,6 +1890,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 Fd::Console { writable } => *writable as u64,
                 Fd::Pipe { writable, .. } => *writable as u64,
                 Fd::Udp { id } => 2 | if crate::net::udp_nonblock(*id) { 0x800 } else { 0 },
+                Fd::Tcp { id } => 1 | if crate::net::tcp_nonblock(*id) { 0x800 } else { 0 },
                 Fd::Epoll { .. } => 2,
             })
             .unwrap_or(EBADF)
@@ -1824,6 +2033,14 @@ fn poll_ready(fd: u64, events: i16) -> i16 {
             }
             Fd::Udp { id } => {
                 if events & POLLIN != 0 && crate::net::udp_pending(*id) {
+                    revents |= POLLIN;
+                }
+                if events & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            Fd::Tcp { id } => {
+                if events & POLLIN != 0 && crate::net::tcp_pending(*id) {
                     revents |= POLLIN;
                 }
                 if events & POLLOUT != 0 {
