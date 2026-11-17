@@ -13,6 +13,8 @@
 //! Сигналы 1–31 доставляются на возврате из syscall и с тика в ring 3, если
 //! задан `SA_RESTORER`. Блокирующий сон, futex, pipe, poll и recvfrom
 //! возвращают `EINTR`. Чтение консоли — нет.
+//! Задача стартует как root (uid/gid 0). `setuid`/`setgid` меняют id.
+//! `seccomp` strict режет всё, кроме read, write, rt_sigreturn и exit.
 //! epoll — level-triggered по номеру fd: `EPOLLET` принимается и ведёт себя
 //! как level, `epoll_pwait` маску не ставит, poll самого epoll-fd пуст.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
@@ -367,8 +369,9 @@ fn write_stat(buf: u64, size: u64, mode: u32, nlink: u64) -> bool {
     st[8..16].copy_from_slice(&fake_ino("stat").to_le_bytes());
     st[16..24].copy_from_slice(&nlink.to_le_bytes());
     st[24..28].copy_from_slice(&mode.to_le_bytes());
-    st[28..32].copy_from_slice(&1000u32.to_le_bytes());
-    st[32..36].copy_from_slice(&1000u32.to_le_bytes());
+    // У файла нет владельца. 0 — root, не uid вызывающего и не старая константа 1000.
+    st[28..32].copy_from_slice(&0u32.to_le_bytes());
+    st[32..36].copy_from_slice(&0u32.to_le_bytes());
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&((size + 511) / 512).to_le_bytes());
@@ -403,6 +406,10 @@ static SEEN_UNKNOWN: Mutex<[u64; 16]> = Mutex::new([u64::MAX; 16]);
 pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) -> u64 {
     let a5 = unsafe { *frame.add(FRAME::R8) };
     let a6 = unsafe { *frame.add(FRAME::R9) };
+    if task::seccomp_kills(nr) {
+        // Не ENOSYS: процесс умирает, запрещённый вызов не выполняется.
+        task::sys_exit(128 + 9);
+    }
     match nr {
         0 => sys_read(a1, a2, a3),
         1 => sys_write(a1, a2, a3),
@@ -480,9 +487,14 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         52 => sys_getpeername(a1, a2, a3),
         54 => sys_setsockopt(a1, a2, a3, a4, a5),
         55 => sys_getsockopt(a1, a2, a3, a4, a5),
-        102 | 104 | 107 | 108 => 1000, // getuid/getgid/geteuid/getegid
-        105 | 106 => 0,                 // setuid/setgid: один пользователь
-        157 => 0,                     // prctl: PR_SET_NAME и прочее — no-op
+        102 => task::cred_ruid(),
+        104 => task::cred_rgid(),
+        107 => task::cred_euid(),
+        108 => task::cred_egid(),
+        105 => task::cred_setuid(a1 as u32),
+        106 => task::cred_setgid(a1 as u32),
+        157 => task::sys_prctl(a1, a2),
+        317 => task::sys_seccomp(a1, a2),
         56 => task::sys_clone(a1, a2, a3, a4, a5, frame),
         57 | 58 => {
             // fork / vfork: clone без флагов
@@ -683,15 +695,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             0
         }
         100 => crate::interrupts::TICKS.load(Ordering::Relaxed) as u64, // times
-        110 => {
-            // getppid
-            let parent = task::with_current_task(|t| t.parent).unwrap_or(-1);
-            if parent < 0 {
-                1
-            } else {
-                task::with_task_at(parent as usize, |t| t.tid).unwrap_or(1)
-            }
-        }
+        110 => task::current_ppid(),
         158 => task::sys_arch_prctl(a1, a2),
         186 => task::current_tid(), // gettid
         202 => sys_futex(a1, a2, a3),
@@ -1455,8 +1459,8 @@ fn sys_statx(dirfd: u64, path_ptr: u64, _flags: u64, _mask: u64, buf: u64) -> u6
             raw[0..4].copy_from_slice(&0x7ffu32.to_le_bytes());
             raw[4..8].copy_from_slice(&4096u32.to_le_bytes());
             raw[16..20].copy_from_slice(&(nlink as u32).to_le_bytes());
-            raw[20..24].copy_from_slice(&1000u32.to_le_bytes());
-            raw[24..28].copy_from_slice(&1000u32.to_le_bytes());
+            raw[20..24].copy_from_slice(&0u32.to_le_bytes());
+            raw[24..28].copy_from_slice(&0u32.to_le_bytes());
             raw[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
             raw[32..40].copy_from_slice(&fake_ino("statx").to_le_bytes());
             raw[40..48].copy_from_slice(&sz.to_le_bytes());

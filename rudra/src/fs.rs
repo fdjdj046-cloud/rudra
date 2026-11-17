@@ -483,7 +483,8 @@ fn ext2_on() -> bool {
 /// Синтетические `/proc` и `/sys`. На диск не пишутся: ни на ext2, ни на ramdisk.
 fn synth_children(name: &str) -> Option<&'static [&'static str]> {
     match name {
-        "/proc" => Some(&["cpuinfo", "meminfo", "stat", "uptime"]),
+        "/proc" => Some(&["cpuinfo", "meminfo", "stat", "uptime", "self"]),
+        "/proc/self" => Some(&["status"]),
         "/sys" => Some(&["devices", "kernel"]),
         "/sys/devices" => Some(&["system"]),
         "/sys/devices/system" => Some(&["cpu"]),
@@ -523,6 +524,7 @@ fn synth_body(name: &str) -> Option<String> {
                 ticks, created, running
             ))
         }
+        "/proc/self/status" => Some(crate::task::proc_self_status()),
         // Задачи крутит только BSP, даже если AP уже подняты.
         "/sys/devices/system/cpu/online" => Some("0\n".into()),
         "/sys/kernel/hostname" => Some("rudra\n".into()),
@@ -870,6 +872,16 @@ mod tests {
         assert!(names.iter().any(|n| n == "cpuinfo"));
         assert!(names.iter().any(|n| n == "meminfo"));
         assert!(names.iter().any(|n| n == "stat"));
+        assert!(names.iter().any(|n| n == "self"));
+        assert!(is_dir("/proc/self"));
+        assert!(exists("/proc/self/status"));
+        assert!(!is_dir("/proc/self/status"));
+        let mut status = [0u8; 256];
+        let n = read_at("/proc/self/status", 0, &mut status);
+        let text = core::str::from_utf8(&status[..n as usize]).unwrap();
+        assert!(text.contains("Name:\tkernel\n"), "{}", text);
+        assert!(text.contains("Seccomp:\t0\n"), "{}", text);
+        assert_eq!(unlink("/proc/self/status"), Err(FsError::Perm));
         assert!(list_dir("/").iter().any(|n| n == "proc"));
         let mut buf = [0u8; 64];
         let n = read_at("/proc/uptime", 0, &mut buf);

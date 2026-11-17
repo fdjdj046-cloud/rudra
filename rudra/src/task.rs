@@ -17,6 +17,7 @@
 //!   0x70000000      стеки потоков (по 1 МиБ на поток)
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -613,6 +614,65 @@ fn write_user(l4: PhysFrame, addr: u64, data: &[u8]) -> Result<(), MapToError<Si
 
 // ---- Задачи ----
 
+/// Учётные данные. Отдельного fsuid нет: в `/proc/self/status` он равен euid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cred {
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+}
+
+impl Cred {
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            euid: 0,
+            suid: 0,
+            gid: 0,
+            egid: 0,
+            sgid: 0,
+        }
+    }
+
+    /// Как Linux `setuid`: root пишет ruid, euid и suid. Иначе меняется только
+    /// euid, и только если новый id уже есть среди ruid, euid, suid.
+    pub fn set_uid(&mut self, uid: u32) -> bool {
+        if self.euid == 0 {
+            self.uid = uid;
+            self.euid = uid;
+            self.suid = uid;
+            return true;
+        }
+        if uid == self.uid || uid == self.euid || uid == self.suid {
+            self.euid = uid;
+            return true;
+        }
+        false
+    }
+
+    pub fn set_gid(&mut self, gid: u32) -> bool {
+        if self.egid == 0 {
+            self.gid = gid;
+            self.egid = gid;
+            self.sgid = gid;
+            return true;
+        }
+        if gid == self.gid || gid == self.egid || gid == self.sgid {
+            self.egid = gid;
+            return true;
+        }
+        false
+    }
+}
+
+/// Strict пускает только read, write, rt_sigreturn и exit. `exit_group` (231) нет.
+pub fn strict_permits(nr: u64) -> bool {
+    matches!(nr, 0 | 1 | 15 | 60)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Runnable,
@@ -651,6 +711,9 @@ pub struct Task {
     pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
     pub cwd: String,
     pub umask: u32,
+    pub cred: Cred,
+    /// 0 — выключен, 1 — `SECCOMP_MODE_STRICT`. Фильтра BPF нет.
+    pub seccomp: u8,
     /// Сохранённые xmm/x87. Пустой образ = чистый FPU при первом входе.
     fx: crate::fpu::FxState,
 }
@@ -685,11 +748,13 @@ static INTR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/intr.elf"));
 static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
 static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"));
 static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
+static CRED_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cred.elf"));
+static SECCOMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом шелл.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 11] = [
+    const BINS: [(&str, &[u8]); 13] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -701,6 +766,8 @@ pub fn init() {
         ("/bin/epoll.elf", EPOLL_ELF),
         ("/bin/interp.elf", INTERP_ELF),
         ("/bin/dyn.elf", DYN_ELF),
+        ("/bin/cred.elf", CRED_ELF),
+        ("/bin/seccomp.elf", SECCOMP_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -812,7 +879,15 @@ fn build_task(
         USER_FLAGS,
     )?;
 
-    let img = load_elf_image(l4, elf_bytes, argv, envp, USER_STACK_TOP, frame_allocator)?;
+    let img = load_elf_image(
+        l4,
+        elf_bytes,
+        argv,
+        envp,
+        USER_STACK_TOP,
+        frame_allocator,
+        Cred::root(),
+    )?;
     finish_task(aspace, img, name)
 }
 
@@ -902,6 +977,7 @@ pub fn load_elf_image(
     envp: &[String],
     stack_top: u64,
     frame_allocator: &mut BootInfoFrameAllocator,
+    cred: Cred,
 ) -> Result<LoadedImage, MapToError<Size4KiB>> {
     let main = match parse_elf64(elf_bytes) {
         Some(p) => p,
@@ -1031,10 +1107,10 @@ pub fn load_elf_image(
         AT_BASE, at_base,
         AT_FLAGS, 0,
         AT_ENTRY, at_entry,
-        AT_UID, 1000,
-        AT_EUID, 1000,
-        AT_GID, 1000,
-        AT_EGID, 1000,
+        AT_UID, cred.uid as u64,
+        AT_EUID, cred.euid as u64,
+        AT_GID, cred.gid as u64,
+        AT_EGID, cred.egid as u64,
         AT_HWCAP, 0x078B_FBFF,
         AT_HWCAP2, 0,
         AT_CLKTCK, 100,
@@ -1158,6 +1234,8 @@ fn finish_task(
         fds: default_fds(),
         cwd: String::from("/"),
         umask: 0o022,
+        cred: Cred::root(),
+        seccomp: 0,
         fx: crate::fpu::FxState::new(),
     })
 }
@@ -1175,6 +1253,135 @@ pub fn current_tid() -> u64 {
         return 0;
     }
     with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.tid).unwrap_or(0))
+}
+
+/// tid родителя. У init и без задачи — 0. Отдельного пространства gettid нет:
+/// `gettid` возвращает тот же номер, что `getpid`.
+pub fn current_ppid() -> u64 {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if cur < 0 {
+        return 0;
+    }
+    with_tasks(|tasks| {
+        let Some(t) = tasks[cur as usize].as_ref() else {
+            return 0;
+        };
+        if t.parent < 0 {
+            return 0;
+        }
+        tasks[t.parent as usize]
+            .as_ref()
+            .map(|p| p.tid)
+            .unwrap_or(0)
+    })
+}
+
+fn cred_field(f: impl FnOnce(&Cred) -> u32) -> u64 {
+    with_current_task(|t| f(&t.cred) as u64).unwrap_or(0)
+}
+
+pub fn cred_ruid() -> u64 {
+    cred_field(|c| c.uid)
+}
+pub fn cred_euid() -> u64 {
+    cred_field(|c| c.euid)
+}
+pub fn cred_rgid() -> u64 {
+    cred_field(|c| c.gid)
+}
+pub fn cred_egid() -> u64 {
+    cred_field(|c| c.egid)
+}
+
+pub fn cred_setuid(uid: u32) -> u64 {
+    match with_current_task(|t| t.cred.set_uid(uid)) {
+        Some(true) => 0,
+        _ => crate::linux::EPERM,
+    }
+}
+
+pub fn cred_setgid(gid: u32) -> u64 {
+    match with_current_task(|t| t.cred.set_gid(gid)) {
+        Some(true) => 0,
+        _ => crate::linux::EPERM,
+    }
+}
+
+/// Уже strict и номер не из четвёрки read/write/rt_sigreturn/exit.
+pub fn seccomp_kills(nr: u64) -> bool {
+    let mode = with_current_task(|t| t.seccomp).unwrap_or(0);
+    mode == 1 && !strict_permits(nr)
+}
+
+pub fn sys_prctl(opt: u64, arg2: u64) -> u64 {
+    const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_SECCOMP: u64 = 22;
+    match opt {
+        PR_GET_SECCOMP => with_current_task(|t| t.seccomp as u64).unwrap_or(0),
+        PR_SET_SECCOMP => set_seccomp_mode(arg2),
+        _ => 0,
+    }
+}
+
+/// `seccomp(2)`. op 0 — strict. op 1 (фильтр) — `ENOSYS`, BPF нет.
+pub fn sys_seccomp(op: u64, flags: u64) -> u64 {
+    if op == 1 {
+        return crate::linux::ENOSYS;
+    }
+    if op != 0 || flags != 0 {
+        return crate::linux::EINVAL;
+    }
+    set_seccomp_mode(1)
+}
+
+fn set_seccomp_mode(mode: u64) -> u64 {
+    if mode != 1 {
+        return crate::linux::EINVAL;
+    }
+    match with_current_task(|t| {
+        if t.seccomp != 0 {
+            return false;
+        }
+        t.seccomp = 1;
+        true
+    }) {
+        Some(true) => 0,
+        _ => crate::linux::EINVAL,
+    }
+}
+
+pub fn proc_self_status() -> String {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if cur < 0 {
+        return format_status("kernel", 0, 0, &Cred::root(), 0);
+    }
+    with_tasks(|tasks| {
+        let Some(t) = tasks[cur as usize].as_ref() else {
+            return format_status("kernel", 0, 0, &Cred::root(), 0);
+        };
+        let ppid = if t.parent >= 0 {
+            tasks[t.parent as usize]
+                .as_ref()
+                .map(|p| p.tid)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let name = cstr_name(&t.name);
+        format_status(name, t.tid, ppid, &t.cred, t.seccomp)
+    })
+}
+
+fn cstr_name(name: &[u8]) -> &str {
+    let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    core::str::from_utf8(&name[..n]).unwrap_or("?")
+}
+
+fn format_status(name: &str, pid: u64, ppid: u64, c: &Cred, seccomp: u8) -> String {
+    format!(
+        "Name:\t{name}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nSeccomp:\t{seccomp}\n",
+        c.uid, c.euid, c.suid, c.euid, c.gid, c.egid, c.sgid, c.egid,
+    )
 }
 
 /// Сколько tid выдано и сколько задач сейчас `Runnable`.
@@ -1203,11 +1410,6 @@ pub fn with_current_task<R>(f: impl FnOnce(&mut Task) -> R) -> Option<R> {
 /// Доступ к любой задаче по tid.
 pub fn with_task<R>(tid: u64, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
     with_tasks(|tasks| tasks.iter_mut().flatten().find(|t| t.tid == tid).map(f))
-}
-
-/// Доступ к задаче по слоту (для getppid и отладки).
-pub fn with_task_at<R>(slot: usize, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
-    with_tasks(|tasks| tasks.get_mut(slot).and_then(|t| t.as_mut()).map(f))
 }
 
 /// Найти завершившегося потомка tid'а (parent == tid). Возвращает
@@ -1293,6 +1495,8 @@ pub fn sys_clone(
             parent_name,
             parent_signals,
             parent_tid,
+            parent_cred,
+            parent_seccomp,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
             (
@@ -1305,6 +1509,8 @@ pub fn sys_clone(
                 p.name,
                 p.signals.for_child(),
                 p.tid,
+                p.cred,
+                p.seccomp,
             )
         });
 
@@ -1406,8 +1612,14 @@ pub fn sys_clone(
             signals: parent_signals,
             name: parent_name,
             fds,
-            cwd: if flags & CLONE_FS != 0 { parent_cwd } else { parent_cwd },
+            cwd: if flags & CLONE_FS != 0 {
+                parent_cwd
+            } else {
+                parent_cwd
+            },
             umask: parent_umask,
+            cred: parent_cred,
+            seccomp: parent_seccomp,
             fx: crate::fpu::FxState::new(),
         };
         // Ребёнок должен увидеть те же xmm, что и родитель в точке clone.
@@ -1473,6 +1685,8 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
             return ENOENT;
         }
     };
+    // execve не сбрасывает uid и seccomp. Снимок до разбора ELF: TASKS там не держим.
+    let cred = with_current_task(|t| t.cred).unwrap_or(Cred::root());
 
     // 3) Новое АП + загрузка.
     let built = crate::memory::with_frame_allocator(|fa| {
@@ -1493,7 +1707,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         } else {
             argv
         };
-        let img = load_elf_image(l4, &elf, &argv_full, &envp, USER_STACK_TOP, fa)?;
+        let img = load_elf_image(l4, &elf, &argv_full, &envp, USER_STACK_TOP, fa, cred)?;
         Ok((aspace, img))
     });
     let (aspace, img) = match built {
@@ -2160,6 +2374,41 @@ mod tests {
         assert!(interp.interp.is_none());
         assert_eq!(interp.entry, 0x800078);
         assert_eq!(load_bias(&interp, true), 0);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn cred_drops_and_strict_is_four_syscalls() {
+        serial_print!("test cred_drops_and_strict_is_four_syscalls... ");
+        let mut c = Cred::root();
+        assert!(c.set_uid(1000));
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 1000, 1000));
+        assert!(!c.set_uid(0));
+        assert_eq!(c.euid, 1000);
+        c.suid = 7;
+        assert!(c.set_uid(7));
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 7, 7));
+        assert!(c.set_gid(50));
+        assert_eq!((c.gid, c.egid, c.sgid), (50, 50, 50));
+        assert!(!c.set_gid(0));
+        assert!(strict_permits(0) && strict_permits(1));
+        assert!(strict_permits(15) && strict_permits(60));
+        assert!(!strict_permits(39));
+        assert!(!strict_permits(157));
+        assert!(!strict_permits(231));
+        assert!(!strict_permits(317));
+        assert_eq!(sys_seccomp(1, 0), crate::linux::ENOSYS);
+        assert_eq!(sys_seccomp(0, 1), crate::linux::EINVAL);
+        assert_eq!(set_seccomp_mode(2), crate::linux::EINVAL);
+        assert_eq!(set_seccomp_mode(1), crate::linux::EINVAL);
+        assert!(!seccomp_kills(39));
+        assert_eq!(current_ppid(), 0);
+        let st = proc_self_status();
+        assert!(st.contains("Name:\tkernel\n"));
+        assert!(st.contains("Pid:\t0\n"));
+        assert!(st.contains("Uid:\t0\t0\t0\t0\n"));
+        assert!(st.contains("Gid:\t0\t0\t0\t0\n"));
+        assert!(st.contains("Seccomp:\t0\n"));
         serial_println!("[ok]");
     }
 

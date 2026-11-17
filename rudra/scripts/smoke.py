@@ -169,6 +169,7 @@ def main():
         commands = [
             "cat /motd.txt",
             "uname",
+            "cat /proc/self/status",
             "echo persist-ok > /keep.txt",
             "mkdir /demo",
             "echo hi > /demo/a.txt",
@@ -179,6 +180,8 @@ def main():
             "run /bin/signal.elf",
             "run /bin/tick.elf",
             "run /bin/intr.elf",
+            "run /bin/cred.elf",
+            "run /bin/seccomp.elf",
             "run /bin/epoll.elf",
             "run /bin/dyn.elf",
             "ls /",
@@ -240,6 +243,12 @@ def main():
             raise SystemExit("tick.elf did not report tick-ok\n" + text[-1500:])
         if "intr-ok" not in text or "intr-bad" in text:
             raise SystemExit("intr.elf did not report intr-ok\n" + text[-1500:])
+        if "Uid:\t0\t0\t0\t0" not in text or "Seccomp:\t0" not in text:
+            raise SystemExit("proc self status missing\n" + text[-1500:])
+        if "cred-ok" not in text or "cred-bad" in text:
+            raise SystemExit("cred.elf did not report cred-ok\n" + text[-1500:])
+        if "seccomp-ok" not in text or "seccomp-bad" in text or "[exit 137]" not in text:
+            raise SystemExit("seccomp.elf did not die on a forbidden syscall\n" + text[-1500:])
         if "epoll-ok" not in text:
             raise SystemExit("epoll.elf did not report epoll-ok\n" + text[-1500:])
         if "interp-ok" not in text or "interp-bad" in text:
