@@ -481,17 +481,71 @@ fn ext2_on() -> bool {
 }
 
 /// Синтетические `/proc` и `/sys`. На диск не пишутся: ни на ext2, ни на ramdisk.
-fn synth_children(name: &str) -> Option<&'static [&'static str]> {
-    match name {
+fn synth_children(name: &str) -> Option<Vec<String>> {
+    let fixed: Option<&[&str]> = match name {
         "/proc" => Some(&["cpuinfo", "meminfo", "stat", "uptime", "self"]),
-        "/proc/self" => Some(&["status"]),
+        "/proc/self" => Some(&["status", "cmdline"]),
         "/sys" => Some(&["devices", "kernel"]),
         "/sys/devices" => Some(&["system"]),
         "/sys/devices/system" => Some(&["cpu"]),
         "/sys/devices/system/cpu" => Some(&["online"]),
         "/sys/kernel" => Some(&["hostname"]),
         _ => None,
+    };
+    if let Some(kids) = fixed {
+        let mut names: Vec<String> = kids.iter().copied().map(String::from).collect();
+        if name == "/proc" {
+            for tid in crate::task::proc_tids() {
+                names.push(tid_name(tid));
+            }
+        }
+        return Some(names);
     }
+    if let Some(tid) = proc_dir_tid(name) {
+        if crate::task::proc_alive(tid) {
+            return Some(vec![String::from("status"), String::from("cmdline")]);
+        }
+    }
+    None
+}
+
+/// `/proc/<цифры>` — каталог задачи. `self` и файлы вроде `uptime` сюда не входят.
+fn proc_dir_tid(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("/proc/")?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    parse_u64(rest)
+}
+
+fn parse_u64(text: &str) -> Option<u64> {
+    let mut n: u64 = 0;
+    if text.is_empty() {
+        return None;
+    }
+    for b in text.bytes() {
+        let d = b.checked_sub(b'0')?;
+        if d > 9 {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(d as u64)?;
+    }
+    Some(n)
+}
+
+fn tid_name(tid: u64) -> String {
+    let mut buf = [0u8; 20];
+    let mut n = tid;
+    let mut i = buf.len();
+    if n == 0 {
+        return String::from("0");
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    String::from(core::str::from_utf8(&buf[i..]).unwrap_or("0"))
 }
 
 fn synth_body(name: &str) -> Option<String> {
@@ -525,9 +579,21 @@ fn synth_body(name: &str) -> Option<String> {
             ))
         }
         "/proc/self/status" => Some(crate::task::proc_self_status()),
+        "/proc/self/cmdline" => Some(crate::task::proc_self_cmdline()),
         // Задачи крутит только BSP, даже если AP уже подняты.
         "/sys/devices/system/cpu/online" => Some("0\n".into()),
         "/sys/kernel/hostname" => Some("rudra\n".into()),
+        _ => proc_pid_file(name),
+    }
+}
+
+fn proc_pid_file(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("/proc/")?;
+    let (tid_text, leaf) = rest.split_once('/')?;
+    let tid = parse_u64(tid_text)?;
+    match leaf {
+        "status" => crate::task::proc_status(tid),
+        "cmdline" => crate::task::proc_cmdline(tid),
         _ => None,
     }
 }
@@ -726,7 +792,7 @@ pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
 
 pub fn list_dir(name: &str) -> Vec<String> {
     if let Some(kids) = synth_children(name) {
-        return kids.iter().map(|s| (*s).into()).collect();
+        return kids;
     }
     let mut names = if ext2_on() {
         crate::ext2::list_dir(name)
@@ -1032,10 +1098,20 @@ mod tests {
         assert!(exists("/proc/self/status"));
         assert!(!is_dir("/proc/self/status"));
         let mut status = [0u8; 256];
-        let n = read_at("/proc/self/status", 0, &mut status);
-        let text = core::str::from_utf8(&status[..n as usize]).unwrap();
-        assert!(text.contains("Name:\tkernel\n"), "{}", text);
-        assert!(text.contains("Seccomp:\t0\n"), "{}", text);
+        {
+            let n = read_at("/proc/self/status", 0, &mut status);
+            let text = core::str::from_utf8(&status[..n as usize]).unwrap();
+            assert!(text.contains("Name:\tkernel\n"), "{}", text);
+            assert!(text.contains("State:\tS\n"), "{}", text);
+            assert!(text.contains("Seccomp:\t0\n"), "{}", text);
+        }
+        assert!(!exists("/proc/1"));
+        assert!(!is_dir("/proc/1"));
+        assert!(read_at("/proc/1/status", 0, &mut status) < 0);
+        assert!(list_dir("/proc").iter().all(|n| !n.bytes().all(|b| b.is_ascii_digit())));
+        let n = read_at("/proc/self/cmdline", 0, &mut status);
+        assert!(n >= 6);
+        assert_eq!(&status[..6], b"kernel");
         assert_eq!(unlink("/proc/self/status"), Err(FsError::Perm));
         assert!(list_dir("/").iter().any(|n| n == "proc"));
         let mut buf = [0u8; 64];

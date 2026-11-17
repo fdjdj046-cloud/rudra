@@ -770,11 +770,12 @@ static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
 static FS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fs.elf"));
 static TCP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tcp.elf"));
 static SEEK_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seek.elf"));
+static PROC_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/proc.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 17] = [
+    const BINS: [(&str, &[u8]); 18] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -792,6 +793,7 @@ pub fn init() {
         ("/bin/fs.elf", FS_ELF),
         ("/bin/tcp.elf", TCP_ELF),
         ("/bin/seek.elf", SEEK_ELF),
+        ("/bin/proc.elf", PROC_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -1404,23 +1406,80 @@ fn set_seccomp_mode(mode: u64) -> u64 {
 pub fn proc_self_status() -> String {
     let cur = CURRENT.load(Ordering::Relaxed);
     if cur < 0 {
-        return format_status("kernel", 0, 0, &Cred::root(), 0);
+        return format_status("kernel", 0, 0, &Cred::root(), 0, "S");
+    }
+    with_tasks(|tasks| match tasks[cur as usize].as_ref() {
+        Some(_) => status_at(tasks, cur as usize),
+        None => format_status("kernel", 0, 0, &Cred::root(), 0, "S"),
+    })
+}
+
+/// Живые и ещё не собранные задачи. Для каталога `/proc`.
+pub fn proc_tids() -> alloc::vec::Vec<u64> {
+    with_tasks(|tasks| tasks.iter().flatten().map(|t| t.tid).collect())
+}
+
+pub fn proc_alive(tid: u64) -> bool {
+    with_tasks(|tasks| tasks.iter().flatten().any(|t| t.tid == tid))
+}
+
+pub fn proc_status(tid: u64) -> Option<String> {
+    with_tasks(|tasks| {
+        let idx = tasks.iter().position(|slot| {
+            slot.as_ref().map(|t| t.tid == tid).unwrap_or(false)
+        })?;
+        Some(status_at(tasks, idx))
+    })
+}
+
+/// Имя, с которым задача вошла в exec. Полного argv нет: в `cmdline` лежит путь и NUL.
+pub fn proc_cmdline(tid: u64) -> Option<String> {
+    with_tasks(|tasks| {
+        let t = tasks.iter().flatten().find(|t| t.tid == tid)?;
+        let mut s = String::from(cstr_name(&t.name));
+        s.push('\0');
+        Some(s)
+    })
+}
+
+pub fn proc_self_cmdline() -> String {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if cur < 0 {
+        return String::from("kernel\0");
     }
     with_tasks(|tasks| {
         let Some(t) = tasks[cur as usize].as_ref() else {
-            return format_status("kernel", 0, 0, &Cred::root(), 0);
+            return String::from("kernel\0");
         };
-        let ppid = if t.parent >= 0 {
-            tasks[t.parent as usize]
-                .as_ref()
-                .map(|p| p.tid)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let name = cstr_name(&t.name);
-        format_status(name, t.tid, ppid, &t.cred, t.seccomp)
+        let mut s = String::from(cstr_name(&t.name));
+        s.push('\0');
+        s
     })
+}
+
+fn status_at(tasks: &[Option<Task>; MAX_TASKS], idx: usize) -> String {
+    let t = tasks[idx].as_ref().unwrap();
+    let mut raw = [0u8; 24];
+    let name_len = cstr_name(&t.name).len().min(raw.len());
+    raw[..name_len].copy_from_slice(&t.name[..name_len]);
+    let tid = t.tid;
+    let cred = t.cred;
+    let seccomp = t.seccomp;
+    let parent = t.parent;
+    let state = match t.state {
+        TaskState::Runnable => "R",
+        TaskState::Exited => "Z",
+    };
+    let ppid = if parent >= 0 {
+        tasks[parent as usize]
+            .as_ref()
+            .map(|p| p.tid)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let name = core::str::from_utf8(&raw[..name_len]).unwrap_or("?");
+    format_status(name, tid, ppid, &cred, seccomp, state)
 }
 
 fn cstr_name(name: &[u8]) -> &str {
@@ -1428,9 +1487,9 @@ fn cstr_name(name: &[u8]) -> &str {
     core::str::from_utf8(&name[..n]).unwrap_or("?")
 }
 
-fn format_status(name: &str, pid: u64, ppid: u64, c: &Cred, seccomp: u8) -> String {
+fn format_status(name: &str, pid: u64, ppid: u64, c: &Cred, seccomp: u8, state: &str) -> String {
     format!(
-        "Name:\t{name}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nSeccomp:\t{seccomp}\n",
+        "Name:\t{name}\nState:\t{state}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nSeccomp:\t{seccomp}\n",
         c.uid, c.euid, c.suid, c.euid, c.gid, c.egid, c.sgid, c.egid,
     )
 }

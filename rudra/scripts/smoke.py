@@ -185,6 +185,7 @@ def main():
             "run /bin/fs.elf",
             "run /bin/tcp.elf",
             "run /bin/seek.elf",
+            "run /bin/proc.elf",
             "run /bin/epoll.elf",
             "run /bin/dyn.elf",
             "ls /",
@@ -260,6 +261,8 @@ def main():
             raise SystemExit("tcp.elf did not report tcp-ok\n" + text[-1500:])
         if "seek-ok" not in text or "seek-bad" in text:
             raise SystemExit("seek.elf did not report seek-ok\n" + text[-1500:])
+        if "proc-ok" not in text or "proc-bad" in text:
+            raise SystemExit("proc.elf did not report proc-ok\n" + text[-1500:])
         if "[task] init spawned" not in text:
             raise SystemExit("init was not pid1\n" + text[-1500:])
         if "epoll-ok" not in text:
