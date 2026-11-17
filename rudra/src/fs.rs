@@ -734,14 +734,19 @@ pub fn nlink_of(name: &str) -> u64 {
     }
 }
 
-/// Целый файл не длиннее 64 КиБ. Запись, unlink и rename слот выкидывают.
-/// Проверка записи ext2 идёт в блочный слой и этот кэш не видит.
-const PAGE_SLOTS: usize = 8;
-const PAGE_MAX: usize = 64 * 1024;
+/// Кэш страниц файлов: 16 слотов по 4 КиБ, ключ (имя, номер страницы).
+/// Попадание читает из памяти, не идя на диск; промах по ровно 4 КиБ,
+/// прочитанным с устройства целиком, заполняет слот. Частичные головной
+/// и хвостовой куски читаются с устройства без кэширования. Запись файла
+/// (write_canon), unlink и rename слоты файла выкидывают: write-through
+/// живёт выше. Проверка записи ext2 идёт в блочный слой и этот кэш не видит.
+const PAGE_SLOTS: usize = 16;
+const PAGE_SZ: usize = 4096;
 
 struct PageSlot {
     name: String,
-    data: Vec<u8>,
+    page: u32,
+    data: Box<[u8; PAGE_SZ]>,
 }
 
 struct PageCache {
@@ -754,17 +759,20 @@ struct PageCache {
 static PAGE: Mutex<PageCache> = Mutex::new(PageCache {
     gen: 0,
     next: 0,
-    slots: [None, None, None, None, None, None, None, None],
+    slots: [
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+    ],
 });
 
 fn with_page<R>(f: impl FnOnce(&mut PageCache) -> R) -> R {
     x86_64::instructions::interrupts::without_interrupts(|| f(&mut PAGE.lock()))
 }
 
-fn page_lookup(name: &str) -> Option<Vec<u8>> {
+fn page_lookup(name: &str, page: u32) -> Option<Box<[u8; PAGE_SZ]>> {
     with_page(|c| {
         for slot in c.slots.iter().flatten() {
-            if slot.name == name {
+            if slot.name == name && slot.page == page {
                 return Some(slot.data.clone());
             }
         }
@@ -776,18 +784,14 @@ fn page_gen() -> u64 {
     with_page(|c| c.gen)
 }
 
-fn page_store(name: &str, data: &[u8], gen: u64) {
-    if data.len() > PAGE_MAX {
-        return;
-    }
+fn page_store(name: &str, page: u32, data: &[u8; PAGE_SZ], gen: u64) {
     with_page(|c| {
         if c.gen != gen {
             return;
         }
         for slot in c.slots.iter_mut().flatten() {
-            if slot.name == name {
-                slot.data.clear();
-                slot.data.extend_from_slice(data);
+            if slot.name == name && slot.page == page {
+                slot.data.copy_from_slice(data);
                 return;
             }
         }
@@ -795,7 +799,8 @@ fn page_store(name: &str, data: &[u8], gen: u64) {
         c.next = c.next.wrapping_add(1);
         c.slots[i] = Some(PageSlot {
             name: String::from(name),
-            data: data.to_vec(),
+            page,
+            data: Box::new(*data),
         });
     });
 }
@@ -813,15 +818,26 @@ fn page_inval(name: &str) {
 
 #[cfg(test)]
 fn page_cache_poke(name: &str, data: &[u8]) -> bool {
+    // Тестовый upsert страницы 0: правит существующий слот или занимает
+    // свободный (круговой вытеснитель последнего).
     with_page(|c| {
+        let mut page = Box::new([0u8; PAGE_SZ]);
+        let n = data.len().min(PAGE_SZ);
+        page[..n].copy_from_slice(&data[..n]);
         for slot in c.slots.iter_mut().flatten() {
-            if slot.name == name {
-                slot.data.clear();
-                slot.data.extend_from_slice(data);
+            if slot.name == name && slot.page == 0 {
+                slot.data = page;
                 return true;
             }
         }
-        false
+        if let Some(i) = c.slots.iter().position(|s| s.is_none()) {
+            c.slots[i] = Some(PageSlot { name: String::from(name), page: 0, data: page });
+            return true;
+        }
+        let i = c.next % PAGE_SLOTS;
+        c.next = c.next.wrapping_add(1);
+        c.slots[i] = Some(PageSlot { name: String::from(name), page: 0, data: page });
+        true
     })
 }
 
@@ -844,24 +860,66 @@ pub fn read_at(name: &str, offset: u64, buf: &mut [u8]) -> isize {
         buf[..n].copy_from_slice(&bytes[start..start + n]);
         return n as isize;
     }
-    if let Some(data) = page_lookup(name) {
-        let start = offset as usize;
-        if start >= data.len() {
-            return 0;
-        }
-        let n = (data.len() - start).min(buf.len());
-        buf[..n].copy_from_slice(&data[start..start + n]);
-        return n as isize;
+    if buf.is_empty() {
+        return 0;
     }
-    let gen = page_gen();
-    let n = device_read_at(name, offset, buf);
-    if n > 0 && offset == 0 && (n as usize) <= buf.len() && (n as usize) <= PAGE_MAX {
-        let size = size_of(name);
-        if size > 0 && size as usize == n as usize {
-            page_store(name, &buf[..n as usize], gen);
+    let start = offset as usize;
+    let mut done = 0usize;
+    // Головной кусок до границы страницы — с устройства, не кэшируем.
+    if start % PAGE_SZ != 0 {
+        let aligned_end = ((start / PAGE_SZ) + 1) * PAGE_SZ;
+        let want = aligned_end.min(start + buf.len()) - start;
+        let n = device_read_at(name, offset, &mut buf[..want]);
+        if n <= 0 {
+            return n;
+        }
+        done = n as usize;
+        if done < want {
+            return done as isize; // короткое чтение — EOF
         }
     }
-    n
+    // Страничные куски: попадание — из кэша, промах на целых 4 КиБ — в кэш.
+    while done < buf.len() {
+        let pos = start + done;
+        let chunk = PAGE_SZ.min(buf.len() - done);
+        if chunk == PAGE_SZ {
+            let pg = (pos / PAGE_SZ) as u32;
+            if let Some(data) = page_lookup(name, pg) {
+                buf[done..done + PAGE_SZ].copy_from_slice(&data[..]);
+                done += PAGE_SZ;
+                continue;
+            }
+            let gen = page_gen();
+            let n = device_read_at(name, pos as u64, &mut buf[done..done + PAGE_SZ]);
+            if n <= 0 {
+                if done == 0 {
+                    return n; // ошибка целиком (нет файла) — проброс
+                }
+                break;
+            }
+            if n as usize == PAGE_SZ {
+                let mut data = Box::new([0u8; PAGE_SZ]);
+                data.copy_from_slice(&buf[done..done + PAGE_SZ]);
+                page_store(name, pg, &data, gen);
+            }
+            done += n as usize;
+            if (n as usize) < PAGE_SZ {
+                break; // EOF посередине файла
+            }
+        } else {
+            // Хвост меньше страницы — с устройства.
+            let n = device_read_at(name, pos as u64, &mut buf[done..]);
+            if n <= 0 {
+                if done == 0 {
+                    return n; // ошибка целиком (нет файла) — проброс
+                }
+                break;
+            }
+            done += n as usize;
+            break;
+        }
+    }
+    done as isize
 }
 
 pub fn list_dir(name: &str) -> Vec<String> {
@@ -1079,35 +1137,23 @@ pub fn read_file_to_vec(path: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Прочитать файл по каноническому имени в Vec (для execve).
+/// Прочитать файл по каноническому имени в Vec (для execve). Идёт через
+/// постраничный кэш: повторные execve бинарников не трогают диск.
 pub fn read_canon(name: &str) -> Option<Vec<u8>> {
     if let Some(text) = synth_body(name) {
         return Some(text.into_bytes());
     }
-    if let Some(data) = page_lookup(name) {
-        return Some(data);
+    let size = size_of(name);
+    if size <= 0 {
+        return None;
     }
-    let gen = page_gen();
-    let data = if ext2_on() {
-        crate::ext2::read_file(name)
+    let mut v = vec![0u8; size as usize];
+    let n = read_at(name, 0, &mut v);
+    if n == size {
+        Some(v)
     } else {
-        let size = fs().size_of(name);
-        if size <= 0 {
-            None
-        } else {
-            let mut v = vec![0u8; size as usize];
-            match fs().read(name, &mut v) {
-                n if n == size => Some(v),
-                _ => None,
-            }
-        }
-    };
-    if let Some(ref bytes) = data {
-        if bytes.len() <= PAGE_MAX {
-            page_store(name, bytes, gen);
-        }
+        None
     }
-    data
 }
 
 /// Удалить файл по каноническому имени.
@@ -1156,17 +1202,26 @@ mod tests {
     fn page_cache_serves_reads_until_write() {
         serial_print!("test page_cache_serves_reads_until_write... ");
         assert!(write_path(b"/pcache.txt", b"one") > 0);
-        let mut buf = [0u8; 8];
+        // Прямое чтение 3 байт с offset 0 — страничный путь: головой нет,
+        // кусок 3 байта < 4096 — хвостовой, с устройства, не кэшируется.
+        let mut buf = [0u8; 4096];
         let n = read_path(b"/pcache.txt", &mut buf) as usize;
         assert_eq!(&buf[..n], b"one");
-        assert!(page_cache_poke("/pcache.txt", b"ZZZ"));
-        let n = read_path(b"/pcache.txt", &mut buf) as usize;
-        assert_eq!(&buf[..n], b"ZZZ");
+        // Отравляем страницу 0 в кэше: следующее чтение ровно 4 КиБ
+        // обслуживается из кэша целиком, префикс — отравленный.
+        let mut poison = [0u8; PAGE_SZ];
+        poison[..3].copy_from_slice(b"ZZZ");
+        assert!(page_cache_poke("/pcache.txt", &poison));
+        let n = read_at("/pcache.txt", 0, &mut buf) as usize;
+        assert_eq!(n, PAGE_SZ);
+        assert_eq!(&buf[..3], b"ZZZ");
+        // Запись выкидывает слот: снова читаем с устройства.
         assert!(write_path(b"/pcache.txt", b"two") > 0);
         let n = read_path(b"/pcache.txt", &mut buf) as usize;
         assert_eq!(&buf[..n], b"two");
         assert!(delete_path(b"/pcache.txt"));
-        assert_eq!(read_path(b"/pcache.txt", &mut buf), -1);
+        let mut small = [0u8; 8];
+        assert_eq!(read_path(b"/pcache.txt", &mut small), -1);
         serial_println!("[ok]");
     }
 
