@@ -720,7 +720,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         110 => task::current_ppid(),
         158 => task::sys_arch_prctl(a1, a2),
         186 => task::current_tid(), // gettid
-        202 => sys_futex(a1, a2, a3),
+        202 => sys_futex(a1, a2, a3, a4, a5, a6),
         203 => task::sys_sched_setaffinity(a1, a2, a3),
         204 => task::sys_sched_getaffinity(a1, a2, a3),
         309 => task::sys_getcpu(a1, a2),
@@ -2633,18 +2633,27 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
     }
 }
 
-fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
+fn sys_futex(uaddr: u64, op: u64, val: u64, val2: u64, uaddr2: u64, val3: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
+    const FUTEX_CMP_REQUEUE: u64 = 4;
     match op & 0x7f {
         FUTEX_WAIT => futex_wait(uaddr, val as u32),
         FUTEX_WAKE => futex_wake(uaddr, val as u32),
+        // glibc pthread_cond_broadcast: разбудить val ждущих на uaddr,
+        // остальных (до val2) переставить на uaddr2. val3 — ожидаемое
+        // значение слова: не сошлось — EAGAIN, никого не трогаем.
+        FUTEX_CMP_REQUEUE => futex_cmp_requeue(uaddr, val as u32, val2 as u32, uaddr2, val3 as u32),
         _ => ENOSYS,
     }
 }
 
 struct FutexWait {
     addr: u64,
+    val: u32,
+    /// Проверять слово по адресу перед блокировкой. У переставленных
+    /// (CMP_REQUEUE) — false: они спят на новом адресе до явного WAKE.
+    check: bool,
     woke: bool,
 }
 
@@ -2679,7 +2688,7 @@ fn futex_wait(addr: u64, val: u32) -> u64 {
         let Some(idx) = idx else {
             return Err(ENOMEM);
         };
-        waiters[idx] = Some(FutexWait { addr, woke: false });
+        waiters[idx] = Some(FutexWait { addr, val, check: true, woke: false });
         Ok(idx)
     });
     let idx = match slot {
@@ -2695,8 +2704,12 @@ fn futex_wait(addr: u64, val: u32) -> u64 {
                 waiters[idx] = None;
                 return Some(0);
             }
-            match futex_word(addr) {
-                Ok(cur) if cur != val => {
+            if !w.check {
+                // Переставлен CMP_REQUEUE: блокируемся до явного WAKE.
+                return None;
+            }
+            match futex_word(w.addr) {
+                Ok(cur) if cur != w.val => {
                     waiters[idx] = None;
                     Some(EAGAIN)
                 }
@@ -2737,5 +2750,41 @@ pub fn futex_wake(addr: u64, n: u32) -> u64 {
             }
         }
         u64::from(woke)
+    })
+}
+
+/// FUTEX_CMP_REQUEUE: слово по `addr` должно быть `val3`. Разбудить до
+/// `nr_wake` ждущих на `addr`, до `nr_requeue` остальных переставить на
+/// `addr2` (они просыпаются от FUTEX_WAKE на новом адресе). Возвращает
+/// woken + requeued.
+fn futex_cmp_requeue(addr: u64, nr_wake: u32, nr_requeue: u32, addr2: u64, val3: u32) -> u64 {
+    if addr == 0 || addr % 4 != 0 || addr2 == 0 || addr2 % 4 != 0 {
+        return EINVAL;
+    }
+    let cur = match futex_word(addr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if cur != val3 {
+        return EAGAIN;
+    }
+    with_futex(|waiters| {
+        let mut moved = 0u32;
+        for slot in waiters.iter_mut().flatten() {
+            if slot.addr != addr || slot.woke {
+                continue;
+            }
+            if moved < nr_wake {
+                slot.woke = true;
+                moved += 1;
+            } else if moved - nr_wake < nr_requeue {
+                slot.addr = addr2;
+                slot.check = false;
+                moved += 1;
+            } else {
+                break;
+            }
+        }
+        u64::from(moved)
     })
 }
