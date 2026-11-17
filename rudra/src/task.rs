@@ -27,6 +27,7 @@ use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::paging::mapper::MapToError;
+use x86_64::PhysAddr;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
     Size4KiB, Translate,
@@ -715,6 +716,12 @@ pub struct Task {
     thread: bool,
     /// FS BASE (TLS) — восстанавливается планировщиком.
     pub fs_base: u64,
+    /// Пользовательский GS. В ядре он лежит в `KERNEL_GS_BASE`.
+    pub gs_base: u64,
+    /// Единственный CPU, на котором задаче разрешено исполняться.
+    pub cpu: u32,
+    /// Кто сейчас её исполняет. -1 — никто.
+    pub on_cpu: i8,
     /// Адрес для CLONE_CHILD_CLEARTID: при exit записать 0 и разбудить futex.
     pub clear_tid: u64,
     /// Пользовательская область rseq. Ноль — не зарегистрирована.
@@ -740,13 +747,32 @@ static TASKS: Mutex<[Option<Task>; MAX_TASKS]> = Mutex::new([
 ]);
 static TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
-/// Индекс текущей задачи; -1 = boot-контекст (ядро до первого переключения).
-static CURRENT: AtomicIsize = AtomicIsize::new(-1);
+/// Индекс задачи на каждом CPU. -1 — простой или ядро до первого переключения.
+static CPU_CUR: [AtomicIsize; crate::cpu::MAX_CPUS] = [
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+    AtomicIsize::new(-1),
+];
+static IDLE_RSP: [AtomicU64; crate::cpu::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 static SCHED_INITED: AtomicBool = AtomicBool::new(false);
 
-/// `TASKS` и `timer_switch` живут на одном ядре. Syscall входит с `sti`,
-/// поэтому лок берём только при выключенных прерываниях: иначе таймер
-/// застаёт лок занятым и крутит его вечно.
+/// Syscall входит с `sti`, поэтому лок берём при выключенных прерываниях
+/// на этом CPU. Спинлок сериализует CPU, пока секция не ждёт другой CPU
+/// и не берёт `TASKS` повторно.
 fn with_tasks<R>(f: impl FnOnce(&mut [Option<Task>; MAX_TASKS]) -> R) -> R {
     x86_64::instructions::interrupts::without_interrupts(|| f(&mut TASKS.lock()))
 }
@@ -772,11 +798,12 @@ static TCP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tcp.elf"));
 static SEEK_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seek.elf"));
 static PROC_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/proc.elf"));
 static MODE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mode.elf"));
+static SMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smp.elf"));
 
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 19] = [
+    const BINS: [(&str, &[u8]); 20] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -796,6 +823,7 @@ pub fn init() {
         ("/bin/seek.elf", SEEK_ELF),
         ("/bin/proc.elf", PROC_ELF),
         ("/bin/mode.elf", MODE_ELF),
+        ("/bin/smp.elf", SMP_ELF),
     ];
     for (name, elf) in BINS {
         if elf.is_empty() {
@@ -1262,6 +1290,9 @@ fn finish_task(
         parent: -1,
         thread: false,
         fs_base: 0,
+        gs_base: 0,
+        cpu: 0,
+        on_cpu: -1,
         clear_tid: 0,
         rseq: 0,
         rseq_sig: 0,
@@ -1279,11 +1310,11 @@ fn finish_task(
 
 /// Номер текущего слота (для отладки).
 pub fn current_slot() -> isize {
-    CURRENT.load(Ordering::Relaxed)
+    CPU_CUR[crate::smp::this_cpu()].load(Ordering::Relaxed)
 }
 
 pub fn current_tid() -> u64 {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return 0;
     }
@@ -1318,7 +1349,7 @@ pub fn current_umask() -> u32 {
 /// tid родителя. У init и без задачи — 0. Отдельного пространства gettid нет:
 /// `gettid` возвращает тот же номер, что `getpid`.
 pub fn current_ppid() -> u64 {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return 0;
     }
@@ -1411,7 +1442,7 @@ fn set_seccomp_mode(mode: u64) -> u64 {
 }
 
 pub fn proc_self_status() -> String {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return format_status("kernel", 0, 0, &Cred::root(), 0, "S");
     }
@@ -1450,7 +1481,7 @@ pub fn proc_cmdline(tid: u64) -> Option<String> {
 }
 
 pub fn proc_self_cmdline() -> String {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return String::from("kernel\0");
     }
@@ -1517,7 +1548,7 @@ pub fn proc_counts() -> (u64, u64) {
 
 /// Доступ к текущей задаче под TASKS-локом.
 pub fn with_current_task<R>(f: impl FnOnce(&mut Task) -> R) -> Option<R> {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return None;
     }
@@ -1593,7 +1624,7 @@ pub fn sys_clone(
     const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let cur = CURRENT.load(Ordering::Relaxed);
+        let cur = current_slot();
         if cur < 0 {
             return u64::MAX;
         }
@@ -1615,6 +1646,7 @@ pub fn sys_clone(
             parent_tid,
             parent_cred,
             parent_seccomp,
+            parent_cpu,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
             let parent_fsctx = p.fsctx.clone();
@@ -1637,6 +1669,7 @@ pub fn sys_clone(
                 p.tid,
                 p.cred,
                 p.seccomp,
+                p.cpu,
             )
         });
 
@@ -1732,6 +1765,9 @@ pub fn sys_clone(
             parent: cur as isize,
             thread: flags & CLONE_VM != 0,
             fs_base: if flags & CLONE_SETTLS != 0 { tls } else { parent_fs },
+            gs_base: crate::cpu::read_user_gs(),
+            cpu: parent_cpu,
+            on_cpu: -1,
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
             rseq: 0,
             rseq_sig: 0,
@@ -1939,7 +1975,7 @@ fn copy_ptr_array(ptr: u64, max: usize) -> Option<Vec<String>> {
 
 /// sys_brk: вернуть/установить brk текущей задачи. addr=0 — запрос.
 pub fn sys_brk(addr: u64) -> u64 {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return 0;
     }
@@ -1999,7 +2035,7 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
     if flags & MAP_PRIVATE == 0 {
         return ENODEV;
     }
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return ENOMEM;
     }
@@ -2034,6 +2070,89 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
     }
 }
 
+fn slot_of(tasks: &[Option<Task>; MAX_TASKS], pid: u64) -> Option<usize> {
+    if pid == 0 {
+        let cur = current_slot();
+        if cur < 0 {
+            None
+        } else {
+            Some(cur as usize)
+        }
+    } else {
+        tasks.iter().position(|slot| {
+            slot.as_ref()
+                .map(|t| t.tid == pid && t.state == TaskState::Runnable)
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// `sched_setaffinity`. Запоминается младший выставленный бит, если этот CPU поднят.
+/// Перенос случится на тике из ring 3, без IPI из-под `TASKS`.
+pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
+    if len == 0 || len > 128 || mask_ptr == 0 {
+        return crate::linux::EINVAL;
+    }
+    let n = (len as usize).min(8);
+    let mut raw = [0u8; 8];
+    if !user_read(mask_ptr, &mut raw[..n]) {
+        return crate::linux::EFAULT;
+    }
+    let mask = u64::from_le_bytes(raw);
+    if mask == 0 {
+        return crate::linux::EINVAL;
+    }
+    let cpu = mask.trailing_zeros();
+    if cpu >= crate::smp::cpu_count() {
+        return crate::linux::EINVAL;
+    }
+    with_tasks(|tasks| {
+        let Some(idx) = slot_of(tasks, pid) else {
+            return crate::linux::ESRCH;
+        };
+        let Some(t) = tasks[idx].as_mut() else {
+            return crate::linux::ESRCH;
+        };
+        t.cpu = cpu;
+        0
+    })
+}
+
+/// `sched_getaffinity`. Возвращает 8, как раньше: в маске бит `Task::cpu`.
+pub fn sys_sched_getaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
+    if len == 0 || mask_ptr == 0 {
+        return crate::linux::EINVAL;
+    }
+    let cpu = with_tasks(|tasks| {
+        let idx = slot_of(tasks, pid)?;
+        tasks[idx].as_ref().map(|t| t.cpu)
+    });
+    let Some(cpu) = cpu else {
+        return crate::linux::ESRCH;
+    };
+    let n = (len as usize).min(128);
+    let mut tmp = [0u8; 128];
+    if (cpu as usize) < n * 8 {
+        tmp[cpu as usize / 8] |= 1 << (cpu % 8);
+    }
+    if !user_write(mask_ptr, &tmp[..n]) {
+        return crate::linux::EFAULT;
+    }
+    8
+}
+
+/// `getcpu`. Пишет CPU, на котором выполнен этот syscall, не поле affinity.
+pub fn sys_getcpu(cpu_ptr: u64, node_ptr: u64) -> u64 {
+    let cpu = crate::smp::this_cpu() as u32;
+    if cpu_ptr != 0 && !user_write(cpu_ptr, &cpu.to_le_bytes()) {
+        return crate::linux::EFAULT;
+    }
+    if node_ptr != 0 && !user_write(node_ptr, &0u32.to_le_bytes()) {
+        return crate::linux::EFAULT;
+    }
+    0
+}
+
 /// sys_arch_prctl: установить/прочитать FS BASE текущей задачи.
 pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_FS: u64 = 0x1002;
@@ -2048,17 +2167,19 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
         }
         ARCH_GET_FS => with_current_task(|t| t.fs_base).unwrap_or(0),
         ARCH_SET_GS => {
-            unsafe { Msr::new(0xC000_0101).write(addr) };
+            // Мы уже в syscall: swapgs сделан, пользовательский GS — KERNEL_GS_BASE.
+            with_current_task(|t| t.gs_base = addr);
+            crate::cpu::write_user_gs(addr);
             0
         }
-        ARCH_GET_GS => unsafe { Msr::new(0xC000_0101).read() },
+        ARCH_GET_GS => crate::cpu::read_user_gs(),
         _ => crate::linux::EINVAL,
     }
 }
 
 /// Выделить стек для нового потока в общем АП. Возвращает вершину стека.
 pub fn alloc_thread_stack() -> Option<u64> {
-    let cur = CURRENT.load(Ordering::Relaxed);
+    let cur = current_slot();
     if cur < 0 {
         return None;
     }
@@ -2089,7 +2210,7 @@ pub fn alloc_thread_stack() -> Option<u64> {
 /// Пометить текущую задачу завершённой. Планировщик больше в неё не вернётся.
 pub fn exit_current() {
     with_tasks(|tasks| {
-        let cur = CURRENT.load(Ordering::Relaxed);
+        let cur = current_slot();
         if cur >= 0 {
             // Детей отдаём задаче без родителя (init). Иначе слот родителя
             // достанется чужому, и wait заберёт не того.
@@ -2329,12 +2450,38 @@ fn rseq_preempt(slot: usize, kernel_rsp: u64) {
     let _ = user_write(addr + 8, &z);
 }
 
-fn timer_user_rip(kernel_rsp: u64) -> Option<u64> {
+fn frame_is_user(kernel_rsp: u64) -> bool {
     let cs = unsafe { core::ptr::read_unaligned((kernel_rsp + 128) as *const u64) };
-    if cs & 3 != 3 {
+    cs & 3 == 3
+}
+
+fn timer_user_rip(kernel_rsp: u64) -> Option<u64> {
+    if !frame_is_user(kernel_rsp) {
         return None;
     }
     Some(unsafe { core::ptr::read_unaligned((kernel_rsp + 120) as *const u64) })
+}
+
+enum Switch {
+    Run {
+        rsp: u64,
+        kstack: u64,
+        cr3: PhysFrame,
+        fs: u64,
+        /// `None` — та же задача, `KERNEL_GS_BASE` не трогаем.
+        gs: Option<u64>,
+    },
+    Idle {
+        rsp: u64,
+    },
+}
+
+fn leave_cpu(task: &mut Task, me: u32) {
+    crate::fpu::save(&mut task.fx);
+    task.gs_base = crate::cpu::read_user_gs();
+    if task.on_cpu == me as i8 {
+        task.on_cpu = -1;
+    }
 }
 
 fn schedule(current_rsp: u64) -> u64 {
@@ -2345,74 +2492,162 @@ fn schedule(current_rsp: u64) -> u64 {
     if count == 0 {
         return current_rsp;
     }
-
-    let prev = CURRENT.load(Ordering::Relaxed);
+    let me = crate::smp::this_cpu();
+    if me >= crate::cpu::MAX_CPUS {
+        return current_rsp;
+    }
+    let prev = CPU_CUR[me].load(Ordering::Relaxed);
     if prev >= 0 {
         rseq_preempt(prev as usize, current_rsp);
     }
+    let from_user = frame_is_user(current_rsp);
 
-    let next = with_tasks(|tasks| {
-        // Ищем следующую Runnable задачу, пропуская Exited и пустые слоты.
-        let mut found = None;
-        for k in 1..=count {
-            let i = if prev < 0 {
-                (k - 1) % count
-            } else {
-                (prev as usize + k) % count
-            };
-            if matches!(
-                tasks[i].as_ref().map(|t| t.state),
-                Some(TaskState::Runnable)
-            ) {
-                found = Some(i);
-                break;
-            }
+    let decision = with_tasks(|tasks| {
+        if prev < 0 {
+            IDLE_RSP[me].store(current_rsp, Ordering::Relaxed);
         }
-        found
-    });
-
-    let next = match next {
-        Some(n) => n,
-        None => return current_rsp, // некому переключаться
-    };
-
-    let (next_rsp, next_kstack_top, next_cr3, next_fs) = with_tasks(|tasks| {
+        let mut pinned = false;
         if prev >= 0 {
             if let Some(t) = tasks[prev as usize].as_mut() {
                 t.kernel_rsp = current_rsp;
-                if prev as usize != next {
-                    crate::fpu::save(&mut t.fx);
+                let dead = t.state != TaskState::Runnable;
+                let migrate = from_user && t.cpu != me as u32;
+                if dead || migrate {
+                    leave_cpu(t, me as u32);
+                } else if !from_user && t.cpu != me as u32 {
+                    // Кадр ядра нельзя отдать другому CPU: у syscall и iret разные кадры.
+                    pinned = true;
+                    t.on_cpu = me as i8;
                 }
             }
         }
-        if prev < 0 || prev as usize != next {
-            if let Some(t) = tasks[next].as_ref() {
-                crate::fpu::restore(&t.fx);
+
+        let n = TASK_COUNT.load(Ordering::Acquire).min(tasks.len());
+        let next = if pinned {
+            Some(prev as usize)
+        } else if n == 0 {
+            None
+        } else {
+            let mut found = None;
+            for k in 1..=n {
+                let i = if prev < 0 {
+                    (k - 1) % n
+                } else {
+                    (prev as usize + k) % n
+                };
+                let Some(t) = tasks[i].as_ref() else {
+                    continue;
+                };
+                if t.state != TaskState::Runnable {
+                    continue;
+                }
+                if t.on_cpu >= 0 && t.on_cpu != me as i8 {
+                    continue;
+                }
+                if t.cpu != me as u32 {
+                    continue;
+                }
+                found = Some(i);
+                break;
+            }
+            found
+        };
+
+        if let Some(next) = next {
+            let switching = prev < 0 || prev as usize != next;
+            if switching && prev >= 0 {
+                if let Some(t) = tasks[prev as usize].as_mut() {
+                    if t.on_cpu == me as i8 {
+                        leave_cpu(t, me as u32);
+                    }
+                }
+            }
+            if switching {
+                if let Some(t) = tasks[next].as_ref() {
+                    crate::fpu::restore(&t.fx);
+                }
+            }
+            if let Some(t) = tasks[next].as_mut() {
+                t.on_cpu = me as i8;
+            }
+            CPU_CUR[me].store(next as isize, Ordering::Relaxed);
+            let task = tasks[next].as_ref().expect("runnable task disappeared");
+            Switch::Run {
+                rsp: task.kernel_rsp,
+                kstack: task.kstack_top,
+                cr3: task.cr3,
+                fs: task.fs_base,
+                gs: if switching {
+                    Some(task.gs_base)
+                } else {
+                    None
+                },
+            }
+        } else {
+            if prev >= 0 {
+                if let Some(t) = tasks[prev as usize].as_mut() {
+                    if t.on_cpu == me as i8 {
+                        leave_cpu(t, me as u32);
+                    }
+                }
+            }
+            CPU_CUR[me].store(-1, Ordering::Relaxed);
+            let idle = IDLE_RSP[me].load(Ordering::Relaxed);
+            Switch::Idle {
+                rsp: if idle == 0 { current_rsp } else { idle },
             }
         }
-        let task = tasks[next].as_ref().expect("runnable task disappeared");
-        (task.kernel_rsp, task.kstack_top, task.cr3, task.fs_base)
     });
 
-    CURRENT.store(next as isize, Ordering::Relaxed);
-
-    unsafe { Cr3::write(next_cr3, Cr3Flags::empty()) };
-    unsafe { Msr::new(0xC000_0100).write(next_fs) };
-    gdt::set_kernel_stack(VirtAddr::new(next_kstack_top));
-    syscall::set_current_kstack(next_kstack_top);
-
-    // Кадр next — тот, в который iret. rseq уже сдвинул rip уходящей
-    // задачи; если это та же задача, обработчик сохранит уже abort.
-    // CR3 уже её: user_write идёт в её страницы. TASKS здесь не держим.
-    crate::signal::deliver_timer(next_rsp);
-
-    next_rsp
+    match decision {
+        Switch::Run {
+            rsp,
+            kstack,
+            cr3,
+            fs,
+            gs,
+        } => {
+            unsafe { Cr3::write(cr3, Cr3Flags::empty()) };
+            unsafe { Msr::new(0xC000_0100).write(fs) };
+            if let Some(gs) = gs {
+                crate::cpu::write_user_gs(gs);
+            }
+            gdt::set_kernel_stack(VirtAddr::new(kstack));
+            syscall::set_current_kstack(kstack);
+            // Кадр next — тот, в который iret. TASKS здесь не держим.
+            crate::signal::deliver_timer(rsp);
+            rsp
+        }
+        Switch::Idle { rsp } => {
+            let kcr3 = crate::smp::kernel_cr3(me);
+            if kcr3 != 0 {
+                if let Ok(frame) = PhysFrame::from_start_address(PhysAddr::new(kcr3)) {
+                    unsafe { Cr3::write(frame, Cr3Flags::empty()) };
+                }
+            }
+            let top = if me == 0 {
+                syscall::boot_kstack_top()
+            } else {
+                crate::smp::idle_kstack(me)
+            };
+            if top != 0 {
+                gdt::set_kernel_stack(VirtAddr::new(top));
+            }
+            syscall::set_current_kstack(if me == 0 { 0 } else { top });
+            rsp
+        }
+    }
 }
 
 core::arch::global_asm!(r#"
     .text
     .global timer_entry
 timer_entry:
+    # В 64-битном кадре CS всегда на [rsp+8]. swapgs только из ring 3.
+    test byte ptr [rsp+8], 3
+    jz 1f
+    swapgs
+1:
     push rax
     push rcx
     push rdx
@@ -2451,10 +2686,18 @@ timer_entry:
     pop rdx
     pop rcx
     pop rax
+    test byte ptr [rsp+8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 
     .global lapic_timer_entry
 lapic_timer_entry:
+    test byte ptr [rsp+8], 3
+    jz 3f
+    swapgs
+3:
     push rax
     push rcx
     push rdx
@@ -2490,6 +2733,10 @@ lapic_timer_entry:
     pop rdx
     pop rcx
     pop rax
+    test byte ptr [rsp+8], 3
+    jz 4f
+    swapgs
+4:
     iretq
 "#);
 

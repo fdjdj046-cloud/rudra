@@ -3,12 +3,11 @@
 //! Конвенция (Linux ABI): rax = номер, rdi/rsi/rdx/r10/r8/r9 = аргументы,
 //! возврат в rax. Диспетчеризация — в `linux::dispatch`.
 //!
-//! syscall НЕ переключает стек сам — entry переключается на kernel-стек
-//! текущей задачи (см. `CURRENT_KSTACK`), обновляемый планировщиком.
+//! syscall НЕ переключает стек сам — entry после `swapgs` читает вершину
+//! kernel-стека из слота GS этого CPU (`cpu::GsSlot::kstack`).
 //! Шестым аргументом в диспетчер передаётся указатель на сохранённый
 //! фрейм (нужен clone/fork/execve — см. `FRAME`).
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::registers::model_specific::{Efer, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
@@ -34,12 +33,17 @@ pub mod FRAME {
     pub const RSP: usize = 14;
 }
 
-/// Вершина kernel-стека текущей задачи (для syscall entry).
-#[no_mangle]
-pub static CURRENT_KSTACK: AtomicU64 = AtomicU64::new(0);
-
+/// Вершина kernel-стека задачи на том CPU, который нас позвал.
 pub fn set_current_kstack(top: u64) {
-    CURRENT_KSTACK.store(top, Ordering::Release);
+    crate::cpu::set_kstack(crate::smp::this_cpu(), top);
+}
+
+/// Запасной стек BSP, пока ни одна задача не выставила свой.
+pub fn boot_kstack_top() -> u64 {
+    extern "C" {
+        static syscall_boot_stack_top: u8;
+    }
+    core::ptr::addr_of!(syscall_boot_stack_top) as u64
 }
 
 core::arch::global_asm!(r#"
@@ -47,25 +51,25 @@ core::arch::global_asm!(r#"
     .global syscall_boot_stack
 syscall_boot_stack:
     .space 32768
+    .global syscall_boot_stack_top
 syscall_boot_stack_top:
-    # Одноядерный scratch: user-rsp на время переключения стека.
-    # IF сброшен SFMask'ом до sti, поэтому гонки нет.
-syscall_scratch_rsp:
-    .quad 0
 
     .text
     .global syscall_entry
 syscall_entry:
     # На входе: rax=nr, rdi/rsi/rdx/r10/r8/r9=args, rcx=user rip, r11=user
     # rflags, IF очищен через SFMask. Стек — пользовательский.
-    # r10 — это Linux-arg4, его НЕЛЬЗЯ затирать: сохраняем user-rsp в scratch.
-    mov qword ptr [rip + syscall_scratch_rsp], rsp
-    mov rsp, qword ptr [rip + CURRENT_KSTACK]
+    # swapgs: GS_BASE становится слотом CPU, пользовательский GS уходит
+    # в KERNEL_GS_BASE. r10 — Linux-arg4, его НЕЛЬЗЯ затирать: user-rsp
+    # лежит в gs:0, вершина kernel-стека — в gs:8.
+    swapgs
+    mov qword ptr gs:[0], rsp
+    mov rsp, qword ptr gs:[8]
     test rsp, rsp
     jnz 1f
     lea rsp, [rip + syscall_boot_stack_top]
 1:
-    push qword ptr [rip + syscall_scratch_rsp]  # user rsp
+    push qword ptr gs:[0]       # user rsp
     push rcx                    # user rip
     push r11                    # user rflags
     push rax                    # nr
@@ -117,6 +121,7 @@ syscall_entry:
     pop rcx
     pop r10
     mov rsp, r10                # обратно на user-стек
+    swapgs
     sysretq
 "#);
 

@@ -1,18 +1,18 @@
 //! Старт application processors.
 //!
-//! AP поднимается SIPI в длинный режим и встаёт в `hlt` со своим стеком.
-//! Планировщик задач остаётся на BSP: у AP нет TSS и тика. IPI с вектором
-//! [`IPI_VECTOR`] только считает попадания, задачи не переносит.
+//! AP поднимается SIPI в длинный режим, получает свой TSS и тик LAPIC
+//! и исполняет задачи, у которых `Task::cpu` равен его индексу.
+//! Кадр, застигнутый в ядре, на другой CPU не переносится.
+//! IPI с вектором [`IPI_VECTOR`] только считает попадания.
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{FrameAllocator, PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
 
+use crate::cpu::MAX_CPUS;
 use crate::memory::BootInfoFrameAllocator;
-
-const MAX_CPUS: usize = 8;
 const PARAM_CR3: usize = 0xE0;
 const PARAM_STACK: usize = 0xE8;
 const PARAM_ENTRY: usize = 0xF0;
@@ -23,6 +23,51 @@ static TRAMP: &[u8] = include_bytes!("ap_tramp.bin");
 static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
 static ONLINE: AtomicU32 = AtomicU32::new(1);
 static IPI_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Следующий индекс AP. BSP занимает 0. `lock xadd` в `ap_entry`.
+#[no_mangle]
+static AP_INDEX_ALLOC: AtomicU32 = AtomicU32::new(1);
+/// Вершины простаивающих стеков. Индекс — номер CPU.
+#[no_mangle]
+static AP_IDLE_TOP: [AtomicU64; MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// CR3 ядра этого CPU. Возврат в простой восстанавливает его, не CR3 BSP.
+static KERNEL_CR3: [AtomicU64; MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// Индекс CPU по id локального APIC. 0xFF — нет такого.
+static APIC_INDEX: [AtomicU8; 256] = [const { AtomicU8::new(0xFF) }; 256];
+
+const IDLE_STACK: usize = 32 * 1024;
+
+#[repr(C, align(16))]
+struct IdleMem([u8; IDLE_STACK]);
+
+#[allow(static_mut_refs)]
+static mut AP_IDLE_MEM: [IdleMem; MAX_CPUS] = [
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+    IdleMem([0; IDLE_STACK]),
+];
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -58,6 +103,42 @@ pub fn record_ipi() {
     IPI_COUNT.fetch_add(1, Ordering::Release);
 }
 
+/// CPU, на котором выполняется этот код. До карты APIC и до регистрации — 0.
+pub fn this_cpu() -> usize {
+    if !crate::apic::mmio_ready() {
+        return 0;
+    }
+    let id = crate::apic::local_id();
+    if id > 255 {
+        return 0;
+    }
+    let idx = APIC_INDEX[id as usize].load(Ordering::Relaxed);
+    if idx == 0xFF {
+        0
+    } else {
+        idx as usize
+    }
+}
+
+pub fn kernel_cr3(cpu: usize) -> u64 {
+    KERNEL_CR3[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed)
+}
+
+/// Вершина простаивающего стека AP. У BSP запасной стек syscall, здесь 0.
+pub fn idle_kstack(cpu: usize) -> u64 {
+    if cpu == 0 || cpu >= MAX_CPUS {
+        0
+    } else {
+        AP_IDLE_TOP[cpu].load(Ordering::Relaxed)
+    }
+}
+
+#[allow(static_mut_refs)]
+fn idle_stack_top(index: usize) -> u64 {
+    let index = index.min(MAX_CPUS - 1);
+    unsafe { core::ptr::addr_of!(AP_IDLE_MEM[index]) as u64 + IDLE_STACK as u64 }
+}
+
 /// Страница ниже 640 КиБ из свободной карты. Кадр потом не выдаёт аллокатор.
 pub fn reserve_trampoline(regions: &[MemoryRegion]) -> Option<u64> {
     let mut best = None;
@@ -80,6 +161,14 @@ pub fn reserve_trampoline(regions: &[MemoryRegion]) -> Option<u64> {
 
 /// Разобрать MADT и поднять AP. `tramp` — страница из [`reserve_trampoline`].
 pub fn start(tramp: Option<u64>, rsdp: Option<u64>) {
+    let (kframe, _) = Cr3::read();
+    KERNEL_CR3[0].store(kframe.start_address().as_u64(), Ordering::Relaxed);
+    if crate::apic::mmio_ready() {
+        let bsp = crate::apic::id();
+        if bsp <= 255 {
+            APIC_INDEX[bsp as usize].store(0, Ordering::Relaxed);
+        }
+    }
     if !crate::apic::mmio_ready() {
         crate::serial_println!("[smp] no xapic mmio, aps not started");
         return;
@@ -117,6 +206,9 @@ pub fn start(tramp: Option<u64>, rsdp: Option<u64>) {
         APIC_IDS[ap_n].store(ids[i], Ordering::Relaxed);
     }
     CPU_COUNT.store((ap_n + 1) as u32, Ordering::Relaxed);
+    for i in 1..=ap_n {
+        AP_IDLE_TOP[i].store(idle_stack_top(i), Ordering::Release);
+    }
     if ap_n == 0 {
         crate::serial_println!("[smp] madt {}, only bsp", n);
         return;
@@ -157,7 +249,7 @@ pub fn start(tramp: Option<u64>, rsdp: Option<u64>) {
     }
     let woke = ping_aps(ap_n);
     crate::serial_println!(
-        "[smp] madt {} online {} ipi {} (aps parked, scheduler on bsp)",
+        "[smp] madt {} online {} ipi {} (per-cpu tss, ap timer)",
         CPU_COUNT.load(Ordering::Relaxed),
         ONLINE.load(Ordering::Acquire),
         woke
@@ -221,19 +313,51 @@ fn prepare(tramp: u64, aps: &[u32]) -> Option<[u64; MAX_CPUS]> {
     Some(stacks)
 }
 
+extern "C" {
+    fn ap_entry();
+}
+
+/// Уже на своём стеке 32 КиБ. Индекс выдал `ap_entry`.
 #[no_mangle]
-extern "C" fn ap_entry() -> ! {
+extern "C" fn ap_main(index: u64) -> ! {
+    let index = (index as usize).min(MAX_CPUS - 1);
     x86_64::instructions::interrupts::disable();
     crate::fpu::enable();
-    crate::gdt::load_ap();
+    let top = idle_stack_top(index);
+    crate::gdt::load_ap(index, top);
     crate::interrupts::init_idt();
-    crate::apic::arm_ap();
+    crate::syscall::init();
+    let id = crate::apic::local_id();
+    if id <= 255 {
+        APIC_INDEX[id as usize].store(index as u8, Ordering::Release);
+    }
+    let (frame, _) = Cr3::read();
+    KERNEL_CR3[index].store(frame.start_address().as_u64(), Ordering::Relaxed);
+    crate::apic::arm_ap_timer();
     ONLINE.fetch_add(1, Ordering::Release);
     x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();
     }
 }
+
+core::arch::global_asm!(
+    r#"
+    .text
+    .global ap_entry
+ap_entry:
+    # Трамплин оставил маленький стек. До Rust его меняем.
+    mov eax, 1
+    lock xadd dword ptr [rip + AP_INDEX_ALLOC], eax
+    lea rcx, [rip + AP_IDLE_TOP]
+    mov rsp, qword ptr [rcx + rax*8]
+    mov rdi, rax
+    call ap_main
+    cli
+    hlt
+    jmp ap_entry
+"#
+);
 
 fn copy_kernel_l4(fa: &mut BootInfoFrameAllocator) -> Option<u64> {
     let src = Cr3::read().0.start_address().as_u64();

@@ -21,6 +21,8 @@ static APIC_ID: AtomicU32 = AtomicU32::new(0);
 static APIC_VERSION: AtomicU32 = AtomicU32::new(0);
 static TIMER_ARMED: AtomicBool = AtomicBool::new(false);
 static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+/// Начальный счёт, которым BSP завёл periodic. Ноль — таймер не калиброван.
+static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Вектор IDT для таймера локального APIC. PIC занимает 32..=47.
 pub const TIMER_VECTOR: u8 = 48;
@@ -32,6 +34,19 @@ pub fn present() -> bool {
 
 pub fn id() -> u32 {
     APIC_ID.load(Ordering::Relaxed)
+}
+
+/// Id локального APIC того CPU, который выполняет чтение. `id` — кэш BSP.
+pub fn local_id() -> u32 {
+    if MMIO.load(Ordering::Relaxed) {
+        read32(0x20) >> 24
+    } else {
+        APIC_ID.load(Ordering::Relaxed)
+    }
+}
+
+pub fn timer_count() -> u32 {
+    TIMER_COUNT.load(Ordering::Relaxed)
 }
 
 pub fn version() -> u32 {
@@ -218,22 +233,30 @@ fn arm_periodic(count: u32) {
         write32(0x320, u32::from(TIMER_VECTOR) | (1 << 17));
         write32(0x380, count);
         TIMER_ARMED.store(true, Ordering::Relaxed);
+        TIMER_COUNT.store(count, Ordering::Relaxed);
     });
+}
+
+/// Таймер того AP, с которого нас позвали. LINT маскируются, таймер — нет.
+/// Тот же период, что у BSP. Нулевой счёт значит, что калибровки не было.
+pub fn arm_ap_timer() {
+    let count = TIMER_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    let svr = read32(0xF0);
+    write32(0xF0, (svr & !0x1FF) | 0x1FF);
+    for off in [0x350u64, 0x360, 0x370] {
+        let v = read32(off);
+        write32(off, v | (1 << 16));
+    }
+    write32(0x3E0, 0x3);
+    write32(0x320, u32::from(TIMER_VECTOR) | (1 << 17));
+    write32(0x380, count);
 }
 
 pub fn eoi() {
     write32(0xB0, 0);
-}
-
-/// Локальный APIC проснувшегося AP: программное включение, таймер и LINT маскированы.
-/// Звать только с того CPU, чей APIC надо настроить. BSP от этого замолчит.
-pub fn arm_ap() {
-    let svr = read32(0xF0);
-    write32(0xF0, (svr & !0x1FF) | 0x1FF);
-    for off in [0x320u64, 0x350, 0x360, 0x370] {
-        let v = read32(off);
-        write32(off, v | (1 << 16));
-    }
 }
 
 fn wait_icr() -> bool {

@@ -7,7 +7,7 @@
 | Версия | Содержание | Статус |
 |---|---|---|
 | 1.0.0, 1.0.1 | ext2-корень, проверка указателей, возврат кадров | теги стоят, не двигаются |
-| 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; таймер BSP LAPIC ~250 Гц; AP паркуются и отвечают на IPI; RTC в `CLOCK_REALTIME`; `futex WAIT/WAKE`; `rseq` на вытеснении из ring 3. Нет очереди задач на AP, x2APIC, per-CPU TSS, `FUTEX_REQUEUE`/PI |
+| 1.1 | SMP, APIC/x2APIC, IPI, per-CPU, часы не на 18 Гц, настоящее время суток, настоящий futex и rseq | начато: TSC; LAPIC ~250 Гц на каждом поднятом CPU; свой TSS и очередь; задача с affinity исполняется на этом CPU; RTC в `CLOCK_REALTIME`; `futex WAIT/WAKE`; `rseq` на вытеснении из ring 3. Нет x2APIC, `FUTEX_REQUEUE`/PI |
 | 1.2 | IPv4/IPv6, virtio-net, сокеты, netlink | начато: legacy virtio-net, DHCP и ARP на 8 соседей, UDP `AF_INET` с суммой (0 на IPv4 принимается) и петля `127.0.0.0/8`. Нет IPv6, TCP, netlink |
 | 1.3 | `PT_INTERP`, сигналы, epoll, `/proc`, `/sys` | начато: `/proc` (`uptime`, `cpuinfo`, `meminfo`, `stat`, `self/status`) и короткий `/sys`; перехваченный сигнал с `SA_RESTORER` доставляется на возврате из syscall и с тика в ring 3; `SIGCHLD` от exit процесса; `EINTR` из сна, futex, pipe, poll, recvfrom; epoll level-triggered по номеру fd; `PT_INTERP` грузит один ELF интерпретатора и входит в него (`AT_ENTRY`/`AT_PHDR` — основная программа). Нет доставки смертельного сигнала с тика, `SA_RESTART`, edge-trigger, поиска символов |
 | 1.4 | блочный слой, NVMe/AHCI, page cache, ext4 | начато: кэш чтения 16 слотов по 4 КиБ, только выровненный запрос. Запись слот сбрасывает и не заполняет. Нет page cache, ext4, NVMe, AHCI |
@@ -20,7 +20,7 @@
 
 Пункты 0.1–0.9 записаны в `doc/`: [compat-contract](doc/compat-contract.md), [profiles](doc/profiles.md), [architecture](doc/architecture.md), [unsafe](doc/unsafe.md), [governance](doc/governance.md). aarch64 (0.10) и HCL (0.11) в 2.0.0 не обязательны и не начаты.
 
-Долг 1.1: задачи исполняет только BSP. AP подняты и стоят в `hlt`, своего TSS и тика у них нет. Пока `sys_clone` и разбор адресного пространства держат IF выключенным, тик LAPIC на BSP не приходит и квант сдвигается. `nanosleep` и `CLOCK_MONOTONIC` на TSC. `CLOCK_REALTIME` — CMOS RTC, без NTP. `FUTEX_REQUEUE` и PI нет. `rseq` не обрывает критическую секцию на входе в syscall.
+Долг 1.1: у каждого поднятого CPU свой TSS и тик LAPIC. `sched_setaffinity` запоминает младший бит маски, и задача с кадром из ring 3 исполняется на этом CPU. Кадр, застигнутый в ядре, остаётся на своём CPU до возврата в ring 3. x2APIC нет. Пока `sys_clone` и разбор адресного пространства держат IF выключенным, тик LAPIC на этом CPU не приходит и квант сдвигается. `nanosleep` и `CLOCK_MONOTONIC` на TSC. `CLOCK_REALTIME` — CMOS RTC, без NTP. `FUTEX_REQUEUE` и PI нет. `rseq` не обрывает критическую секцию на входе в syscall.
 
 Долг 1.2: кэш ARP — восемь записей, девятая вытесняет самую старую. `SO_REUSEADDR` и `SO_BROADCAST` принимаются и не запоминаются. Датаграмма UDP не длиннее 1280 байт. Адрес с карты появляется после DHCP, сам по себе при загрузке не запрашивается. `SOCK_STREAM` возвращает `EPROTONOSUPPORT`. Сумма 0 у входящего UDP на IPv4 не проверяется.
 

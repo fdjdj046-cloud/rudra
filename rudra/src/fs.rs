@@ -648,8 +648,14 @@ fn synth_body(name: &str) -> Option<String> {
         }
         "/proc/self/status" => Some(crate::task::proc_self_status()),
         "/proc/self/cmdline" => Some(crate::task::proc_self_cmdline()),
-        // Задачи крутит только BSP, даже если AP уже подняты.
-        "/sys/devices/system/cpu/online" => Some("0\n".into()),
+        "/sys/devices/system/cpu/online" => {
+            let cpus = crate::smp::cpu_count().max(1);
+            if cpus == 1 {
+                Some("0\n".into())
+            } else {
+                Some(format!("0-{}\n", cpus - 1))
+            }
+        }
         "/sys/kernel/hostname" => Some("rudra\n".into()),
         _ => proc_pid_file(name),
     }
@@ -1281,8 +1287,8 @@ mod tests {
     }
 
     #[test_case]
-    fn sys_online_is_bsp_only() {
-        serial_print!("test sys_online_is_bsp_only... ");
+    fn sys_online_lists_cpus() {
+        serial_print!("test sys_online_lists_cpus... ");
         assert!(is_dir("/sys"));
         assert!(is_dir("/sys/devices/system/cpu"));
         assert!(is_dir("/sys/kernel"));
@@ -1293,7 +1299,13 @@ mod tests {
         assert!(list_dir("/sys").iter().any(|n| n == "devices"));
         let mut buf = [0u8; 16];
         let n = read_at("/sys/devices/system/cpu/online", 0, &mut buf);
-        assert_eq!(&buf[..n as usize], b"0\n");
+        let cpus = crate::smp::cpu_count().max(1);
+        let expect = if cpus == 1 {
+            alloc::format!("0\n")
+        } else {
+            alloc::format!("0-{}\n", cpus - 1)
+        };
+        assert_eq!(&buf[..n as usize], expect.as_bytes());
         let n = read_at("/sys/kernel/hostname", 0, &mut buf);
         assert_eq!(&buf[..n as usize], b"rudra\n");
         assert_eq!(mkdir("/sys"), Err(FsError::Exist));

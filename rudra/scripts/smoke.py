@@ -187,6 +187,7 @@ def main():
             "run /bin/seek.elf",
             "run /bin/proc.elf",
             "run /bin/mode.elf",
+            "run /bin/smp.elf",
             "run /bin/epoll.elf",
             "run /bin/dyn.elf",
             "ls /",
@@ -271,6 +272,8 @@ def main():
             raise SystemExit("proc.elf did not report proc-ok\n" + text[-1500:])
         if "mode-ok" not in text or "mode-bad" in text:
             raise SystemExit("mode.elf did not report mode-ok\n" + text[-1500:])
+        if "smp-ok" not in text or "smp-bad" in text:
+            raise SystemExit("smp.elf did not report smp-ok\n" + text[-1500:])
         if "[task] init spawned" not in text:
             raise SystemExit("init was not pid1\n" + text[-1500:])
         if "epoll-ok" not in text:

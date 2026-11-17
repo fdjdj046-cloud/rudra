@@ -18,7 +18,7 @@
 //! epoll — level-triggered по номеру fd: `EPOLLET` принимается и ведёт себя
 //! как level, `epoll_pwait` маску не ставит, poll самого epoll-fd пуст.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
-//! CPU; задачи крутит только BSP.
+//! CPU. Задача исполняется на CPU из `sched_setaffinity`. x2APIC нет.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
 use alloc::boxed::Box;
@@ -713,20 +713,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         158 => task::sys_arch_prctl(a1, a2),
         186 => task::current_tid(), // gettid
         202 => sys_futex(a1, a2, a3),
-        203 => 0, // sched_setaffinity
-        204 => {
-            // sched_getaffinity: задачи исполняет только BSP, даже если AP подняты.
-            if a2 == 0 || a3 == 0 {
-                return EINVAL;
-            }
-            let n = (a2 as usize).min(128);
-            let mut tmp = [0u8; 128];
-            tmp[0] = 1;
-            if !u_write(a3, &tmp[..n]) {
-                return EFAULT;
-            }
-            8
-        }
+        203 => task::sys_sched_setaffinity(a1, a2, a3),
+        204 => task::sys_sched_getaffinity(a1, a2, a3),
+        309 => task::sys_getcpu(a1, a2),
         218 => {
             // set_tid_address
             task::with_current_task(|t| t.clear_tid = a1);

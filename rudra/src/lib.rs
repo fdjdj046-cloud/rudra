@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod apic;
 pub mod block;
+pub mod cpu;
 pub mod ext2;
 pub mod framebuffer;
 pub mod fpu;
