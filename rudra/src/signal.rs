@@ -1,4 +1,5 @@
-//! Сигналы 1–31 для текущего потока.
+//! Сигналы 1–31 для текущего потока плюс очередь rt 34–64 (глубина 8,
+//! несколько ожидающих одного номера не схлопываются).
 //!
 //! Перехваченный сигнал с `SA_RESTORER` ставится и на возврате из syscall,
 //! и когда тик таймера возвращается в ring 3. Кадр тика — не кадр syscall:
@@ -36,10 +37,15 @@ const SIGINFO_AT: usize = 312;
 pub struct Signals {
     pending: u64,
     mask: u64,
-    handler: [u64; 32],
-    restorer: [u64; 32],
-    sa_mask: [u64; 32],
-    sa_flags: [u32; 32],
+    handler: [u64; 65],
+    restorer: [u64; 65],
+    sa_mask: [u64; 65],
+    sa_flags: [u32; 65],
+    /// Очередь rt-сигналов (34–64): несколько ожидающих одного номера
+    /// не схлопываются, как в Linux. Глубина 8 на задачу, дальше — тихий
+    /// сброс (Linux тут EAGAIN по RLIMIT_SIGPENDING).
+    rt_q: [u8; 8],
+    rt_n: u8,
 }
 
 impl Signals {
@@ -73,10 +79,38 @@ impl Signals {
         Self {
             pending: 0,
             mask: 0,
-            handler: [0; 32],
-            restorer: [0; 32],
-            sa_mask: [0; 32],
-            sa_flags: [0; 32],
+            handler: [0; 65],
+            restorer: [0; 65],
+            sa_mask: [0; 65],
+            sa_flags: [0; 65],
+            rt_q: [0; 8],
+            rt_n: 0,
+        }
+    }
+
+    /// Минимальный незаблокированный rt-сигнал из очереди.
+    fn rt_min_unblocked(&self, blocked: u64) -> Option<u32> {
+        let mut best: Option<u32> = None;
+        for i in 0..self.rt_n as usize {
+            let s = u32::from(self.rt_q[i]);
+            if bit(s) & blocked != 0 {
+                continue;
+            }
+            best = match best {
+                Some(b) if b <= s => Some(b),
+                _ => Some(s),
+            };
+        }
+        best
+    }
+
+    fn rt_dequeue(&mut self, sig: u32) {
+        if let Some(pos) = self.rt_q[..self.rt_n as usize]
+            .iter()
+            .position(|&x| u32::from(x) == sig)
+        {
+            self.rt_n -= 1;
+            self.rt_q[pos] = self.rt_q[self.rt_n as usize];
         }
     }
 
@@ -84,18 +118,26 @@ impl Signals {
     pub fn for_child(self) -> Self {
         let mut child = self;
         child.pending = 0;
+        child.rt_q = [0; 8];
+        child.rt_n = 0;
         child
     }
 
     fn pop(&mut self) -> Option<Pop> {
         let blocked = self.mask & !(bit(SIGKILL) | bit(SIGSTOP));
         let bits = self.pending & !blocked;
-        if bits == 0 {
-            return None;
-        }
-        let sig = bits.trailing_zeros() + 1;
+        // Обычные 1–31 — младшие номера, Linux доставляет минимальный:
+        // сначала битовая маска, потом очередь rt.
+        let sig = if bits != 0 {
+            let sig = bits.trailing_zeros() + 1;
+            self.pending &= !bit(sig);
+            sig
+        } else {
+            let sig = self.rt_min_unblocked(blocked)?;
+            self.rt_dequeue(sig);
+            sig
+        };
         let mark = bit(sig);
-        self.pending &= !mark;
         if sig == SIGKILL || (self.handler[sig as usize] == 0 && fatal_default(sig)) {
             return Some(Pop::Fatal(sig));
         }
@@ -137,6 +179,9 @@ impl Signals {
     pub fn raise(&mut self, sig: u32) {
         if (1..=31).contains(&sig) {
             self.pending |= bit(sig);
+        } else if (34..=64).contains(&sig) && self.rt_n < 8 {
+            self.rt_q[self.rt_n as usize] = sig as u8;
+            self.rt_n += 1;
         }
     }
 
@@ -158,6 +203,17 @@ impl Signals {
                 return true;
             }
             if handler == 0 && fatal_default(sig) {
+                return true;
+            }
+        }
+        if let Some(sig) = self.rt_min_unblocked(blocked) {
+            let handler = self.handler[sig as usize];
+            let restorer = self.restorer[sig as usize];
+            if handler > 1 && handler >= 0x1000 && restorer >= 0x1000 {
+                return true;
+            }
+            if handler == 0 {
+                // rt без обработчика — default fatal.
                 return true;
             }
         }
@@ -183,6 +239,13 @@ impl Signals {
                 return Some(sig);
             }
         }
+        if let Some(sig) = self.rt_min_unblocked(blocked) {
+            if self.handler[sig as usize] > 1 {
+                return None;
+            }
+            // rt без обработчика — default fatal.
+            return Some(sig);
+        }
         None
     }
 
@@ -207,11 +270,27 @@ impl Signals {
             }
             // Игнорируемый по умолчанию — смотрим следующий.
         }
+        if let Some(sig) = self.rt_min_unblocked(blocked) {
+            let handler = self.handler[sig as usize];
+            let restorer = self.restorer[sig as usize];
+            if handler > 1 && restorer >= 0x1000 {
+                return self.sa_flags[sig as usize] & SA_RESTART != 0;
+            }
+            return false;
+        }
         false
     }
 
     fn undo(&mut self, caught: &Catch) {
-        self.pending |= bit(caught.sig);
+        if caught.sig >= 32 {
+            // rt возвращается в очередь, не в битовую маску.
+            if self.rt_n < 8 {
+                self.rt_q[self.rt_n as usize] = caught.sig as u8;
+                self.rt_n += 1;
+            }
+        } else {
+            self.pending |= bit(caught.sig);
+        }
         self.mask = caught.old_mask;
         if caught.flags & SA_RESETHAND != 0 {
             self.handler[caught.sig as usize] = caught.handler;
@@ -474,7 +553,13 @@ pub fn sys_rt_sigreturn(frame: *mut u64) -> u64 {
 }
 
 pub fn sys_rt_sigaction(sig: u64, act: u64, old: u64, setsize: u64) -> u64 {
-    if setsize != 8 || sig == 0 || sig > 31 || sig == u64::from(SIGKILL) || sig == u64::from(SIGSTOP)
+    if setsize != 8
+        || sig == 0
+        || sig > 64
+        || sig == 32
+        || sig == 33
+        || sig == u64::from(SIGKILL)
+        || sig == u64::from(SIGSTOP)
     {
         return crate::linux::EINVAL;
     }
@@ -546,7 +631,8 @@ pub fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, setsize: u64) -> u64 
 }
 
 pub fn sys_kill(pid: u64, sig: u64) -> u64 {
-    if sig > 31 || task::current_slot() < 0 {
+    // 32 и 33 заняты NPTL, Linux на них даёт EINVAL.
+    if sig > 64 || sig == 32 || sig == 33 || task::current_slot() < 0 {
         return crate::linux::EINVAL;
     }
     let me = task::current_tid();
@@ -559,11 +645,16 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
     if sig == u64::from(SIGKILL) && pid == me {
         task::sys_exit(128 + u64::from(SIGKILL));
     }
-    let mark = bit(sig as u32);
     let armed = if pid == me {
-        task::with_current_task(|t| t.signals.pending |= mark).is_some()
+        task::with_current_task(|t| {
+            t.signals.raise(sig as u32);
+        })
+        .is_some()
     } else {
-        task::with_task(pid, |t| t.signals.pending |= mark).is_some()
+        task::with_task(pid, |t| {
+            t.signals.raise(sig as u32);
+        })
+        .is_some()
     };
     if armed {
         0
@@ -572,9 +663,55 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
     }
 }
 
+/// `sigqueue` (109): как kill, значение не сохраняется — siginfo нулевой.
+pub fn sys_sigqueue(pid: u64, sig: u64, _value: u64) -> u64 {
+    sys_kill(pid, sig)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case]
+    fn rt_signals_queue_and_deliver_in_order() {
+        crate::serial_print!("test rt_signals_queue_and_deliver_in_order... ");
+        let mut s = Signals::new();
+        s.handler[34] = 0x5000;
+        s.restorer[34] = 0x6000;
+        s.sa_flags[34] = SA_NODEFER;
+        s.handler[40] = 0x5000;
+        s.restorer[40] = 0x6000;
+        s.sa_flags[40] = SA_NODEFER;
+        s.raise(40);
+        s.raise(40); // два ожидающих одного номера — не схлопываются
+        s.raise(34);
+        match s.pop() {
+            Some(Pop::Catch(c)) => assert_eq!(c.sig, 34),
+            _ => panic!("rt order"),
+        }
+        match s.pop() {
+            Some(Pop::Catch(c)) => assert_eq!(c.sig, 40),
+            _ => panic!("rt first 40"),
+        }
+        match s.pop() {
+            Some(Pop::Catch(c)) => assert_eq!(c.sig, 40),
+            _ => panic!("rt second 40"),
+        }
+        assert!(s.pop().is_none());
+        // rt без обработчика — default fatal.
+        let mut s2 = Signals::new();
+        s2.raise(64);
+        match s2.pop() {
+            Some(Pop::Fatal(64)) => {}
+            _ => panic!("rt default fatal"),
+        }
+        // 32/33 не ставятся.
+        let mut s3 = Signals::new();
+        s3.raise(32);
+        s3.raise(33);
+        assert!(s3.pop().is_none());
+        crate::serial_println!("[ok]");
+    }
 
     #[test_case]
     fn sigkill_is_fatal_even_when_masked() {
