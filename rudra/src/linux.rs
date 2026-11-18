@@ -782,6 +782,14 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             task::debug_dump();
             0
         }
+        1001 => {
+            // rudra-specific: поднять IPv4 по DHCP (сеть поднята ли — проверяется).
+            // Для тестов и ручного bring-up; сама загрузка DHCP не запрашивает.
+            match crate::net::dhcp() {
+                Ok(ip) => u64::from(ip),
+                Err(_) => u64::MAX,
+            }
+        }
         _ => {
             // Неизвестный syscall: логируем один раз на номер, ENOSYS.
             let mut seen = SEEN_UNKNOWN.lock();
@@ -1040,6 +1048,8 @@ fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
                 if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
+                // Проводной клиент приходит кадром: качаем сами.
+                crate::net::pump();
                 x86_64::instructions::hlt();
             }
             Err(e) => return neg_err(e),
@@ -1233,6 +1243,9 @@ fn tcp_read(id: usize, buf: u64, len: u64, src: u64, srclen: u64) -> u64 {
                 if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
+                // Блокирующий читатель сам качает кадры: проводные данные
+                // приходят по прерыванию, ждать некому.
+                crate::net::pump();
                 x86_64::instructions::hlt();
             }
             Err(e) => return neg_err(e),

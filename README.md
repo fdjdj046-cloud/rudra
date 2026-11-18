@@ -156,7 +156,7 @@ Linux x86_64. Номер в `rax`, возврат в `rax`, аргументы:
 
 Частые номера: 0 read, 1 write, 2 open, 9 mmap, 12 brk, 56 clone, 57 fork,
 41 socket, 44 sendto, 45 recvfrom, 49 bind, 59 execve, 60 exit, 61 wait4, 78 getdents64, 202 futex.
-UDP `AF_INET`: петля и virtio-net, сумма на проводе (0 на IPv4 принимается). TCP — listen, accept, send и recv только на `127.0.0.0/8`; другой адрес даёт `ENETUNREACH`. IPv6 и netlink — ошибка.
+UDP `AF_INET`: петля и virtio-net, сумма на проводе (0 на IPv4 принимается). TCP — listen/accept/send/recv на петле `127.0.0.0/8` и на проводе (QEMU user-net: DHCP, handshake, обмен с хостом; без повторов и скользящего окна). IPv6 и netlink — ошибка.
 Полный разбор — `rudra/src/linux.rs`. `SFMask` гасит IF на время entry.
 
 syscall не переключает CR3: kernel-половина замаплена в каждом адресном пространстве,
@@ -250,7 +250,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [ ] SMP до конца: очередь и TSS есть на каждом поднятом CPU, задача с affinity исполняется на нём. Нет x2APIC и полной маски
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра
-- [ ] Серверный контур 2.x до конца: проводной TCP, IPv6, netlink, ext4, пакеты, namespaces. Петля UDP и TCP на `127.0.0.0/8`, кэш целого файла до 64 КиБ, virtio-net, PID1 и `CLONE_FS` уже в ядре
+- [ ] Серверный контур 2.x до конца: IPv6, netlink, ext4, пакеты, namespaces, повторы и окно TCP. Петля и провод UDP/TCP, постраничный кэш fs (16 слотов по 4 КиБ), virtio-net, PID1 и `CLONE_FS` уже в ядре
 
 ## Благодарности
 
