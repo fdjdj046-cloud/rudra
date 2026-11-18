@@ -74,6 +74,84 @@ fn write_handoff_elfs(out_dir: &Path) {
 
     std::fs::write(out_dir.join("interp.elf"), &interp).expect("write interp.elf");
     std::fs::write(out_dir.join("dyn.elf"), &dyn_elf).expect("write dyn.elf");
+    std::fs::write(out_dir.join("dsym.elf"), &dsym_elf()).expect("write dsym.elf");
+}
+
+/// ET_DYN с .dynsym/.dynstr/.hash и одной релокацией `R_X86_64_64` на
+/// символ `exported_fn` (st_value 0x1234, addend 0x10, слот по vaddr 0x210).
+/// Код на входе сравнивает [0x400210] с 0x401244 (S+A+bias): совпало —
+/// печатает `dsym-ok` и exit(0), иначе exit(3). Файловые смещения = vaddr.
+fn dsym_elf() -> Vec<u8> {
+    let mut e = Vec::new();
+    e.extend_from_slice(&elf_header(3, 0x1c0, 64, 2));
+    e.extend_from_slice(&phdr(1, 7, 0, 0, 0, 0, 0x1000));
+    e.extend_from_slice(&phdr(2, 4, 0x100, 0x100, 128, 128, 8));
+
+    // 0x0B0: dynstr.
+    e.resize(0xb0, 0);
+    e.extend_from_slice(b"\0exported_fn\0");
+    // 0x0C0: .dynsym (2 записи по 24 байт).
+    e.resize(0xc0, 0);
+    e.extend_from_slice(&[0u8; 24]);
+    e.extend_from_slice(&1u32.to_le_bytes()); // st_name
+    e.push(0x12); // st_info
+    e.push(0); // st_other
+    e.extend_from_slice(&1u16.to_le_bytes()); // st_shndx (определён)
+    e.extend_from_slice(&0x1234u64.to_le_bytes()); // st_value
+    e.extend_from_slice(&0u64.to_le_bytes()); // st_size
+    // 0x100: .dynamic — 8 записей.
+    e.resize(0x100, 0);
+    for (tag, val) in [
+        (5u64, 0xb0u64),  // DT_STRTAB
+        (6, 0xc0),        // DT_SYMTAB
+        (11, 24),         // DT_SYMENT
+        (4, 0x180),       // DT_HASH
+        (7, 0x1a0),       // DT_RELA
+        (8, 24),          // DT_RELASZ
+        (9, 24),          // DT_RELAENT
+        (0, 0),           // DT_NULL
+    ] {
+        e.extend_from_slice(&tag.to_le_bytes());
+        e.extend_from_slice(&val.to_le_bytes());
+    }
+    // 0x180: SysV .hash — nbucket=1, nchain=2, bucket[0]=1, chain=[0, 0].
+    e.resize(0x180, 0);
+    for v in [1u32, 2, 1, 0, 0] {
+        e.extend_from_slice(&v.to_le_bytes());
+    }
+    // 0x1A0: .rela.dyn — R_X86_64_64, символ 1, слот 0x210, addend 0x10.
+    e.resize(0x1a0, 0);
+    e.extend_from_slice(&0x210u64.to_le_bytes());
+    e.extend_from_slice(&((1u64 << 32) | 1).to_le_bytes());
+    e.extend_from_slice(&0x10u64.to_le_bytes());
+    // 0x1C0: код.
+    e.resize(0x1c0, 0);
+    let code: &[u8] = &[
+        0x48, 0xa1, 0x10, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax,[0x400210]
+        0x48, 0x3d, 0x44, 0x12, 0x40, 0x00, // cmp rax,0x401244
+        0x75, 0x1f, // jne exit3 (0x1f2)
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax,1 (write)
+        0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi,1
+        0xbe, 0xfe, 0x01, 0x40, 0x00, // mov esi,msg (0x401fe)
+        0xba, 0x08, 0x00, 0x00, 0x00, // mov edx,8
+        0x0f, 0x05, // syscall
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,60
+        0x31, 0xff, // xor edi,edi
+        0x0f, 0x05, // syscall
+        // exit3:
+        0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax,60
+        0xbf, 0x03, 0x00, 0x00, 0x00, // mov edi,3
+        0x0f, 0x05, // syscall
+        b'd', b's', b'y', b'm', b'-', b'o', b'k', b'\n',
+    ];
+    e.extend_from_slice(code);
+    // 0x210: слот под релокацию.
+    e.resize(0x210, 0);
+    e.extend_from_slice(&0u64.to_le_bytes());
+
+    let len = e.len() as u64;
+    patch_phdr_sizes(&mut e, 64, len, len);
+    e
 }
 
 fn elf_header(kind: u16, entry: u64, phoff: u64, phnum: u16) -> [u8; 64] {

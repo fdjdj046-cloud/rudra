@@ -81,6 +81,9 @@ enum ElfKind {
 struct RelaRel {
     offset: u64,
     addend: u64,
+    /// Для R_X86_64_64/GLOB_DAT/JUMP_SLOT — разрешённое значение символа
+    /// (st_value до bias) либо None для R_X86_64_RELATIVE.
+    sym: Option<u64>,
 }
 
 struct ElfParsed {
@@ -104,7 +107,9 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 }
 
 /// ELF64 x86_64, ET_EXEC или ET_DYN. PT_INTERP запоминается, а не отвергается.
-/// Из релокаций жив только `R_X86_64_RELATIVE`. Любая другая — отказ.
+/// Релокации: `R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT` и
+/// `R_X86_64_JUMP_SLOT` — символ ищется в .dynsym того же объекта (по имени
+/// для UNDEF; DT_NEEDED-библиотек нет). Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -194,16 +199,81 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     })
 }
 
+/// Значение символа по индексу. Символ разрешён внутри того же объекта:
+/// определённый — сразу его st_value, неопределённый (SHN_UNDEF) — по имени
+/// среди определённых записей .dynsym. `nchain` из DT_HASH — граница таблицы.
+/// Библиотек (DT_NEEDED) нет, наружу резолвить некуда.
+#[allow(clippy::too_many_arguments)]
+fn resolve_symbol(
+    elf: &[u8],
+    symtab: usize,
+    syment: u64,
+    strtab: usize,
+    nchain: u64,
+    idx: u64,
+) -> Option<u64> {
+    if syment < 24 || idx >= nchain {
+        return None;
+    }
+    let ent = symtab.checked_add((idx.checked_mul(syment)?) as usize)?;
+    if ent.checked_add(24)? > elf.len() {
+        return None;
+    }
+    let shndx = rd16(elf, ent + 6);
+    if shndx != 0 {
+        // Определён в этом объекте.
+        return Some(rd64(elf, ent + 8));
+    }
+    // UNDEF: ищем по имени среди определённых.
+    let name_off = rd32(elf, ent) as usize;
+    let name_start = strtab.checked_add(name_off)?;
+    if name_start >= elf.len() || elf[name_start] == 0 {
+        return None;
+    }
+    let name_end = elf[name_start..].iter().position(|b| *b == 0)? + name_start;
+    let name = &elf[name_start..name_end];
+    for i in 0..nchain {
+        let e = symtab.checked_add((i.checked_mul(syment)?) as usize)?;
+        if e + 24 > elf.len() {
+            return None;
+        }
+        if rd16(elf, e + 6) == 0 {
+            continue;
+        }
+        let no = rd32(elf, e) as usize;
+        let ns = strtab.checked_add(no)?;
+        if ns >= elf.len() {
+            return None;
+        }
+        let ne = elf[ns..].iter().position(|b| *b == 0)? + ns;
+        if &elf[ns..ne] == name {
+            return Some(rd64(elf, e + 8));
+        }
+    }
+    None
+}
+
 fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<RelaRel>> {
     const DT_NULL: u64 = 0;
+    const DT_STRTAB: u64 = 5;
+    const DT_SYMTAB: u64 = 6;
     const DT_RELA: u64 = 7;
     const DT_RELASZ: u64 = 8;
     const DT_RELAENT: u64 = 9;
+    const DT_SYMENT: u64 = 11;
+    const DT_HASH: u64 = 4;
+    const R_X86_64_64: u64 = 1;
+    const R_GLOB_DAT: u64 = 6;
+    const R_JUMP_SLOT: u64 = 7;
     const R_RELATIVE: u64 = 8;
     let mut rela_addr = 0u64;
     let mut rela_sz = 0u64;
     let mut rela_ent = 24u64;
     let mut saw_rela = false;
+    let mut strtab = 0u64;
+    let mut symtab = 0u64;
+    let mut syment = 24u64;
+    let mut hash_addr = 0u64;
     let mut i = 0;
     while i + 16 <= dynamic.len() {
         let tag = rd64(dynamic, i);
@@ -218,6 +288,14 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
             rela_sz = val;
         } else if tag == DT_RELAENT {
             rela_ent = val;
+        } else if tag == DT_STRTAB {
+            strtab = val;
+        } else if tag == DT_SYMTAB {
+            symtab = val;
+        } else if tag == DT_SYMENT {
+            syment = val;
+        } else if tag == DT_HASH {
+            hash_addr = val;
         }
     }
     if !saw_rela || rela_sz == 0 {
@@ -226,8 +304,33 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
     if rela_ent != 24 || rela_sz % 24 != 0 || rela_sz > 8192 * 24 {
         return None;
     }
-    let file_off = vaddr_file_off(segs, rela_addr)?;
-    let start = file_off as usize;
+    // Границы .dynsym: nchain из DT_HASH. Без хеш-таблицы символьные
+    // релокации не поддерживаем: резолвить по таблице без границы небезопасно.
+    // Требуем лениво: RELATIVE-only бинарники без DT_HASH пропускаем.
+    let symtab_off = if symtab != 0 {
+        Some(vaddr_file_off(segs, symtab)? as usize)
+    } else {
+        None
+    };
+    let nchain = if hash_addr != 0 {
+        let hoff = vaddr_file_off(segs, hash_addr)? as usize;
+        if hoff.checked_add(8)? > elf.len() {
+            return None;
+        }
+        let n = rd32(elf, hoff + 4);
+        if n == 0 || n > 1 << 20 {
+            return None;
+        }
+        n
+    } else {
+        0
+    };
+    let strtab_off = if strtab != 0 {
+        Some(vaddr_file_off(segs, strtab)? as usize)
+    } else {
+        None
+    };
+    let start = vaddr_file_off(segs, rela_addr)? as usize;
     let end = start.checked_add(rela_sz as usize)?;
     if end > elf.len() {
         return None;
@@ -243,10 +346,34 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
             at += 24;
             continue;
         }
-        if typ != R_RELATIVE {
-            return None;
-        }
-        out.push(RelaRel { offset, addend });
+        let rel = match typ {
+            R_RELATIVE => RelaRel {
+                offset,
+                addend,
+                sym: None,
+            },
+            R_X86_64_64 => {
+                let (soff, nc) = (symtab_off?, nchain);
+                let st = resolve_symbol(elf, soff, syment, strtab_off?, nc, info >> 32)?;
+                RelaRel {
+                    offset,
+                    addend,
+                    sym: Some(st),
+                }
+            }
+            R_GLOB_DAT | R_JUMP_SLOT => {
+                let (soff, nc) = (symtab_off?, nchain);
+                let st = resolve_symbol(elf, soff, syment, strtab_off?, nc, info >> 32)?;
+                // GLOB_DAT/JUMP_SLOT: S без A.
+                RelaRel {
+                    offset,
+                    addend: 0,
+                    sym: Some(st),
+                }
+            }
+            _ => return None,
+        };
+        out.push(rel);
         at += 24;
     }
     Some(out)
@@ -794,6 +921,7 @@ static INTR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/intr.elf"));
 static EPOLL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/epoll.elf"));
 static INTERP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/interp.elf"));
 static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
+static DSYM_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsym.elf"));
 static CRED_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cred.elf"));
 static SECCOMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/seccomp.elf"));
 static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
@@ -807,7 +935,7 @@ static SMP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smp.elf"));
 /// Инициализация: программы уже лежат в ext2-образе. Если файла нет
 /// (recovery-ramdisk) или размер другой — записываем. Потом PID1.
 pub fn init() {
-    const BINS: [(&str, &[u8]); 20] = [
+    const BINS: [(&str, &[u8]); 21] = [
         ("/bin/shell.elf", SHELL_ELF),
         ("/bin/hello.elf", HELLO_ELF),
         ("/bin/counter.elf", COUNTER_ELF),
@@ -819,6 +947,7 @@ pub fn init() {
         ("/bin/epoll.elf", EPOLL_ELF),
         ("/bin/interp.elf", INTERP_ELF),
         ("/bin/dyn.elf", DYN_ELF),
+        ("/bin/dsym.elf", DSYM_ELF),
         ("/bin/cred.elf", CRED_ELF),
         ("/bin/seccomp.elf", SECCOMP_ELF),
         ("/bin/init.elf", INIT_ELF),
@@ -1030,7 +1159,11 @@ fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapT
             .offset
             .checked_add(bias)
             .ok_or(MapToError::FrameAllocationFailed)?;
-        let val = rel.addend.wrapping_add(bias);
+        // RELATIVE: B + A. Символьные: S (+ A для R_X86_64_64) + B.
+        let val = rel
+            .addend
+            .wrapping_add(rel.sym.unwrap_or(0))
+            .wrapping_add(bias);
         write_user(l4, addr, &val.to_le_bytes())?;
     }
     Ok(())
@@ -2819,6 +2952,21 @@ pub fn lapic_timer_handler_addr() -> u64 {
 mod tests {
     use super::*;
     use crate::{serial_print, serial_println};
+
+    #[test_case]
+    fn dsym_reloc_resolves_exported_symbol() {
+        serial_print!("test dsym_reloc_resolves_exported_symbol... ");
+        let img = parse_elf64(DSYM_ELF).expect("dsym.elf");
+        assert!(img.kind == ElfKind::Dyn);
+        assert_eq!(img.relative.len(), 1);
+        let r = &img.relative[0];
+        // R_X86_64_64 на exported_fn: [slot] = S(0x1234) + A(0x10) + bias.
+        assert_eq!(r.offset, 0x210);
+        assert_eq!(r.addend, 0x10);
+        assert_eq!(r.sym, Some(0x1234));
+        assert_eq!(load_bias(&img, false), 0x400000);
+        serial_println!("[ok]");
+    }
 
     #[test_case]
     fn pt_interp_names_the_interpreter() {
