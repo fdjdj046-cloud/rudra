@@ -42,6 +42,18 @@ pub struct Signals {
     sa_flags: [u32; 32],
 }
 
+impl Signals {
+    /// Маска блокируемых сигналов (для `epoll_pwait` и соседей).
+    pub fn blocked_mask(&self) -> u64 {
+        self.mask
+    }
+
+    /// Установить маску. SIGKILL/SIGSTOP не блокируются никогда.
+    pub fn set_blocked_mask(&mut self, mask: u64) {
+        self.mask = mask & !(bit(SIGKILL) | bit(SIGSTOP));
+    }
+}
+
 enum Pop {
     Ignored,
     Fatal(u32),

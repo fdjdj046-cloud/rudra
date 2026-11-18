@@ -54,6 +54,39 @@ fn main() {
         println!("epoll-bad event {:#x} data {:#x}", got_ev, got_data);
         exit(8);
     }
+    // ET: тот же интерес с EPOLLET. Первый wait — фронт по новому байту.
+    // Второй wait без новых данных — 0 (level дал бы 1). После ещё одного
+    // байта — снова 1.
+    let mut ev_et = [0u8; 12];
+    ev_et[0..4].copy_from_slice(&(1u32 | 0x8000_0000).to_le_bytes());
+    ev_et[4..12].copy_from_slice(&rfd.to_le_bytes());
+    let rc = unsafe { syscall6(233, ep, 3, rfd, ev_et.as_ptr() as u64, 0, 0) };
+    if rc != 0 {
+        println!("epoll-bad mod-et {:#x}", rc);
+        exit(9);
+    }
+    // Дренируем pipe, чтобы следующий байт дал фронт.
+    let mut drain = [0u8; 1];
+    let rd = unsafe { syscall6(0, rfd, drain.as_mut_ptr() as u64, 1, 0, 0, 0) };
+    if rd != 1 {
+        println!("epoll-bad drain {:#x}", rd);
+        exit(10);
+    }
+    let wr = unsafe { syscall6(1, wfd, byte.as_ptr() as u64, 1, 0, 0, 0) };
+    if wr != 1 {
+        println!("epoll-bad write2 {:#x}", wr);
+        exit(11);
+    }
+    let n = unsafe { syscall6(232, ep, out.as_mut_ptr() as u64, 1, 0, 0, 0) };
+    if n != 1 {
+        println!("epoll-bad et-first {:#x}", n);
+        exit(12);
+    }
+    let n = unsafe { syscall6(232, ep, out.as_mut_ptr() as u64, 1, 0, 0, 0) };
+    if n != 0 {
+        println!("epoll-bad et-level {:#x}", n);
+        exit(13);
+    }
     println!("epoll-ok");
 }
 

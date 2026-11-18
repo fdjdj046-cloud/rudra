@@ -15,8 +15,8 @@
 //! возвращают `EINTR`. Чтение консоли — нет.
 //! Задача стартует как root (uid/gid 0). `setuid`/`setgid` меняют id.
 //! `seccomp` strict режет всё, кроме read, write, rt_sigreturn и exit.
-//! epoll — level-triggered по номеру fd: `EPOLLET` принимается и ведёт себя
-//! как level, `epoll_pwait` маску не ставит, poll самого epoll-fd пуст.
+//! epoll — level-triggered по номеру fd, `EPOLLET` даёт edge-триггер,
+//! `epoll_pwait` ставит временную маску сигналов, poll самого epoll-fd пуст.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
 //! CPU. Задача исполняется на CPU из `sched_setaffinity`. x2APIC нет.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
@@ -457,8 +457,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         }
         232 => sys_epoll_wait(a1, a2, a3, a4),
         233 => sys_epoll_ctl(a1, a2, a3, a4),
-        // epoll_pwait: sigmask не ставим, ждём так же, как epoll_wait.
-        281 => sys_epoll_wait(a1, a2, a3, a4),
+        // epoll_pwait: как epoll_wait, но с временной маской сигналов.
+        281 => sys_epoll_pwait(a1, a2, a3, a4, a5, a6),
         291 => sys_epoll_create(a1),
         8 => sys_lseek(a1, a2 as i64, a3),
         9 => task::sys_mmap(a1, a2, a3, a4, a5, a6),
@@ -2182,15 +2182,17 @@ fn poll_ready(fd: u64, events: i16) -> i16 {
 
 // ---- epoll ----
 //
-// Level-triggered. Интерес — номер fd в таблице задачи, не описание файла:
-// close этого номера снимает интерес, даже если остался dup. `EPOLLET`
-// принимается и не меняет поведение. Больше 16 наборов или 32 интересов —
-// ENOMEM. Таймаут дольше 60 с — EINVAL, чтобы зависший wait не выглядел
-// как рабочий epoll. `epoll_pwait` маску сигнала игнорирует.
+// Level-triggered по умолчанию; `EPOLLET` — edge: доставляется фронт
+// «не готово → готово» по снимку прошлой готовности. Интерес — номер fd
+// в таблице задачи, не описание файла: close этого номера снимает интерес,
+// даже если остался dup. Больше 16 наборов или 32 интересов — ENOMEM.
+// Таймаут дольше 60 с — EINVAL, чтобы зависший wait не выглядел как рабочий
+// epoll. `epoll_pwait` ставит временную маску сигналов на время ожидания.
 
 const EPOLL_MAX_SETS: usize = 16;
 const EPOLL_MAX_ITEMS: usize = 32;
 const EPOLLIN: u32 = 1;
+const EPOLLET: u32 = 0x8000_0000;
 const EPOLLOUT: u32 = 4;
 const EPOLL_CLOEXEC: u64 = 0x80000;
 
@@ -2204,6 +2206,9 @@ struct EpInterest {
 struct EpollSet {
     refs: usize,
     items: [Option<EpInterest>; EPOLL_MAX_ITEMS],
+    /// Последняя наблюдавшаяся готовность по слоту: для EPOLLET доставляем
+    /// только фронт 0 → готово.
+    last: [u32; EPOLL_MAX_ITEMS],
 }
 
 static EPOLLS: Mutex<Vec<Option<EpollSet>>> = Mutex::new(Vec::new());
@@ -2229,6 +2234,7 @@ fn epoll_alloc() -> Result<usize, u64> {
         let set = EpollSet {
             refs: 1,
             items: [None; EPOLL_MAX_ITEMS],
+            last: [0; EPOLL_MAX_ITEMS],
         };
         if let Some(i) = tab.iter().position(|s| s.is_none()) {
             tab[i] = Some(set);
@@ -2364,6 +2370,9 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
                     return ENOMEM;
                 };
                 set.items[free] = interest;
+                // ET считает регистрацию фронтом: сбрасываем прошлое
+                // состояние, чтобы готовый fd дал событие.
+                set.last[free] = 0;
                 0
             }
             DEL => {
@@ -2374,6 +2383,7 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
             MOD => {
                 let Some(i) = slot else { return ENOENT };
                 set.items[i] = interest;
+                set.last[i] = 0;
                 0
             }
             _ => EINVAL,
@@ -2382,6 +2392,44 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
 }
 
 fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    epoll_wait_core(epfd, events_ptr, maxevents, timeout)
+}
+
+/// `epoll_pwait`: ждёт с временной маской сигналов (SIGKILL/SIGSTOP
+/// разблокируемы, как в Linux: маска просто срезает биты).
+fn sys_epoll_pwait(
+    epfd: u64,
+    events_ptr: u64,
+    maxevents: u64,
+    timeout: u64,
+    sigmask: u64,
+    sigsz: u64,
+) -> u64 {
+    if sigsz != 8 {
+        return EINVAL;
+    }
+    let mut saved = None;
+    if sigmask != 0 {
+        let mut raw = [0u8; 8];
+        if !u_read(sigmask, &mut raw) {
+            return EFAULT;
+        }
+        // bit(sig) = 1 << (sig-1): SIGKILL 9, SIGSTOP 19.
+        let mask = u64::from_le_bytes(raw) & !((1 << 8) | (1 << 18));
+        saved = task::with_current_task(|t| {
+            let old = t.signals.blocked_mask();
+            t.signals.set_blocked_mask(mask);
+            old
+        });
+    }
+    let rc = epoll_wait_core(epfd, events_ptr, maxevents, timeout);
+    if let Some(old) = saved {
+        task::with_current_task(|t| t.signals.set_blocked_mask(old));
+    }
+    rc
+}
+
+fn epoll_wait_core(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
     let epfd = match arg_fd(epfd) {
         Ok(fd) => fd,
         Err(e) => return e,
@@ -2411,15 +2459,20 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             Ok(Err(e)) | Err(e) => return e,
         };
         let snap = with_epolls(|tab| {
-            tab.get(id).and_then(|s| s.as_ref()).map(|set| set.items)
+            tab.get(id)
+                .and_then(|s| s.as_ref())
+                .map(|set| (set.items, set.last))
         });
-        let Some(items) = snap else {
+        let Some((items, mut last)) = snap else {
             return EBADF;
         };
         let mut n = 0usize;
         let mut evs = [0u32; EPOLL_MAX_ITEMS];
         let mut data = [0u64; EPOLL_MAX_ITEMS];
-        for it in items.into_iter().flatten() {
+        for (i, it) in items.iter().enumerate() {
+            let Some(it) = it else {
+                continue;
+            };
             let want = (it.events & (EPOLLIN | EPOLLOUT)) as i16;
             let re = poll_ready(it.fd, want);
             let mut got = 0u32;
@@ -2429,7 +2482,11 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             if re & 4 != 0 {
                 got |= EPOLLOUT;
             }
-            if got != 0 {
+            // Состояние обновляем всегда; EPOLLET доставляет только фронт
+            // «не готово → готово».
+            let edge = got != last[i];
+            last[i] = got;
+            if got != 0 && (it.events & EPOLLET == 0 || edge) {
                 evs[n] = got;
                 data[n] = it.data;
                 n += 1;
@@ -2438,6 +2495,11 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
                 }
             }
         }
+        with_epolls(|tab| {
+            if let Some(set) = tab.get_mut(id).and_then(|s| s.as_mut()) {
+                set.last = last;
+            }
+        });
         let expired = match deadline {
             Some(d) => crate::interrupts::uptime_ms() >= d,
             None => false,
