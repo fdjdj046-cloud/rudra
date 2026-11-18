@@ -641,10 +641,18 @@ fn synth_body(name: &str) -> Option<String> {
             let ticks = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
             let (created, running) = crate::task::proc_counts();
             // user, nice и idle не считаем. Тики планировщика лежат в system.
-            Some(format!(
-                "cpu  0 0 {} 0 0 0 0 0 0 0\nprocesses {}\nprocs_running {}\n",
-                ticks, created, running
-            ))
+            let mut out = alloc::format!(
+                "cpu  0 0 {} 0 0 0 0 0 0 0\n",
+                ticks
+            );
+            let cpus = crate::smp::cpu_count().min(crate::cpu::MAX_CPUS as u32);
+            for c in 0..cpus {
+                let t = crate::interrupts::PER_CPU_TICKS[c as usize]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                out.push_str(&alloc::format!("cpu{} 0 0 {} 0 0 0 0 0 0 0\n", c, t));
+            }
+            out.push_str(&alloc::format!("processes {}\nprocs_running {}\n", created, running));
+            Some(out)
         }
         "/proc/self/status" => Some(crate::task::proc_self_status()),
         "/proc/self/cmdline" => Some(crate::task::proc_self_cmdline()),

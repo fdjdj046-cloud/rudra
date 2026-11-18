@@ -14,6 +14,10 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 /// иначе IRQ0 PIT (~18.2 Гц).
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Тики по CPU (для `cpuN` в `/proc/stat` и наблюдаемости балансировки).
+pub static PER_CPU_TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+
 /// Аптайм в миллисекундах по TSC. `TICKS` — счётчик тиков планировщика, не часы.
 pub fn uptime_ms() -> u64 {
     crate::time::monotonic_ns() / 1_000_000

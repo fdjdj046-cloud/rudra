@@ -847,6 +847,9 @@ pub struct Task {
     pub gs_base: u64,
     /// Единственный CPU, на котором задаче разрешено исполняться.
     pub cpu: u32,
+    /// `true` — CPU выбрал пользователь через `sched_setaffinity`: ядро его
+    /// не переназначает и не ворует. `false` — ядро балансирует само.
+    pub affinity_set: bool,
     /// Кто сейчас её исполняет. -1 — никто.
     pub on_cpu: i8,
     /// Адрес для CLONE_CHILD_CLEARTID: при exit записать 0 и разбудить futex.
@@ -1358,6 +1361,32 @@ pub fn load_elf_image(
 }
 
 /// Kernel-стек в куче. База запоминается в задаче и освобождается в Drop.
+/// Крутилка раскидки новых задач между равно нагруженными CPU.
+static PICK_ROTATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// CPU с наименьшим числом Runnable-задач; равенство — round-robin.
+fn pick_cpu() -> u32 {
+    let n = crate::smp::cpu_count().max(1);
+    let start = (PICK_ROTATE.fetch_add(1, Ordering::Relaxed) as u32) % n;
+    let mut best = 0u32;
+    let mut best_load = u32::MAX;
+    with_tasks(|tasks| {
+        for k in 0..n {
+            let c = (start + k) % n;
+            let load = tasks
+                .iter()
+                .flatten()
+                .filter(|t| t.cpu == c && t.state == TaskState::Runnable)
+                .count() as u32;
+            if load < best_load {
+                best_load = load;
+                best = c;
+            }
+        }
+    });
+    best
+}
+
 fn alloc_kernel_stack() -> (u64, u64) {
     let kstack: Box<[u8]> = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
     let base = kstack.as_ptr() as u64;
@@ -1429,7 +1458,8 @@ fn finish_task(
         thread: false,
         fs_base: 0,
         gs_base: 0,
-        cpu: 0,
+        cpu: pick_cpu(),
+        affinity_set: false,
         on_cpu: -1,
         clear_tid: 0,
         rseq: 0,
@@ -1785,6 +1815,7 @@ pub fn sys_clone(
             parent_cred,
             parent_seccomp,
             parent_cpu,
+            parent_affinity_set,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
             let parent_fsctx = p.fsctx.clone();
@@ -1808,8 +1839,17 @@ pub fn sys_clone(
                 p.cred,
                 p.seccomp,
                 p.cpu,
+                p.affinity_set,
             )
         });
+
+        // Унаследованная привязка уважается; свободный ребёнок уходит на
+        // сейчас наименее загруженный CPU.
+        let child_cpu = if parent_affinity_set {
+            parent_cpu
+        } else {
+            pick_cpu()
+        };
 
         let child_as = if flags & CLONE_VM != 0 {
             parent_as.clone()
@@ -1904,7 +1944,8 @@ pub fn sys_clone(
             thread: flags & CLONE_VM != 0,
             fs_base: if flags & CLONE_SETTLS != 0 { tls } else { parent_fs },
             gs_base: crate::cpu::read_user_gs(),
-            cpu: parent_cpu,
+            cpu: child_cpu,
+            affinity_set: parent_affinity_set,
             on_cpu: -1,
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
             rseq: 0,
@@ -2252,6 +2293,7 @@ pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
             return crate::linux::ESRCH;
         };
         t.cpu = cpu;
+        t.affinity_set = true;
         0
     })
 }
@@ -2523,6 +2565,10 @@ extern "C" fn timer_switch(current_rsp: u64) -> u64 {
 #[no_mangle]
 extern "C" fn lapic_timer_switch(current_rsp: u64) -> u64 {
     crate::interrupts::TICKS.fetch_add(1, Ordering::Relaxed);
+    let me = crate::smp::this_cpu();
+    if me < crate::cpu::MAX_CPUS {
+        crate::interrupts::PER_CPU_TICKS[me].fetch_add(1, Ordering::Relaxed);
+    }
     crate::apic::eoi();
     schedule(current_rsp)
 }
@@ -2740,6 +2786,22 @@ fn schedule(current_rsp: u64) -> u64 {
                 }
                 found = Some(i);
                 break;
+            }
+            // Локальных нет — воруем чужую свободную задачу: не привязанную
+            // пользователем и не исполняющуюся прямо сейчас. Привязанные
+            // (sched_setaffinity) и кадры в ядре чужого CPU не трогаем.
+            if found.is_none() {
+                for i in 0..n {
+                    let Some(t) = tasks[i].as_ref() else {
+                        continue;
+                    };
+                    if t.state != TaskState::Runnable || t.affinity_set || t.on_cpu >= 0 {
+                        continue;
+                    }
+                    tasks[i].as_mut().expect("checked").cpu = me as u32;
+                    found = Some(i);
+                    break;
+                }
             }
             found
         };
