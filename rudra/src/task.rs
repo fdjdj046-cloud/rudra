@@ -2622,10 +2622,11 @@ pub fn sys_rseq(addr: u64, len: u64, flags: u64, sig: u64) -> u64 {
     }
 }
 
-fn rseq_preempt(slot: usize, kernel_rsp: u64) {
-    let Some(ip) = timer_user_rip(kernel_rsp) else {
-        return;
-    };
+/// Общая часть обрыва rseq-критической секции: `ip` внутри `[start,
+/// start+post)` и abort-заглушка с подписью на месте. Обнуляет cs-указатель
+/// и возвращает abort-ip. `flags & 1` (NO_RESTART_ON_PREEMPT) отменяет
+/// обрыв при вытеснении; syscall-обрыв флага не уважает — Linux-семантика.
+fn rseq_try_abort(slot: usize, ip: u64, honor_no_restart: bool) -> Option<u64> {
     let (addr, sig) = match with_tasks(|tasks| {
         tasks
             .get(slot)
@@ -2633,7 +2634,7 @@ fn rseq_preempt(slot: usize, kernel_rsp: u64) {
             .map(|t| (t.rseq, t.rseq_sig))
     }) {
         Some((addr, sig)) if addr != 0 => (addr, sig),
-        _ => return,
+        _ => return None,
     };
     let zeros = 0u32.to_le_bytes();
     let mut ids = [0u8; 8];
@@ -2643,15 +2644,15 @@ fn rseq_preempt(slot: usize, kernel_rsp: u64) {
 
     let mut cs_ptr_raw = [0u8; 8];
     if !user_read(addr + 8, &mut cs_ptr_raw) {
-        return;
+        return None;
     }
     let cs_ptr = u64::from_le_bytes(cs_ptr_raw);
     if cs_ptr == 0 {
-        return;
+        return None;
     }
     let mut cs = [0u8; 32];
     if !user_read(cs_ptr, &mut cs) {
-        return;
+        return None;
     }
     let flags = u32::from_le_bytes([cs[4], cs[5], cs[6], cs[7]]);
     let mut start_raw = [0u8; 8];
@@ -2664,21 +2665,50 @@ fn rseq_preempt(slot: usize, kernel_rsp: u64) {
     let post = u64::from_le_bytes(post_raw);
     let abort = u64::from_le_bytes(abort_raw);
     let in_cs = post > 0 && ip >= start && ip.wrapping_sub(start) < post;
-    let no_preempt_restart = flags & 1 != 0;
-    if in_cs && !no_preempt_restart {
-        if abort < 4 {
-            return;
-        }
-        let mut mark = [0u8; 4];
-        if !user_read(abort - 4, &mut mark) || u32::from_le_bytes(mark) != sig {
-            return;
-        }
+    let no_restart = flags & 1 != 0;
+    if !in_cs || (honor_no_restart && no_restart) {
+        // Не в критической секции: только сброс cs-указателя (как раньше).
+        let z = 0u64.to_le_bytes();
+        let _ = user_write(addr + 8, &z);
+        return None;
+    }
+    if abort < 4 {
+        return None;
+    }
+    let mut mark = [0u8; 4];
+    if !user_read(abort - 4, &mut mark) || u32::from_le_bytes(mark) != sig {
+        return None;
+    }
+    let z = 0u64.to_le_bytes();
+    let _ = user_write(addr + 8, &z);
+    Some(abort)
+}
+
+fn rseq_preempt(slot: usize, kernel_rsp: u64) {
+    let Some(ip) = timer_user_rip(kernel_rsp) else {
+        return;
+    };
+    if let Some(abort) = rseq_try_abort(slot, ip, true) {
         unsafe {
             core::ptr::write_unaligned((kernel_rsp + 120) as *mut u64, abort);
         }
     }
-    let z = 0u64.to_le_bytes();
-    let _ = user_write(addr + 8, &z);
+}
+
+/// Обрыв критической секции на входе в syscall: rip в syscall-фрейме
+/// переносится на abort-обработчик. Linux-семантика: syscall из cs
+/// перезапускает последовательность.
+pub fn rseq_syscall_abort(frame: *mut u64) {
+    let slot = current_slot();
+    if slot < 0 {
+        return;
+    }
+    let ip = unsafe { core::ptr::read_unaligned(frame.add(FRAME::RIP)) };
+    if let Some(abort) = rseq_try_abort(slot as usize, ip, false) {
+        unsafe {
+            core::ptr::write_unaligned(frame.add(FRAME::RIP), abort);
+        }
+    }
 }
 
 fn frame_is_user(kernel_rsp: u64) -> bool {

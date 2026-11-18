@@ -424,6 +424,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         // Не ENOSYS: процесс умирает, запрещённый вызов не выполняется.
         task::sys_exit(128 + 9);
     }
+    // rseq: syscall из критической секции обрывает её (rip → abort handler).
+    task::rseq_syscall_abort(frame);
     match nr {
         0 => sys_read(a1, a2, a3),
         1 => sys_write(a1, a2, a3),
