@@ -89,7 +89,13 @@ pub fn init() {
         }
         Err(e) => {
             crate::serial_println!("[virtio-net] no device ({})", e);
+            return;
         }
+    }
+    // Адрес с карты появляется при загрузке, а не по первому запросу.
+    // Без сети в QEMU (тестовые образы) просто отмечаем неудачу и живём дальше.
+    if let Err(e) = dhcp() {
+        crate::serial_println!("[net] dhcp on boot failed: {}", e);
     }
 }
 
