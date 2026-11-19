@@ -73,6 +73,8 @@ pub fn init(boot_info: &mut BootInfo) {
     time::init_realtime();
     apic::start_timer();
     smp::start(trampoline, boot_info.rsdp_addr.into_option());
+    // AP подняты через INIT-SIPI по xAPIC — теперь можно перейти на MSR.
+    apic::enable_x2apic();
 
     // Ramdisk из rootfs (после кучи: нужен 256 KiB буфер).
     fs::init();

@@ -1,9 +1,10 @@
 //! Локальный APIC загрузочного процессора.
 //!
-//! Читаем базу из `IA32_APIC_BASE`, отображаем MMIO одной страницей и
-//! забираем id с version. x2APIC не включаем. Если прошивка уже подняла x2APIC,
-//! id берём из MSR, потому что MMIO в этом режиме отключено, и старт AP
-//! пропускается: IPI ниже ходят через xAPIC ICR.
+//! База — из `IA32_APIC_BASE`. Поддерживается x2APIC (CPUID.1:ECX[21]):
+//! включается битом 10 того же MSR, после чего MMIO отключается и все
+//! регистры ходят через MSR `0x800 + (offset >> 4)`; ICR — единый 64-битный
+//! MSR `0x830` с destination в старшей половине, без ожидания pending-бита.
+//! Без поддержки в CPU — прежний MMIO-путь одной страницей.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::registers::model_specific::Msr;
@@ -12,6 +13,8 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const IA32_APIC_BASE: u32 = 0x1B;
 const IA32_X2APIC_APICID: u32 = 0x802;
+const X2APIC_MSR_BASE: u32 = 0x800;
+const X2APIC_ICR: u32 = 0x830;
 /// Сразу за кучей `0x4444_4444_0000` + 48 МиБ, одна страница.
 const APIC_VIRT: u64 = 0x4444_4800_0000;
 
@@ -36,13 +39,27 @@ pub fn id() -> u32 {
     APIC_ID.load(Ordering::Relaxed)
 }
 
+/// Этот CPU в x2APIC-режиме (бит 10 IA32_APIC_BASE). Читаем сам MSR, а не
+/// разделяемый флаг: режим у каждого CPU свой, и флаг соседа сломал бы
+/// wrmsr на 0x830 тем, кто ещё на xAPIC MMIO.
+fn x2_mode() -> bool {
+    (unsafe { Msr::new(IA32_APIC_BASE).read() } & (1 << 10)) != 0
+}
+
 /// Id локального APIC того CPU, который выполняет чтение. `id` — кэш BSP.
 pub fn local_id() -> u32 {
-    if MMIO.load(Ordering::Relaxed) {
+    if x2_mode() {
+        unsafe { Msr::new(IA32_X2APIC_APICID).read() as u32 }
+    } else if MMIO.load(Ordering::Relaxed) {
         read32(0x20) >> 24
     } else {
         APIC_ID.load(Ordering::Relaxed)
     }
+}
+
+/// x2APIC-путь активен на этом CPU: регистры только через MSR.
+pub fn x2apic() -> bool {
+    x2_mode()
 }
 
 pub fn timer_count() -> u32 {
@@ -73,16 +90,21 @@ pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Siz
         base |= 1 << 11;
         unsafe { msr.write(base) };
     }
-    let x2apic = base & (1 << 10) != 0;
-    let phys = base & 0xFFFF_F000;
+    let x2_on = base & (1 << 10) != 0;
 
-    if x2apic {
+    if x2_on {
+        // Прошивка уже подняла x2APIC (MMIO отключено): работаем через MSR.
         let id = unsafe { Msr::new(IA32_X2APIC_APICID).read() } as u32;
+        let version = unsafe { Msr::new(X2APIC_MSR_BASE + (0x30 >> 4)).read() } as u32 & 0xFF;
         APIC_ID.store(id, Ordering::Relaxed);
+        APIC_VERSION.store(version, Ordering::Relaxed);
         PRESENT.store(true, Ordering::Relaxed);
-        crate::serial_println!("[apic] x2apic bsp {} id {} (APs not started)", bsp, id);
+        MMIO.store(true, Ordering::Relaxed);
+        crate::serial_println!("[apic] x2apic bsp {} id {} version {:#x}", bsp, id, version);
         return;
     }
+
+    let phys = base & 0xFFFF_F000;
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(APIC_VIRT));
     let frame = match PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(phys)) {
@@ -121,6 +143,25 @@ pub fn init(mapper: &mut impl Mapper<Size4KiB>, fa: &mut impl FrameAllocator<Siz
         id,
         version
     );
+}
+
+/// Переключить локальный APIC этого CPU в x2APIC-режим. Вызывать только
+/// ПОСЛЕ старта всех AP: INIT IPI в x2-режиме не поддерживается, поэтому
+/// порядок как в Linux — INIT-SIPI-SIPI по xAPIC, затем переход на MSR.
+/// Конфигурация LVT и таймера переживает переключение.
+pub fn enable_x2apic() {
+    if x2_mode() {
+        return;
+    }
+    let supported = unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 21) != 0;
+    if !supported || !MMIO.load(Ordering::Relaxed) {
+        crate::serial_println!("[apic] x2apic unsupported, staying on xapic mmio");
+        return;
+    }
+    let mut msr = Msr::new(IA32_APIC_BASE);
+    let base = unsafe { msr.read() };
+    unsafe { msr.write(base | (1 << 10)) };
+    crate::serial_println!("[apic] x2apic enabled on cpu {}", crate::smp::this_cpu());
 }
 
 /// Включить периодический таймер ~250 Гц и замаскировать IRQ0 PIT.
@@ -264,6 +305,10 @@ pub fn eoi() {
 }
 
 fn wait_icr() -> bool {
+    // x2APIC: MSR-записи ICR завершаются до возврата из wrmsr, pending-бита нет.
+    if x2_mode() {
+        return true;
+    }
     for _ in 0..1_000_000 {
         if read32(0x300) & (1 << 12) == 0 {
             return true;
@@ -273,9 +318,17 @@ fn wait_icr() -> bool {
     false
 }
 
-/// INIT IPI одному APIC id. xAPIC, destination в старшем байте ICR.
+/// INIT IPI одному APIC id. xAPIC — destination в старшем байте ICR,
+/// x2APIC — в старшей половине ICR-MSR.
 pub fn send_init(dest: u32) -> bool {
-    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+    if !MMIO.load(Ordering::Relaxed) || !wait_icr() {
+        return false;
+    }
+    if x2_mode() {
+        unsafe { Msr::new(X2APIC_ICR).write((u64::from(dest) << 32) | 0x4500) };
+        return true;
+    }
+    if dest > 0xFF {
         return false;
     }
     write32(0x310, dest << 24);
@@ -285,7 +338,14 @@ pub fn send_init(dest: u32) -> bool {
 
 /// SIPI. `vector` — физическая страница трамплина >> 12.
 pub fn send_startup(dest: u32, vector: u8) -> bool {
-    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+    if !MMIO.load(Ordering::Relaxed) || !wait_icr() {
+        return false;
+    }
+    if x2_mode() {
+        unsafe { Msr::new(X2APIC_ICR).write((u64::from(dest) << 32) | 0x4600 | u64::from(vector)) };
+        return true;
+    }
+    if dest > 0xFF {
         return false;
     }
     write32(0x310, dest << 24);
@@ -295,7 +355,16 @@ pub fn send_startup(dest: u32, vector: u8) -> bool {
 
 /// Обычный IPI (fixed, physical, edge).
 pub fn send_fixed(dest: u32, vector: u8) -> bool {
-    if !MMIO.load(Ordering::Relaxed) || dest > 0xFF || !wait_icr() {
+    if !MMIO.load(Ordering::Relaxed) || !wait_icr() {
+        return false;
+    }
+    if x2_mode() {
+        unsafe {
+            Msr::new(X2APIC_ICR).write((u64::from(dest) << 32) | u64::from(vector) | (1 << 14))
+        };
+        return true;
+    }
+    if dest > 0xFF {
         return false;
     }
     write32(0x310, dest << 24);
@@ -304,11 +373,19 @@ pub fn send_fixed(dest: u32, vector: u8) -> bool {
 }
 
 fn read32(offset: u64) -> u32 {
-    unsafe { core::ptr::read_volatile((APIC_VIRT + offset) as *const u32) }
+    if x2_mode() {
+        unsafe { Msr::new(X2APIC_MSR_BASE + (offset as u32 >> 4)).read() as u32 }
+    } else {
+        unsafe { core::ptr::read_volatile((APIC_VIRT + offset) as *const u32) }
+    }
 }
 
 fn write32(offset: u64, value: u32) {
-    unsafe { core::ptr::write_volatile((APIC_VIRT + offset) as *mut u32, value) }
+    if x2_mode() {
+        unsafe { Msr::new(X2APIC_MSR_BASE + (offset as u32 >> 4)).write(u64::from(value)) };
+    } else {
+        unsafe { core::ptr::write_volatile((APIC_VIRT + offset) as *mut u32, value) };
+    }
 }
 
 #[cfg(test)]

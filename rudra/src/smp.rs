@@ -342,6 +342,8 @@ extern "C" fn ap_main(index: u64) -> ! {
     let (frame, _) = Cr3::read();
     KERNEL_CR3[index].store(frame.start_address().as_u64(), Ordering::Relaxed);
     crate::apic::arm_ap_timer();
+    // INIT-SIPI больше не нужны: переключаем этот AP на x2APIC (MSR-интерфейс).
+    crate::apic::enable_x2apic();
     ONLINE.fetch_add(1, Ordering::Release);
     x86_64::instructions::interrupts::enable();
     loop {
