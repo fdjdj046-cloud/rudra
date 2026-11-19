@@ -295,6 +295,41 @@ pub fn pump() {
         };
         handle_frame(&buf[..n]);
     }
+    tcp_retransmit();
+}
+
+/// Повтор неподтверждённого: головной сегмент каждого сокета, у которого
+/// RTO вышел. За RTO_TC попыток без ACK — разрыв (eof), как таймаут читателя.
+const RTO_NS: u64 = 500_000_000;
+const RTO_TC: u8 = 8;
+
+fn tcp_retransmit() {
+    let now = crate::time::monotonic_ns();
+    let mut jobs: Vec<(u32, u16, u32, u16, u32, u32, Vec<u8>)> = Vec::new();
+    with_tcp(|tab| {
+        for s in tab.iter_mut().flatten() {
+            if !s.wire || !s.estab || s.unacked.is_empty() {
+                continue;
+            }
+            let due = s.unacked.iter_mut().find(|(_, _, last)| {
+                now.saturating_sub(*last) > RTO_NS
+            });
+            let Some((seq, data, last)) = due else { continue };
+            *last = now;
+            s.rtx = s.rtx.saturating_add(1);
+            if s.rtx >= RTO_TC {
+                // Пир молчит слишком долго: закрываем передачу.
+                s.eof = true;
+                s.estab = false;
+                s.unacked.clear();
+                continue;
+            }
+            jobs.push((s.addr, s.port, s.peer_addr, s.peer_port, *seq, s.rnext, data.clone()));
+        }
+    });
+    for (a, p, pa, pp, seq, ack, data) in jobs {
+        let _ = send_tcp(a, p, pa, pp, seq, ack, TH_ACK | TH_PSH, &data);
+    }
 }
 
 pub fn our_ip() -> u32 {
@@ -753,6 +788,11 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                 rx: Vec::new(),
                 eof: false,
                 nonblock: false,
+                unacked: Vec::new(),
+                win: TCP_RX as u32,
+                reorder: Vec::new(),
+                reorder_fin: false,
+                rtx: 0,
             });
             tab[lid].as_mut().unwrap().backlog.push(child);
             // SYN-ACK: seq = наш ISN, ack = их seq + 1.
@@ -786,15 +826,26 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                     s.estab = true;
                     s.seq = s.seq.wrapping_add(1);
                     s.rnext = rx_seq.wrapping_add(1);
+                    s.win = u32::from(be16(frame, t + 14));
                     reply = Some((s.seq, s.rnext, TH_ACK, Vec::new()));
                 }
             } else if flags & TH_ACK != 0 && !s.estab {
-                // Третий шаг на SYN-Received дочернего сокета.
+                    // Третий шаг на SYN-Received дочернего сокета.
                 if rx_ack == s.seq.wrapping_add(1) {
                     s.estab = true;
                     s.seq = s.seq.wrapping_add(1);
+                    s.win = u32::from(be16(frame, t + 14));
                 }
             } else if s.estab {
+                // ACK: снимаем подтверждённое с inflight, запоминаем окно.
+                if flags & TH_ACK != 0 {
+                    s.win = u32::from(be16(frame, t + 14));
+                    s.unacked
+                        .retain(|(sq, d, _)| rx_ack.wrapping_sub(*sq) < d.len() as u32);
+                    if s.unacked.is_empty() {
+                        s.rtx = 0;
+                    }
+                }
                 if rx_seq == s.rnext {
                     if !payload.is_empty() {
                         let space = TCP_RX.saturating_sub(s.rx.len());
@@ -802,13 +853,44 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                         s.rx.extend_from_slice(&payload[..n]);
                         s.rnext = s.rnext.wrapping_add(n as u32);
                     }
+                    // Закрыть дыру внеочередными сегментами, что накопились.
+                    loop {
+                        let hit = s
+                            .reorder
+                            .iter()
+                            .position(|(sq, _)| *sq == s.rnext);
+                        let Some(i) = hit else { break };
+                        let (_, data) = s.reorder.remove(i);
+                        let space = TCP_RX.saturating_sub(s.rx.len());
+                        let n = space.min(data.len());
+                        s.rx.extend_from_slice(&data[..n]);
+                        s.rnext = s.rnext.wrapping_add(n as u32);
+                    }
+                    if s.reorder.is_empty() && s.reorder_fin {
+                        // Дыра закрыта, ждущий FIN занимает следующий номер.
+                        s.reorder_fin = false;
+                        s.eof = true;
+                        s.rnext = s.rnext.wrapping_add(1);
+                    }
                     if flags & TH_FIN != 0 {
                         s.eof = true;
                         s.rnext = s.rnext.wrapping_add(1);
                     }
                     reply = Some((s.seq, s.rnext, TH_ACK, Vec::new()));
                 } else {
-                    // Вне порядка: dupack с тем, что ждём.
+                    // Вне очядь (или старый дубликат): прячем сегмент в
+                    // reorder в пределах окна, просим дыру dupack'ом.
+                    let ahead = rx_seq.wrapping_sub(s.rnext) as usize;
+                    if flags & (TH_PSH | TH_FIN) != 0 && ahead > 0 {
+                        let held: usize = s.reorder.iter().map(|(_, d)| d.len()).sum();
+                        if held + payload.len() <= TCP_RX {
+                            s.reorder.push((rx_seq, payload.to_vec()));
+                        }
+                        if flags & TH_FIN != 0 {
+                            // FIN вне очереди: закроется, когда дыру дотянут.
+                            s.reorder_fin = true;
+                        }
+                    }
                     reply = Some((s.seq, s.rnext, TH_ACK, Vec::new()));
                 }
             }
@@ -1099,6 +1181,17 @@ struct TcpSock {
     backlog: Vec<usize>,
     rx: Vec<u8>,
     eof: bool,
+    /// Провод: неподтверждённые исходящие сегменты (seq, данные, когда
+    /// отправлены в последний раз). Пусто у сокетов петли.
+    unacked: Vec<(u32, Vec<u8>, u64)>,
+    /// Скользящее окно пира из последнего ACK (наш приём — TCP_RX).
+    win: u32,
+    /// Провод: внеочередные сегменты (seq > rnext), ждут закрытия дыры.
+    reorder: Vec<(u32, Vec<u8>)>,
+    /// FIN пришёл вне очереди: eof ставим, когда дыру дотянут.
+    reorder_fin: bool,
+    /// Счётчик ретрансмиссий: за пределами — разрыв (eof).
+    rtx: u8,
 }
 
 static TCP_TAB: Mutex<[Option<TcpSock>; TCP_N]> = Mutex::new([
@@ -1129,6 +1222,11 @@ fn tcp_fresh(nonblock: bool) -> TcpSock {
         backlog: Vec::new(),
         rx: Vec::new(),
         eof: false,
+        unacked: Vec::new(),
+        win: TCP_RX as u32,
+        reorder: Vec::new(),
+        reorder_fin: false,
+        rtx: 0,
     }
 }
 
@@ -1472,6 +1570,11 @@ pub fn tcp_connect(id: usize, dst_ip: u32, dst_port: u16) -> Result<(), i32> {
             backlog: Vec::new(),
             rx: Vec::new(),
             eof: false,
+            unacked: Vec::new(),
+            win: TCP_RX as u32,
+            reorder: Vec::new(),
+            reorder_fin: false,
+            rtx: 0,
         });
         {
             let s = tab[id].as_mut().unwrap();
@@ -1526,20 +1629,32 @@ pub fn tcp_send(id: usize, data: &[u8]) -> Result<usize, i32> {
             return Err(ENOTCONN);
         }
         if wire {
-            // Провод: PSH|ACK с нашим seq, пир подтвердит (подтверждения
-            // не ждём — повторов нет). Окно — один сегмент за вызов.
+            // Провод: PSH|ACK в пределах окна пира. Неподтверждённое копится
+            // в unacked — pump() повторяет по таймауту, пока ACK не догонит.
             if eof {
                 return Err(EPIPE);
             }
             if !estab {
                 return Err(ENOTCONN);
             }
-            let n = data.len().min(1280);
+            let now = crate::time::monotonic_ns();
             let s = tab[id].as_mut().unwrap();
-            let r = send_tcp(s.addr, s.port, s.peer_addr, s.peer_port, s.seq, s.rnext, TH_ACK | TH_PSH, &data[..n]);
+            let inflight: u32 = s.unacked.iter().map(|(_, d, _)| d.len() as u32).sum();
+            if s.win == 0 {
+                // Нулевое окно: ждём window update (пока — EAGAIN).
+                return Err(EAGAIN);
+            }
+            let avail = s.win.saturating_sub(inflight) as usize;
+            let n = data.len().min(1280).min(avail);
+            if n == 0 {
+                return Err(EAGAIN);
+            }
+            let seq = s.seq;
+            let r = send_tcp(s.addr, s.port, s.peer_addr, s.peer_port, seq, s.rnext, TH_ACK | TH_PSH, &data[..n]);
             match r {
                 Ok(()) => {
                     s.seq = s.seq.wrapping_add(n as u32);
+                    s.unacked.push((seq, data[..n].to_vec(), now));
                     Ok(n)
                 }
                 Err(e) => Err(e),
