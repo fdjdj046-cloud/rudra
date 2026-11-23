@@ -18,6 +18,8 @@
 //! Номер 1024 — резолвер ленивого PLT: он идёт до фильтра и пишет только
 //! уже посчитанный адрес в известный слот GOT.
 //! epoll — level и edge по номеру fd. poll и select видят готовый epoll-fd.
+//! `FD_CLOEXEC` хранится на номере: `O_CLOEXEC`, `SOCK_CLOEXEC`, `EPOLL_CLOEXEC`,
+//! `pipe2` и `fcntl(F_SETFD)`. `execve` такие номера закрывает.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
@@ -26,6 +28,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -134,21 +137,81 @@ impl Fd {
     }
 }
 
-fn alloc_fd(slot: &mut Option<Fd>, fds: &mut Vec<Option<Fd>>) -> u64 {
-    for (i, f) in fds.iter_mut().enumerate() {
-        if f.is_none() {
-            *f = slot.take();
-            return i as u64;
+/// Таблица дескрипторов одной задачи, не больше 64 номеров.
+/// Бит `cloexec` — `FD_CLOEXEC` этого номера.
+pub struct Fds {
+    v: Vec<Option<Fd>>,
+    cloexec: u64,
+}
+
+impl Fds {
+    pub fn new(v: Vec<Option<Fd>>) -> Self {
+        Self { v, cloexec: 0 }
+    }
+
+    /// Fork без `CLONE_FILES`. Биты копируются. pipe, сокет и epoll
+    /// получают ещё одну ссылку, как `clone_fd`.
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            v: self
+                .v
+                .iter()
+                .map(|f| f.as_ref().map(|f| f.clone_fd()))
+                .collect(),
+            cloexec: self.cloexec,
         }
+    }
+
+    pub fn set_cloexec(&mut self, fd: u64, on: bool) {
+        if fd >= 64 {
+            return;
+        }
+        let bit = 1u64 << (fd as u32);
+        if on {
+            self.cloexec |= bit;
+        } else {
+            self.cloexec &= !bit;
+        }
+    }
+
+    pub fn is_cloexec(&self, fd: u64) -> bool {
+        fd < 64 && self.cloexec & (1u64 << (fd as u32)) != 0
+    }
+
+    pub fn cloexec_bits(&self) -> u64 {
+        self.cloexec
+    }
+}
+
+impl Deref for Fds {
+    type Target = Vec<Option<Fd>>;
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl DerefMut for Fds {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v
+    }
+}
+
+fn alloc_fd(slot: &mut Option<Fd>, fds: &mut Fds, cloexec: bool) -> u64 {
+    if let Some(i) = fds.iter().position(|f| f.is_none()) {
+        fds[i] = slot.take();
+        fds.set_cloexec(i as u64, cloexec);
+        return i as u64;
     }
     if fds.len() >= 64 {
         return EMFILE;
     }
     fds.push(slot.take());
-    (fds.len() - 1) as u64
+    let i = (fds.len() - 1) as u64;
+    fds.set_cloexec(i, cloexec);
+    i
 }
 
-fn with_current_fds<R>(f: impl FnOnce(&mut Vec<Option<Fd>>) -> R) -> Result<R, u64> {
+fn with_current_fds<R>(f: impl FnOnce(&mut Fds) -> R) -> Result<R, u64> {
     let fds = task::with_current_task(|t| t.fds.clone())
         .ok_or(EPERM)?;
     let mut guard = fds.lock();
@@ -190,7 +253,7 @@ fn pipe_chan_add_ref(id: usize, writable: bool) {
     }
 }
 
-fn new_pipe() -> (u64, u64) {
+fn new_pipe(cloexec: bool) -> (u64, u64) {
     let mut pipes = PIPES.lock();
     let chan = PipeChan {
         ring: Box::new([0u8; PIPE_CAP]),
@@ -203,9 +266,9 @@ fn new_pipe() -> (u64, u64) {
     pipes.push(Some(chan));
     let r = with_current_fds(|fds| {
         let mut r = Some(Fd::Pipe { id, writable: false });
-        let rfd = alloc_fd(&mut r, fds);
+        let rfd = alloc_fd(&mut r, fds, cloexec);
         let mut w = Some(Fd::Pipe { id, writable: true });
-        let wfd = alloc_fd(&mut w, fds);
+        let wfd = alloc_fd(&mut w, fds, cloexec);
         (rfd, wfd)
     });
     match r {
@@ -488,7 +551,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 None => ENOENT,
             }
         }
-        22 | 293 => sys_pipe(a1),
+        22 => sys_pipe(a1, 0),
+        293 => sys_pipe(a1, a2),
         23 => sys_select(a1, a2, a3, a4, a5),
         24 => 0, // sched_yield: PIT и так вытесняет
         28 => 0, // madvise
@@ -947,6 +1011,7 @@ fn sys_socket(domain: u64, typ: u64, proto: u64) -> u64 {
     let flags = typ & (SOCK_NONBLOCK | SOCK_CLOEXEC);
     let kind = typ & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
     let nonblock = flags & SOCK_NONBLOCK != 0;
+    let cloexec = flags & SOCK_CLOEXEC != 0;
     let (id, slot_fd) = if kind == SOCK_STREAM {
         if proto != 0 && proto != 6 {
             return EPROTONOSUPPORT;
@@ -969,7 +1034,7 @@ fn sys_socket(domain: u64, typ: u64, proto: u64) -> u64 {
     let id_close = id;
     let is_tcp = matches!(slot_fd, Fd::Tcp { .. });
     let mut slot = Some(slot_fd);
-    match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
+    match with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)) {
         Ok(fd) if fd == EMFILE => {
             if is_tcp {
                 crate::net::tcp_close(id_close);
@@ -1036,7 +1101,7 @@ fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
         match crate::net::tcp_accept(id) {
             Ok((child, ip, port)) => {
                 let mut slot = Some(Fd::Tcp { id: child });
-                match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
+                match with_current_fds(|fds| alloc_fd(&mut slot, fds, false)) {
                     Ok(nfd) if nfd == EMFILE => {
                         crate::net::tcp_close(child);
                         return EMFILE;
@@ -1524,6 +1589,7 @@ fn sys_close(fd: u64) -> u64 {
         if fd as usize >= fds.len() {
             return None;
         }
+        fds.set_cloexec(fd, false);
         fds[fd as usize].take()
     });
     let obj = match taken {
@@ -1555,6 +1621,20 @@ fn sys_close(fd: u64) -> u64 {
     match flushed {
         Ok(()) => 0,
         Err(e) => fs_err(e),
+    }
+}
+
+/// `execve` закрывает номера с `FD_CLOEXEC`. Образ уже принят: неудачный
+/// exec сюда не доходит и дескрипторы не трогает.
+pub fn close_on_exec() {
+    let bits = match with_current_fds(|fds| fds.cloexec_bits()) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    for i in 0..64 {
+        if bits & (1u64 << i) != 0 {
+            let _ = sys_close(i as u64);
+        }
     }
 }
 
@@ -1590,6 +1670,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
     const O_TRUNC: u64 = 0x200;
     const O_APPEND: u64 = 0x400;
     const O_DIRECTORY: u64 = 0x10000;
+    const O_CLOEXEC: u64 = 0x80000;
 
     let Some(path) = task::copy_user_cstr(path_ptr, 256) else { return EFAULT };
 
@@ -1625,6 +1706,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
     };
 
     let accmode = flags & O_ACCMODE;
+    let cloexec = flags & O_CLOEXEC != 0;
     let want_dir = flags & O_DIRECTORY != 0;
     let is_dir = crate::fs::is_dir(&canon);
     let exists = crate::fs::exists(&canon);
@@ -1632,7 +1714,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
     if is_dir {
         if want_dir || accmode == 0 {
             let mut slot = Some(Fd::Dir { prefix: canon, idx: 0 });
-            return with_current_fds(|fds| alloc_fd(&mut slot, fds)).unwrap_or(EMFILE);
+            return with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)).unwrap_or(EMFILE);
         }
         return EISDIR;
     }
@@ -1667,7 +1749,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
         append: flags & O_APPEND != 0,
         dirty,
     });
-    with_current_fds(|fds| alloc_fd(&mut slot, fds)).unwrap_or(EMFILE)
+    with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)).unwrap_or(EMFILE)
 }
 
 fn sys_fstat(fd: u64, buf: u64) -> u64 {
@@ -1984,7 +2066,7 @@ fn sys_dup(fd: u64) -> u64 {
     match with_fd(fd, |f| f.clone_fd()) {
         Ok(clone) => {
             let mut slot = Some(clone);
-            with_current_fds(|fds| alloc_fd(&mut slot, fds)).unwrap_or(EMFILE)
+            with_current_fds(|fds| alloc_fd(&mut slot, fds, false)).unwrap_or(EMFILE)
         }
         Err(e) => e,
     }
@@ -1996,6 +2078,9 @@ fn sys_dup2(old: u64, new: u64) -> u64 {
             Ok(()) => old,
             Err(e) => e,
         };
+    }
+    if new >= 64 {
+        return EMFILE;
     }
     match with_fd(old, |f| f.clone_fd()) {
         Ok(clone) => {
@@ -2018,6 +2103,8 @@ fn sys_dup2(old: u64, new: u64) -> u64 {
                     epoll_on_close(ep, new);
                 }
                 fds[i] = Some(clone);
+                // dup2 сбрасывает FD_CLOEXEC у нового номера. old == new сюда не входит.
+                fds.set_cloexec(new, false);
                 new
             })
             .unwrap_or(EMFILE)
@@ -2026,33 +2113,78 @@ fn sys_dup2(old: u64, new: u64) -> u64 {
     }
 }
 
+/// Снять лишнюю ссылку, если копия дескриптора так и не встала в таблицу.
+fn release_clone(fd: Fd) {
+    match fd {
+        Fd::Pipe { id, writable } => pipe_close_end(id, writable),
+        Fd::Udp { id } => crate::net::udp_close(id),
+        Fd::Tcp { id } => crate::net::tcp_close(id),
+        Fd::Epoll { id } => epoll_decref(id),
+        _ => {}
+    }
+}
+
+/// Наименьший свободный номер `>= min`. Пустые щели до `min` не занимаются.
+fn dup_at_least(fds: &mut Fds, slot: &mut Option<Fd>, min: u64, cloexec: bool) -> u64 {
+    if min >= 64 {
+        return EMFILE;
+    }
+    let start = min as usize;
+    for i in start..fds.len() {
+        if fds[i].is_none() {
+            fds[i] = slot.take();
+            fds.set_cloexec(i as u64, cloexec);
+            return i as u64;
+        }
+    }
+    while fds.len() < start {
+        fds.push(None);
+    }
+    if fds.len() >= 64 {
+        return EMFILE;
+    }
+    fds.push(slot.take());
+    let i = (fds.len() - 1) as u64;
+    fds.set_cloexec(i, cloexec);
+    i
+}
+
 fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     match cmd {
-        0 => {
-            // F_DUPFD: копия с номером >= arg
+        0 | 1030 => {
+            // F_DUPFD и F_DUPFD_CLOEXEC (1030): копия с номером >= arg.
+            // Обычный dup бит сбрасывает, CLOEXEC-вариант ставит.
+            let cloexec = cmd == 1030;
             match with_fd(fd, |f| f.clone_fd()) {
                 Ok(clone) => {
                     let mut slot = Some(clone);
-                    with_current_fds(|fds| {
-                        let min = arg as usize;
-                        for i in min..fds.len() {
-                            if fds[i].is_none() {
-                                fds[i] = slot.take();
-                                return i as u64;
-                            }
-                        }
-                        if fds.len() < 64 {
-                            fds.push(slot.take());
-                            return (fds.len() - 1) as u64;
-                        }
-                        EMFILE
-                    })
-                    .unwrap_or(EMFILE)
+                    let rc = with_current_fds(|fds| dup_at_least(fds, &mut slot, arg, cloexec))
+                        .unwrap_or(EMFILE);
+                    if let Some(left) = slot.take() {
+                        release_clone(left);
+                    }
+                    rc
                 }
                 Err(e) => e,
             }
         }
-        1 | 2 => 0, // F_GETFD / F_SETFD
+        1 => with_current_fds(|fds| {
+            // F_GETFD
+            if (fd as usize) >= fds.len() || fds[fd as usize].is_none() {
+                return EBADF;
+            }
+            if fds.is_cloexec(fd) { 1 } else { 0 }
+        })
+        .unwrap_or(EBADF),
+        2 => with_current_fds(|fds| {
+            // F_SETFD: ядро хранит только FD_CLOEXEC (бит 0).
+            if (fd as usize) >= fds.len() || fds[fd as usize].is_none() {
+                return EBADF;
+            }
+            fds.set_cloexec(fd, arg & 1 != 0);
+            0
+        })
+        .unwrap_or(EBADF),
         3 => {
             // F_GETFL: accmode в младших битах
             with_fd(fd, |f| match f {
@@ -2118,11 +2250,16 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
     }
 }
 
-fn sys_pipe(fds_ptr: u64) -> u64 {
+fn sys_pipe(fds_ptr: u64, flags: u64) -> u64 {
+    const O_CLOEXEC: u64 = 0x80000;
     if fds_ptr == 0 {
         return EFAULT;
     }
-    let (r, w) = new_pipe();
+    // O_NONBLOCK у канала нет: не делаем вид, что флаг принят.
+    if flags & !O_CLOEXEC != 0 {
+        return EINVAL;
+    }
+    let (r, w) = new_pipe(flags & O_CLOEXEC != 0);
     let mut raw = [0u8; 8];
     raw[0..4].copy_from_slice(&(r as u32).to_le_bytes());
     raw[4..8].copy_from_slice(&(w as u32).to_le_bytes());
@@ -2373,7 +2510,8 @@ fn sys_epoll_create(flags: u64) -> u64 {
         Err(e) => return e,
     };
     let mut slot = Some(Fd::Epoll { id });
-    match with_current_fds(|fds| alloc_fd(&mut slot, fds)) {
+    let cloexec = flags & EPOLL_CLOEXEC != 0;
+    match with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)) {
         Ok(fd) if slot.is_none() => fd,
         Ok(err) => {
             epoll_decref(id);
@@ -2964,4 +3102,70 @@ fn futex_requeue_common(
         }
         u64::from(moved)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn cloexec_bit_follows_the_fd_not_the_dup() {
+        crate::serial_print!("test cloexec_bit_follows_the_fd_not_the_dup... ");
+        let mut fds = Fds::new(alloc::vec![
+            Some(Fd::console(false)),
+            Some(Fd::console(true)),
+            Some(Fd::console(true)),
+        ]);
+        assert!(!fds.is_cloexec(0));
+        fds.set_cloexec(1, true);
+        assert!(fds.is_cloexec(1));
+        assert_eq!(fds.cloexec_bits(), 1u64 << 1);
+
+        let mut slot = Some(Fd::console(false));
+        let n = alloc_fd(&mut slot, &mut fds, true);
+        assert_eq!(n, 3);
+        assert!(slot.is_none());
+        assert!(fds.is_cloexec(3));
+
+        // fork копирует биты. Консоль ссылок не считает.
+        let child = fds.clone_for_fork();
+        assert!(child.is_cloexec(1));
+        assert!(child.is_cloexec(3));
+        assert!(!child.is_cloexec(0));
+
+        // Повторная выдача дырки берёт флаг этого вызова, не старый бит.
+        fds[3] = None;
+        fds.set_cloexec(3, true);
+        let mut slot = Some(Fd::console(true));
+        let again = alloc_fd(&mut slot, &mut fds, false);
+        assert_eq!(again, 3);
+        assert!(!fds.is_cloexec(3));
+
+        // F_DUPFD_CLOEXEC занимает наименьший номер не ниже запрошенного.
+        let mut slot = Some(Fd::console(false));
+        let high = dup_at_least(&mut fds, &mut slot, 5, true);
+        assert_eq!(high, 5);
+        assert!(fds.is_cloexec(5));
+        assert!(fds[4].is_none());
+        assert!(!fds.is_cloexec(4));
+
+        let mut slot = Some(Fd::console(false));
+        assert_eq!(dup_at_least(&mut fds, &mut slot, 64, true), EMFILE);
+        assert!(slot.is_some());
+
+        // exec закрывает ровно помеченные номера.
+        let bits = fds.cloexec_bits();
+        let mut marked = [false; 64];
+        for i in 0..64 {
+            if bits & (1u64 << i) != 0 {
+                marked[i] = true;
+            }
+        }
+        assert!(marked[1]);
+        assert!(marked[5]);
+        assert!(!marked[0]);
+        assert!(!marked[2]);
+        assert!(!marked[3]);
+        crate::serial_println!("[ok]");
+    }
 }

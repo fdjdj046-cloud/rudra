@@ -2802,7 +2802,7 @@ pub struct Task {
     /// но не ожидающие биты. execve сбрасывает всё в SIG_DFL.
     pub signals: crate::signal::Signals,
     pub name: [u8; 24],
-    pub fds: Arc<Mutex<Vec<Option<crate::linux::Fd>>>>,
+    pub fds: Arc<Mutex<crate::linux::Fds>>,
     /// `CLONE_FS` держит один и тот же `Arc`. fork без этого флага копирует.
     pub fsctx: Arc<Mutex<FsCtx>>,
     pub cred: Cred,
@@ -2938,12 +2938,12 @@ pub fn init() {
     }
 }
 
-fn default_fds() -> Arc<Mutex<Vec<Option<crate::linux::Fd>>>> {
-    Arc::new(Mutex::new(alloc::vec![
+fn default_fds() -> Arc<Mutex<crate::linux::Fds>> {
+    Arc::new(Mutex::new(crate::linux::Fds::new(alloc::vec![
         Some(crate::linux::Fd::console(false)),
         Some(crate::linux::Fd::console(true)),
         Some(crate::linux::Fd::console(true)),
-    ]))
+    ])))
 }
 
 fn alloc_slot(tasks: &mut [Option<Task>; MAX_TASKS]) -> Option<usize> {
@@ -4258,11 +4258,7 @@ pub fn sys_clone(
         let fds = if flags & CLONE_FILES != 0 {
             parent_fds
         } else {
-            let cloned: Vec<Option<crate::linux::Fd>> = parent_fds
-                .lock()
-                .iter()
-                .map(|f| f.as_ref().map(|f| f.clone_fd()))
-                .collect();
+            let cloned = parent_fds.lock().clone_for_fork();
             Arc::new(Mutex::new(cloned))
         };
 
@@ -4442,6 +4438,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         *f.add(FRAME::RSP) = user_rsp;
     }
     drop(old);
+    crate::linux::close_on_exec();
     0
 }
 
