@@ -1135,18 +1135,17 @@ fn expand_dirs(raw: &[String], origin: Option<&str>, cwd: &str) -> Option<Vec<St
     Some(out)
 }
 
-/// Каталоги поиска имени без слэша до `/lib`.
-/// `DT_RUNPATH` того объекта, чей `DT_NEEDED` резолвится, отменяет всякий
-/// `DT_RPATH`. Иначе — `DT_RPATH` объекта, затем его загрузчиков. `DT_RPATH`
-/// библиотеки действует и для зависимостей её зависимостей, даже если у неё
-/// самой есть `DT_RUNPATH`: тот смотрит только прямые. `DT_RPATH` программы
-/// не используется, если у программы есть `DT_RUNPATH`. Если цепочка
-/// загрузчиков до программы не дошла, её `DT_RPATH` добавляется в конце.
+/// `DT_RPATH` до `LD_LIBRARY_PATH`. `DT_RUNPATH` того объекта, чей
+/// `DT_NEEDED` резолвится, отменяет всякий `DT_RPATH` (сам `DT_RUNPATH`
+/// подставляется позже). Иначе — `DT_RPATH` объекта, затем его загрузчиков.
+/// `DT_RPATH` библиотеки действует и для зависимостей её зависимостей, даже
+/// если у неё самой есть `DT_RUNPATH`: тот смотрит только прямые. `DT_RPATH`
+/// программы не используется, если у программы есть `DT_RUNPATH`. Если
+/// цепочка загрузчиков до программы не дошла, её `DT_RPATH` добавляется
+/// в конце.
 fn rpath_dirs(objs: &[LinkObj], index: usize, cwd: &str) -> Option<Vec<String>> {
     if objs[index].parsed.runpath.is_some() {
-        let origin = origin_dir(objs[index].path.as_deref());
-        let raw = objs[index].parsed.runpath.as_deref().unwrap_or(&[]);
-        return expand_dirs(raw, origin.as_deref(), cwd);
+        return Some(Vec::new());
     }
     let mut dirs = Vec::new();
     let mut cur = Some(index);
@@ -1177,6 +1176,47 @@ fn rpath_dirs(objs: &[LinkObj], index: usize, cwd: &str) -> Option<Vec<String>> 
     Some(dirs)
 }
 
+/// `DT_RUNPATH` только того объекта, чей `DT_NEEDED` резолвится.
+fn referring_runpath(objs: &[LinkObj], index: usize, cwd: &str) -> Option<Vec<String>> {
+    let Some(raw) = objs[index].parsed.runpath.as_deref() else {
+        return Some(Vec::new());
+    };
+    let origin = origin_dir(objs[index].path.as_deref());
+    expand_dirs(raw, origin.as_deref(), cwd)
+}
+
+/// `LD_LIBRARY_PATH`: каталоги через `:` или `;`. Переменной нет — пустой
+/// список. `$ORIGIN` здесь каталог программы. Кривой список отвергает
+/// загрузку.
+fn library_path_dirs(raw: Option<&str>, origin: Option<&str>, cwd: &str) -> Option<Vec<String>> {
+    let Some(text) = raw else {
+        return Some(Vec::new());
+    };
+    if text.len() > 1024 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        let normalized = text.replace(';', ":");
+        for part in normalized.split(':') {
+            if part.is_empty() {
+                continue;
+            }
+            if part.len() > 200 || parts.len() >= 32 {
+                return None;
+            }
+            parts.push(String::from(part));
+        }
+    }
+    expand_dirs(&parts, origin, cwd)
+}
+
+/// Первая `LD_LIBRARY_PATH` в envp. Повтора нет: берётся первая.
+fn ld_library_path(envp: &[String]) -> Option<&str> {
+    envp.iter()
+        .find_map(|ent| ent.strip_prefix("LD_LIBRARY_PATH="))
+}
+
 fn lib_in(dir: &str, name: &str) -> Option<String> {
     let mut path = String::from(dir);
     if !path.ends_with('/') {
@@ -1186,9 +1226,16 @@ fn lib_in(dir: &str, name: &str) -> Option<String> {
     crate::fs::resolve("/", &path)
 }
 
-/// Куда пробовать `DT_NEEDED`, по порядку. Имя без слэша — каталоги выше,
-/// затем `/lib`. Путь со слэшем — один файл, от cwd после подстановки.
-fn locate_needed(objs: &[LinkObj], index: usize, spec: &str, cwd: &str) -> Option<Vec<String>> {
+/// Куда пробовать `DT_NEEDED`, по порядку. Имя без слэша — `DT_RPATH`,
+/// затем `LD_LIBRARY_PATH`, затем `DT_RUNPATH` этого объекта, затем `/lib`.
+/// Путь со слэшем — один файл, от cwd после подстановки.
+fn locate_needed(
+    objs: &[LinkObj],
+    index: usize,
+    spec: &str,
+    cwd: &str,
+    libpath: &[String],
+) -> Option<Vec<String>> {
     if spec.is_empty() || spec.len() > 200 || spec.as_bytes().contains(&0) {
         return None;
     }
@@ -1205,6 +1252,12 @@ fn locate_needed(objs: &[LinkObj], index: usize, spec: &str, cwd: &str) -> Optio
     }
     let mut cands = Vec::new();
     for dir in rpath_dirs(objs, index, cwd)? {
+        cands.push(lib_in(&dir, &expanded)?);
+    }
+    for dir in libpath {
+        cands.push(lib_in(dir, &expanded)?);
+    }
+    for dir in referring_runpath(objs, index, cwd)? {
         cands.push(lib_in(&dir, &expanded)?);
     }
     let mut fallback = String::from("/lib/");
@@ -1294,6 +1347,7 @@ fn load_needed<F>(
     fetch: &mut F,
     group: u8,
     cwd: &str,
+    libpath: &[String],
 ) -> bool
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
@@ -1305,7 +1359,7 @@ where
         head += 1;
         let needed = objs[index].parsed.needed.clone();
         for spec in needed {
-            let Some(cands) = locate_needed(objs, index, &spec, cwd) else {
+            let Some(cands) = locate_needed(objs, index, &spec, cwd, libpath) else {
                 serial_println!("[task] DT_NEEDED path rejected: {}", spec);
                 return false;
             };
@@ -1509,10 +1563,16 @@ fn link_with<F>(main_bytes: &[u8], fetch: F) -> Option<Linked>
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
-    link_at(main_bytes, None, "/", fetch)
+    link_at(main_bytes, None, "/", None, fetch)
 }
 
-fn link_at<F>(main_bytes: &[u8], origin: Option<&str>, cwd: &str, mut fetch: F) -> Option<Linked>
+fn link_at<F>(
+    main_bytes: &[u8],
+    origin: Option<&str>,
+    cwd: &str,
+    libpath: Option<&str>,
+    mut fetch: F,
+) -> Option<Linked>
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
@@ -1525,6 +1585,14 @@ where
             }
         },
         None => None,
+    };
+    let main_origin = origin_dir(main_path.as_deref());
+    let lib_dirs = match library_path_dirs(libpath, main_origin.as_deref(), cwd) {
+        Some(dirs) => dirs,
+        None => {
+            serial_println!("[task] bad LD_LIBRARY_PATH");
+            return None;
+        }
     };
     let parsed = match parse_elf64(main_bytes) {
         Some(parsed) => parsed,
@@ -1548,7 +1616,7 @@ where
         loaded_by: None,
     });
     let mut seen = Vec::new();
-    if !load_needed(&mut objs, &mut seen, 0, &mut fetch, 0, cwd) {
+    if !load_needed(&mut objs, &mut seen, 0, &mut fetch, 0, cwd, &lib_dirs) {
         return None;
     }
     let mut interp_index = None;
@@ -1592,7 +1660,7 @@ where
         });
         let index = objs.len() - 1;
         interp_index = Some(index);
-        if !load_needed(&mut objs, &mut seen, index, &mut fetch, 1, cwd) {
+        if !load_needed(&mut objs, &mut seen, index, &mut fetch, 1, cwd, &lib_dirs) {
             return None;
         }
     }
@@ -1602,8 +1670,10 @@ where
     Some(Linked { objs, interp_index })
 }
 
-fn link_program(bytes: &[u8], origin: &str, cwd: &str) -> Option<Linked> {
-    link_at(bytes, Some(origin), cwd, |path| crate::fs::read_canon(path))
+fn link_program(bytes: &[u8], origin: &str, cwd: &str, envp: &[String]) -> Option<Linked> {
+    link_at(bytes, Some(origin), cwd, ld_library_path(envp), |path| {
+        crate::fs::read_canon(path)
+    })
 }
 
 // ---- Адресное пространство ----
@@ -2379,7 +2449,7 @@ pub fn load_elf_image(
     origin: &str,
     cwd: &str,
 ) -> Result<LoadedImage, MapToError<Size4KiB>> {
-    let linked = match link_program(elf_bytes, origin, cwd) {
+    let linked = match link_program(elf_bytes, origin, cwd, envp) {
         Some(linked) => linked,
         None => return Err(MapToError::FrameAllocationFailed),
     };
@@ -5443,7 +5513,7 @@ mod tests {
         files: &[(&str, Vec<u8>)],
     ) -> (Option<Linked>, Vec<String>) {
         let log = core::cell::RefCell::new(Vec::new());
-        let linked = link_at(main, origin, cwd, |path| {
+        let linked = link_at(main, origin, cwd, None, |path| {
             log.borrow_mut().push(String::from(path));
             files.iter().find(|(name, _)| *name == path).map(|(_, bytes)| bytes.clone())
         });
@@ -5555,7 +5625,7 @@ mod tests {
         assert!(linked.is_some());
         assert_eq!(log, alloc::vec![String::from("/app/rel/libfoo.so")]);
         let main = craft_search(&["libfoo.so"], None, Some("/usr/$PLATFORM"), None);
-        assert!(link_at(main.as_slice(), None, "/", |_| Some(Vec::new())).is_none());
+        assert!(link_at(main.as_slice(), None, "/", None, |_| Some(Vec::new())).is_none());
         serial_println!("[ok]");
     }
 
@@ -5588,6 +5658,118 @@ mod tests {
             log,
             alloc::vec![String::from("/bin/ld.so"), String::from("/lib/libld.so")]
         );
+        serial_println!("[ok]");
+    }
+
+    fn load_libpath(
+        main: &[u8],
+        origin: Option<&str>,
+        cwd: &str,
+        libpath: Option<&str>,
+        files: &[(&str, Vec<u8>)],
+    ) -> (Option<Linked>, Vec<String>) {
+        let log = core::cell::RefCell::new(Vec::new());
+        let linked = link_at(main, origin, cwd, libpath, |path| {
+            log.borrow_mut().push(String::from(path));
+            files
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, bytes)| bytes.clone())
+        });
+        (linked, log.into_inner())
+    }
+
+    #[test_case]
+    fn ld_library_path_sits_between_rpath_and_runpath() {
+        serial_print!("test ld_library_path_sits_between_rpath_and_runpath... ");
+        let env = alloc::vec![
+            String::from("OTHER=1"),
+            String::from("LD_LIBRARY_PATH=/first"),
+            String::from("LD_LIBRARY_PATH=/second"),
+        ];
+        assert_eq!(ld_library_path(&env), Some("/first"));
+        assert_eq!(ld_library_path(&[String::from("PATH=/bin")]), None);
+
+        let lib = craft_dyn(&[], &[], &[], false, false, None);
+        // RPATH раньше переменной. Файла в RPATH нет, он в LD_LIBRARY_PATH.
+        let main = craft_search(&["libfoo.so"], Some("/rpath"), None, None);
+        let (linked, log) = load_libpath(
+            main.as_slice(),
+            None,
+            "/",
+            Some("/mid"),
+            &[("/mid/libfoo.so", lib.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/rpath/libfoo.so"), String::from("/mid/libfoo.so")]
+        );
+        // DT_RUNPATH отменяет RPATH, но не LD_LIBRARY_PATH: переменная
+        // раньше RUNPATH.
+        let main = craft_search(&["libfoo.so"], Some("/rpath"), Some("/run"), None);
+        let (linked, log) = load_libpath(
+            main.as_slice(),
+            None,
+            "/",
+            Some("/mid"),
+            &[("/run/libfoo.so", lib.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/mid/libfoo.so"), String::from("/run/libfoo.so")]
+        );
+        // $ORIGIN в переменной — каталог программы. `;` тоже разделитель.
+        let main = craft_search(&["libfoo.so"], None, None, None);
+        let (linked, log) = load_libpath(
+            main.as_slice(),
+            Some("/app/bin/prog"),
+            "/app",
+            Some("$ORIGIN/extra;rel"),
+            &[("/app/rel/libfoo.so", lib.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![
+                String::from("/app/bin/extra/libfoo.so"),
+                String::from("/app/rel/libfoo.so"),
+            ]
+        );
+        // Зависимость интерпретатора видит ту же переменную, не RUNPATH
+        // программы.
+        let ld = craft_dyn(&["libld.so"], &[], &[], false, false, None);
+        let main = craft_search(&[], Some("/opt"), Some("/app-run"), Some("/bin/ld.so"));
+        let (linked, log) = load_libpath(
+            main.as_slice(),
+            None,
+            "/",
+            Some("/mid"),
+            &[("/bin/ld.so", ld), ("/mid/libld.so", lib)],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/bin/ld.so"), String::from("/mid/libld.so")]
+        );
+        let main = craft_search(&["libfoo.so"], None, None, None);
+        assert!(link_at(main.as_slice(), None, "/", Some("/usr/$PLATFORM"), |_| {
+            Some(Vec::new())
+        })
+        .is_none());
+        assert!(link_at(main.as_slice(), None, "/", Some("$ORIGIN/lib"), |_| {
+            Some(Vec::new())
+        })
+        .is_none());
+        let mut wide = String::new();
+        for i in 0..33 {
+            if i != 0 {
+                wide.push(':');
+            }
+            wide.push('a');
+        }
+        assert!(link_at(main.as_slice(), None, "/", Some(&wide), |_| Some(Vec::new())).is_none());
         serial_println!("[ok]");
     }
 }
