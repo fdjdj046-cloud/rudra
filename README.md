@@ -250,7 +250,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [ ] SMP до конца: очередь и TSS есть на каждом поднятом CPU, маска affinity хранится целиком. x2APIC есть. PI-futex нет
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра
-- [ ] Серверный контур 2.x до конца: IPv6, netlink, ext4, пакеты, namespaces, повторы и окно TCP. Петля и провод UDP/TCP, постраничный кэш fs (16 слотов по 4 КиБ), virtio-net, PID1 и `CLONE_FS` уже в ядре
+- [ ] Серверный контур 2.x до конца: IPv6, netlink, запись ext4, пакеты, namespaces. Петля и провод UDP/TCP с окном и RTO, постраничный кэш fs, чтение ext4 (extent, 64-bit, запись — `EROFS`), virtio-net, PID1 и `CLONE_FS` уже в ядре
 
 ## Благодарности
 

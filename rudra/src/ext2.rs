@@ -1,9 +1,17 @@
-//! ext2 чтение и запись поверх блочного слоя.
+//! ext2 чтение и запись и чтение ext4 поверх блочного слоя.
 //!
 //! Релизный образ: первые 16 МиБ — загрузчик и ядро, дальше файловая система.
 //! Отдельный диск, у которого суперблок в байте 1024, тоже монтируется.
-//! Одна группа, блоки до 4096, inode 128 или 256, прямой и один косвенный блок.
-//! `RFS2` остаётся recovery, если ext2 не найден.
+//! ext2: одна группа, блоки до 4096, inode 128 или 256, прямой и один косвенный
+//! блок. ext4 монтируется только на чтение, если в incompat нет ничего, кроме
+//! filetype, extents, flex_bg, 64bit и metadata_csum_seed. Дескриптор группы — `s_desc_size`
+//! (степень двойки от 64 до размера блока), номер inode-таблицы собирается
+//! из младшей и старшей половин. Число блоков тоже 64-битное. Дерево extent
+//! (корень в inode, глубина до 5) отдаёт физический блок до 48 бит; дыра и
+//! unwritten читаются нулями. Запись такого тома — `EROFS`. Журнал не
+//! проигрывается (флаг RECOVER отвергает монтирование). Каталог с htree
+//! (`EXT4_INDEX_FL`) не читается. `RFS2` остаётся recovery, если суперблок
+//! не подошёл.
 
 use alloc::string::String;
 use alloc::vec;
@@ -16,6 +24,13 @@ use crate::fs::{parent, FsError};
 pub const EMBED_OFF: u64 = 16 * 1024 * 1024;
 
 const FILETYPE: u32 = 0x2;
+const BIT64: u32 = 0x80;
+/// Зерно crc32c лежит в суперблоке, а не в UUID. Сумму мы не считаем.
+const CSUM_SEED: u32 = 0x2000;
+const EXTENTS_FL: u32 = 0x80000;
+const INDEX_FL: u32 = 0x1000;
+const HUGE_FL: u32 = 0x40000;
+const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT2_FT_REG: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
 const ROOT_INO: u32 = 2;
@@ -23,18 +38,22 @@ const ROOT_INO: u32 = 2;
 struct Vol {
     off: u64,
     block_size: usize,
-    blocks_count: u32,
+    blocks_count: u64,
     inodes_count: u32,
     free_blocks: u32,
     free_inodes: u32,
-    _blocks_per_group: u32,
-    _inodes_per_group: u32,
     inode_size: usize,
     first_ino: u32,
     filetype: bool,
+    /// ext4 с extent: метаданные не переписываем, мутации возвращают `RoFs`.
+    readonly: bool,
+    blocks_per_group: u32,
+    inodes_per_group: u32,
+    /// 32 у ext2. У ext4 с 64bit — `s_desc_size`, от 64 и степень двойки.
+    desc_size: usize,
     block_bitmap: u32,
     inode_bitmap: u32,
-    inode_table: u32,
+    inode_table: u64,
     used_dirs: u16,
     bb: Vec<u8>,
     ib: Vec<u8>,
@@ -49,7 +68,12 @@ pub fn mounted() -> bool {
 }
 
 pub fn sync() {
-    let _ = with_vol(|v| v.flush());
+    let _ = with_vol(|v| {
+        if v.readonly {
+            return Ok(());
+        }
+        v.flush()
+    });
 }
 
 /// Найти суперблок и проверить, что запись блока не задевает соседний.
@@ -62,6 +86,15 @@ pub fn mount() {
         }
         match Vol::open(off, bytes) {
             Ok(vol) => {
+                if vol.readonly {
+                    crate::serial_println!(
+                        "[ext4] read-only off {:#x} block {} blocks {} inodes {}",
+                        vol.off, vol.block_size, vol.blocks_count, vol.inodes_count
+                    );
+                    *EXT2.lock() = Some(vol);
+                    crate::serial_println!("[root] ext4 on virtio-blk");
+                    return;
+                }
                 let max_file = (12 + vol.block_size / 4) * vol.block_size;
                 crate::serial_println!(
                     "[ext2] mounted off {:#x} block {} blocks {} inodes {} free {} file-max {}",
@@ -109,7 +142,11 @@ pub fn size_of(path: &str) -> isize {
             return None;
         }
         let inode = v.read_inode(ino).ok()?;
-        Some(get_u32(&inode, 4) as isize)
+        let sz = inode_bytes(&inode);
+        if sz > isize::MAX as u64 {
+            return None;
+        }
+        Some(sz as isize)
     })
     .flatten()
     .unwrap_or(-1)
@@ -139,7 +176,11 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
             return None;
         }
         let inode = v.read_inode(ino).ok()?;
-        let size = get_u32(&inode, 4) as usize;
+        let size = inode_bytes(&inode);
+        if size > isize::MAX as u64 {
+            return None;
+        }
+        let size = size as usize;
         let mut buf = vec![0u8; size];
         if size == 0 {
             return Some(buf);
@@ -152,14 +193,14 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     .flatten()
 }
 
-pub fn write_file(path: &str, data: &[u8]) -> isize {
+pub fn write_file(path: &str, data: &[u8]) -> Result<(), FsError> {
     match with_vol(|v| v.write_file_at(path, data)) {
-        Some(Ok(())) => data.len() as isize,
         Some(Err(e)) => {
             crate::serial_println!("[ext2] write {} failed ({:?})", path, e);
-            -1
+            Err(e)
         }
-        None => -1,
+        Some(Ok(())) => Ok(()),
+        None => Err(FsError::Io),
     }
 }
 
@@ -241,17 +282,12 @@ impl Vol {
             return Err("block size");
         }
         let block_size = 1024usize << log_block;
-        let blocks_count = get_u32(&sb, 4);
+        let blocks_lo = get_u32(&sb, 4);
         let inodes_count = get_u32(&sb, 0);
         let blocks_per_group = get_u32(&sb, 32);
         let inodes_per_group = get_u32(&sb, 40);
-        if blocks_count == 0 || inodes_count == 0 || blocks_per_group == 0 || inodes_per_group == 0
-        {
+        if inodes_count == 0 || blocks_per_group == 0 || inodes_per_group == 0 {
             return Err("empty fs");
-        }
-        let fs_bytes = blocks_count as u64 * block_size as u64;
-        if off.saturating_add(fs_bytes) > disk_bytes {
-            return Err("fs past disk");
         }
         let rev = get_u32(&sb, 76);
         if rev > 1 {
@@ -266,31 +302,50 @@ impl Vol {
             return Err("inode size");
         }
         let incompat = get_u32(&sb, 96);
-        if incompat & !FILETYPE != 0 {
-            return Err("incompat feature");
+        let readonly = features(incompat, get_u32(&sb, 100))?;
+        let bit64 = incompat & BIT64 != 0;
+        let blocks_hi = if sb.len() >= 340 { get_u32(&sb, 336) } else { 0 };
+        if blocks_hi != 0 && !bit64 {
+            return Err("64bit blocks");
         }
-        if get_u32(&sb, 100) != 0 {
-            return Err("ro feature");
+        let blocks_count = (blocks_lo as u64) | ((blocks_hi as u64) << 32);
+        if blocks_count == 0 {
+            return Err("empty fs");
         }
-        let groups = blocks_count.div_ceil(blocks_per_group);
+        let fs_bytes = match blocks_count.checked_mul(block_size as u64) {
+            Some(n) => n,
+            None => return Err("fs size"),
+        };
+        if off.saturating_add(fs_bytes) > disk_bytes {
+            return Err("fs past disk");
+        }
+        let desc_size = desc_len(&sb, block_size, bit64)?;
+        let groups = blocks_count.div_ceil(blocks_per_group as u64);
         let igroups = inodes_count.div_ceil(inodes_per_group);
-        if groups != 1 || igroups != 1 {
+        if !readonly && (groups != 1 || igroups != 1) {
             return Err("only one group");
         }
-        let mut gd = vec![0u8; 32];
+        let mut gd = vec![0u8; desc_size];
         // 1024: суперблок — блок 1, таблица групп — блок 2.
         // 2048 и 4096: суперблок внутри блока 0, таблица групп — следующий блок.
         read_abs(gdt_byte(off, block_size), &mut gd).map_err(|_| "gdt read")?;
         let block_bitmap = get_u32(&gd, 0);
         let inode_bitmap = get_u32(&gd, 4);
-        let inode_table = get_u32(&gd, 8);
-        if block_bitmap == 0 || inode_bitmap == 0 || inode_table == 0 {
+        let inode_table = gd_inode_table(&gd).map_err(|_| "group desc")?;
+        if !readonly && (block_bitmap == 0 || inode_bitmap == 0) {
             return Err("group desc");
         }
-        let mut bb = vec![0u8; block_size];
-        let mut ib = vec![0u8; block_size];
-        read_abs(off + block_bitmap as u64 * block_size as u64, &mut bb).map_err(|_| "bitmap")?;
-        read_abs(off + inode_bitmap as u64 * block_size as u64, &mut ib).map_err(|_| "ibitmap")?;
+        let (bb, ib) = if readonly {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut bb = vec![0u8; block_size];
+            let mut ib = vec![0u8; block_size];
+            read_abs(off + block_bitmap as u64 * block_size as u64, &mut bb)
+                .map_err(|_| "bitmap")?;
+            read_abs(off + inode_bitmap as u64 * block_size as u64, &mut ib)
+                .map_err(|_| "ibitmap")?;
+            (bb, ib)
+        };
         let mut vol = Vol {
             off,
             block_size,
@@ -298,11 +353,13 @@ impl Vol {
             inodes_count,
             free_blocks: 0,
             free_inodes: 0,
-            _blocks_per_group: blocks_per_group,
-            _inodes_per_group: inodes_per_group,
             inode_size,
             first_ino,
             filetype: incompat & FILETYPE != 0,
+            readonly,
+            blocks_per_group,
+            inodes_per_group,
+            desc_size,
             block_bitmap,
             inode_bitmap,
             inode_table,
@@ -312,14 +369,26 @@ impl Vol {
             sb,
             gd,
         };
+        if readonly {
+            return Ok(vol);
+        }
         vol.recount();
         vol.write_check().map_err(|_| "write check")?;
         Ok(vol)
     }
 
+    fn ro(&self) -> Result<(), FsError> {
+        if self.readonly {
+            Err(FsError::RoFs)
+        } else {
+            Ok(())
+        }
+    }
+
     fn recount(&mut self) {
         let mut blocks = 0u32;
-        for b in 0..self.blocks_count {
+        let nblocks = self.blocks_count.min(u32::MAX as u64) as u32;
+        for b in 0..nblocks {
             if !bit(&self.bb, b) {
                 blocks += 1;
             }
@@ -338,19 +407,27 @@ impl Vol {
         (self.block_size / 4) as u32
     }
 
-    fn read_block(&self, block: u32, buf: &mut [u8]) -> Result<(), FsError> {
+    fn read_block(&self, block: impl Into<u64>, buf: &mut [u8]) -> Result<(), FsError> {
+        let block = block.into();
         if block >= self.blocks_count || buf.len() < self.block_size {
             return Err(FsError::Io);
         }
-        let byte = self.off + block as u64 * self.block_size as u64;
+        let byte = match block.checked_mul(self.block_size as u64) {
+            Some(n) => self.off.saturating_add(n),
+            None => return Err(FsError::Io),
+        };
         read_abs(byte, &mut buf[..self.block_size])
     }
 
-    fn write_block(&self, block: u32, buf: &[u8]) -> Result<(), FsError> {
+    fn write_block(&self, block: impl Into<u64>, buf: &[u8]) -> Result<(), FsError> {
+        let block = block.into();
         if block >= self.blocks_count || buf.len() < self.block_size {
             return Err(FsError::Io);
         }
-        let byte = self.off + block as u64 * self.block_size as u64;
+        let byte = match block.checked_mul(self.block_size as u64) {
+            Some(n) => self.off.saturating_add(n),
+            None => return Err(FsError::Io),
+        };
         write_abs(byte, &buf[..self.block_size])
     }
 
@@ -361,7 +438,7 @@ impl Vol {
         let b = self.alloc_block()?;
         let neighbor = b.saturating_add(1);
         let mut nb = vec![0u8; self.block_size];
-        let have_neighbor = neighbor < self.blocks_count;
+        let have_neighbor = (neighbor as u64) < self.blocks_count;
         if have_neighbor {
             self.read_block(neighbor, &mut nb)?;
         }
@@ -406,7 +483,8 @@ impl Vol {
     }
 
     fn alloc_block(&mut self) -> Result<u32, FsError> {
-        for b in 0..self.blocks_count {
+        let nblocks = self.blocks_count.min(u32::MAX as u64) as u32;
+        for b in 0..nblocks {
             if !bit(&self.bb, b) {
                 set_bit(&mut self.bb, b, true);
                 self.free_blocks = self.free_blocks.saturating_sub(1);
@@ -417,7 +495,7 @@ impl Vol {
     }
 
     fn free_block(&mut self, b: u32) {
-        if b == 0 || b >= self.blocks_count {
+        if b == 0 || b as u64 >= self.blocks_count {
             return;
         }
         if bit(&self.bb, b) {
@@ -450,19 +528,35 @@ impl Vol {
         }
     }
 
+    fn inode_table_of(&self, ino: u32) -> Result<u64, FsError> {
+        let group = (ino - 1) / self.inodes_per_group;
+        if !self.readonly {
+            return Ok(self.inode_table);
+        }
+        let groups = self.blocks_count.div_ceil(self.blocks_per_group as u64);
+        if group as u64 >= groups {
+            return Err(FsError::Io);
+        }
+        let mut gd = vec![0u8; self.desc_size];
+        let byte = gdt_byte(self.off, self.block_size) + group as u64 * self.desc_size as u64;
+        read_abs(byte, &mut gd)?;
+        gd_inode_table(&gd)
+    }
+
     fn read_inode(&self, ino: u32) -> Result<Vec<u8>, FsError> {
         if ino == 0 || ino > self.inodes_count {
             return Err(FsError::NoEnt);
         }
-        let index = (ino - 1) as usize;
         let per = self.block_size / self.inode_size;
         if per == 0 {
             return Err(FsError::Io);
         }
-        let block = self.inode_table as usize + index / per;
+        let table = self.inode_table_of(ino)?;
+        let index = (ino - 1) as usize % self.inodes_per_group as usize;
+        let block = table + (index / per) as u64;
         let inner = (index % per) * self.inode_size;
         let mut blk = vec![0u8; self.block_size];
-        self.read_block(block as u32, &mut blk)?;
+        self.read_block(block, &mut blk)?;
         let mut out = vec![0u8; 128];
         let n = 128.min(self.inode_size);
         out[..n].copy_from_slice(&blk[inner..inner + n]);
@@ -473,15 +567,16 @@ impl Vol {
         if ino == 0 || ino > self.inodes_count || inode.len() < 128 {
             return Err(FsError::Io);
         }
-        let index = (ino - 1) as usize;
         let per = self.block_size / self.inode_size;
-        let block = self.inode_table as usize + index / per;
+        let table = self.inode_table_of(ino)?;
+        let index = (ino - 1) as usize % self.inodes_per_group as usize;
+        let block = table + (index / per) as u64;
         let inner = (index % per) * self.inode_size;
         let mut blk = vec![0u8; self.block_size];
-        self.read_block(block as u32, &mut blk)?;
+        self.read_block(block, &mut blk)?;
         let n = 128.min(self.inode_size);
         blk[inner..inner + n].copy_from_slice(&inode[..n]);
-        self.write_block(block as u32, &blk)
+        self.write_block(block, &blk)
     }
 
     fn is_dir_ino(&self, ino: u32) -> Result<bool, FsError> {
@@ -489,9 +584,16 @@ impl Vol {
         Ok(get_u16(&inode, 0) & 0xF000 == 0x4000)
     }
 
-    fn map_block(&self, inode: &[u8], iblock: u32) -> Result<u32, FsError> {
+    fn map_block(&self, inode: &[u8], iblock: u32) -> Result<u64, FsError> {
+        if inode.len() >= 100 && get_u32(inode, 32) & EXTENTS_FL != 0 {
+            return extent_map(&inode[40..100], iblock, &mut |b| {
+                let mut blk = vec![0u8; self.block_size];
+                self.read_block(b, &mut blk)?;
+                Ok(blk)
+            });
+        }
         if iblock < 12 {
-            return Ok(get_u32(inode, 40 + iblock as usize * 4));
+            return Ok(get_u32(inode, 40 + iblock as usize * 4) as u64);
         }
         let idx = iblock - 12;
         if idx >= self.ptrs() {
@@ -503,12 +605,12 @@ impl Vol {
         }
         let mut blk = vec![0u8; self.block_size];
         self.read_block(sib, &mut blk)?;
-        Ok(get_u32(&blk, idx as usize * 4))
+        Ok(get_u32(&blk, idx as usize * 4) as u64)
     }
 
     fn read_ino(&self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let inode = self.read_inode(ino)?;
-        let size = get_u32(&inode, 4) as u64;
+        let size = inode_bytes(&inode);
         if offset >= size || buf.is_empty() {
             return Ok(0);
         }
@@ -538,9 +640,12 @@ impl Vol {
         inode: &[u8],
         iblock: u32,
         cache: &mut Option<(u32, Vec<u8>)>,
-    ) -> Result<u32, FsError> {
+    ) -> Result<u64, FsError> {
+        if inode.len() >= 100 && get_u32(inode, 32) & EXTENTS_FL != 0 {
+            return self.map_block(inode, iblock);
+        }
         if iblock < 12 {
-            return Ok(get_u32(inode, 40 + iblock as usize * 4));
+            return Ok(get_u32(inode, 40 + iblock as usize * 4) as u64);
         }
         let idx = iblock - 12;
         if idx >= self.ptrs() {
@@ -556,7 +661,7 @@ impl Vol {
             *cache = Some((sib, blk));
         }
         let buf = &cache.as_ref().unwrap().1;
-        Ok(get_u32(buf, idx as usize * 4))
+        Ok(get_u32(buf, idx as usize * 4) as u64)
     }
 
     fn read_path(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -614,7 +719,10 @@ impl Vol {
         mut f: impl FnMut(&[u8], usize, usize, u32) -> Result<bool, FsError>,
     ) -> Result<(), FsError> {
         let inode = self.read_inode(dir)?;
-        let size = get_u32(&inode, 4) as usize;
+        if get_u32(&inode, 32) & INDEX_FL != 0 {
+            return Err(FsError::Io);
+        }
+        let size = inode_bytes(&inode) as usize;
         let mut off = 0usize;
         while off + 8 <= size {
             let ib = (off / self.block_size) as u32;
@@ -940,6 +1048,7 @@ impl Vol {
     }
 
     fn write_file_at(&mut self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        self.ro()?;
         if path == "/" {
             return Err(FsError::IsDir);
         }
@@ -970,6 +1079,7 @@ impl Vol {
     }
 
     fn mkdir_at(&mut self, path: &str, perm: u16, uid: u32, gid: u32) -> Result<(), FsError> {
+        self.ro()?;
         if path.is_empty() || path == "/" {
             return Err(FsError::Inval);
         }
@@ -1020,6 +1130,7 @@ impl Vol {
     }
 
     fn chmod_at(&mut self, path: &str, perm: u16) -> Result<(), FsError> {
+        self.ro()?;
         let ino = self.lookup(path)?;
         let mut inode = self.read_inode(ino)?;
         let old = get_u16(&inode, 0);
@@ -1032,6 +1143,7 @@ impl Vol {
     }
 
     fn create_reg(&mut self, path: &str, perm: u16, uid: u32, gid: u32) -> Result<(), FsError> {
+        self.ro()?;
         if path.is_empty() || path == "/" {
             return Err(FsError::Inval);
         }
@@ -1073,6 +1185,7 @@ impl Vol {
     }
 
     fn unlink_at(&mut self, path: &str) -> Result<(), FsError> {
+        self.ro()?;
         if path == "/" {
             return Err(FsError::Perm);
         }
@@ -1107,6 +1220,7 @@ impl Vol {
     }
 
     fn rmdir_at(&mut self, path: &str) -> Result<(), FsError> {
+        self.ro()?;
         if path == "/" {
             return Err(FsError::Perm);
         }
@@ -1163,6 +1277,7 @@ impl Vol {
     }
 
     fn rename_at(&mut self, old: &str, new: &str) -> Result<(), FsError> {
+        self.ro()?;
         if old == new {
             return Ok(());
         }
@@ -1300,4 +1415,296 @@ fn put_u16(buf: &mut [u8], off: usize, v: u16) {
 
 fn put_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Размер файла. `HUGE_FILE` добавляет старшую половину с offset 108.
+fn inode_bytes(inode: &[u8]) -> u64 {
+    let lo = get_u32(inode, 4) as u64;
+    if inode.len() >= 112 && get_u32(inode, 32) & HUGE_FL != 0 {
+        lo | ((get_u32(inode, 108) as u64) << 32)
+    } else {
+        lo
+    }
+}
+
+/// `Ok(true)` — монтировать только на чтение. `Ok(false)` — обычный ext2.
+/// Журнал с RECOVER, meta_bg, encrypt и прочие incompat отвергаются.
+/// `64bit` и `metadata_csum_seed` принимаются только вместе с extents.
+fn features(incompat: u32, ro: u32) -> Result<bool, &'static str> {
+    const EXTENTS: u32 = 0x40;
+    const FLEX_BG: u32 = 0x200;
+    const OK: u32 = FILETYPE | EXTENTS | FLEX_BG | BIT64 | CSUM_SEED;
+    // sparse_super, large_file, huge_file, gdt_csum, dir_nlink, extra_isize,
+    // metadata_csum. Сумму метаданных не проверяем и не переписываем.
+    const RO_OK: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | 0x400;
+    if incompat & !OK != 0 {
+        return Err("incompat feature");
+    }
+    let extents = incompat & EXTENTS != 0;
+    if (incompat & (FLEX_BG | BIT64 | CSUM_SEED)) != 0 && !extents {
+        return Err("incompat feature");
+    }
+    if extents {
+        if ro & !RO_OK != 0 {
+            return Err("ro feature");
+        }
+        return Ok(true);
+    }
+    if ro != 0 {
+        return Err("ro feature");
+    }
+    Ok(false)
+}
+
+/// Длина дескриптора группы. Без 64bit это 32 байта. С 64bit — `s_desc_size`
+/// по смещению 254: не меньше 64, не больше блока, степень двойки.
+fn desc_len(sb: &[u8], block_size: usize, bit64: bool) -> Result<usize, &'static str> {
+    if !bit64 {
+        return Ok(32);
+    }
+    if sb.len() < 256 {
+        return Err("desc size");
+    }
+    let d = get_u16(sb, 254) as usize;
+    if d < 64 || d > block_size || !d.is_power_of_two() {
+        return Err("desc size");
+    }
+    Ok(d)
+}
+
+/// Номер блока inode-таблицы. Старшая половина лежит по смещению 0x28
+/// и есть только в дескрипторе длиннее 32 байт.
+fn gd_inode_table(gd: &[u8]) -> Result<u64, FsError> {
+    if gd.len() < 12 {
+        return Err(FsError::Io);
+    }
+    let lo = get_u32(gd, 8) as u64;
+    let hi = if gd.len() >= 44 {
+        get_u32(gd, 40) as u64
+    } else {
+        0
+    };
+    let table = (hi << 32) | lo;
+    if table == 0 {
+        Err(FsError::Io)
+    } else {
+        Ok(table)
+    }
+}
+
+/// Логический блок → физический. `0` — дыра или unwritten (читать нулями).
+/// Индексный узел: берётся запись с наибольшим `ei_block` не больше логического.
+/// Старшие 16 бит номера блока (`ee_start_hi` / `ei_leaf_hi`) входят в адрес.
+fn extent_map(
+    node: &[u8],
+    logical: u32,
+    fetch: &mut dyn FnMut(u64) -> Result<Vec<u8>, FsError>,
+) -> Result<u64, FsError> {
+    extent_walk(node, logical, 5, fetch)
+}
+
+fn extent_walk(
+    node: &[u8],
+    logical: u32,
+    left: u8,
+    fetch: &mut dyn FnMut(u64) -> Result<Vec<u8>, FsError>,
+) -> Result<u64, FsError> {
+    if node.len() < 12 || get_u16(node, 0) != EXTENT_MAGIC {
+        return Err(FsError::Io);
+    }
+    let entries = get_u16(node, 2) as usize;
+    let max = get_u16(node, 4) as usize;
+    let depth = get_u16(node, 6);
+    if entries > max || 12 + entries * 12 > node.len() {
+        return Err(FsError::Io);
+    }
+    if entries == 0 {
+        return Ok(0);
+    }
+    if depth == 0 {
+        for i in 0..entries {
+            let off = 12 + i * 12;
+            let ee_block = get_u32(node, off);
+            let raw = get_u16(node, off + 4);
+            let start_hi = get_u16(node, off + 6) as u64;
+            let start_lo = get_u32(node, off + 8) as u64;
+            let len = (raw & 0x7FFF) as u32;
+            if len == 0 {
+                return Err(FsError::Io);
+            }
+            let start = (start_hi << 32) | start_lo;
+            if logical >= ee_block && logical - ee_block < len {
+                if raw & 0x8000 != 0 || start == 0 {
+                    return Ok(0);
+                }
+                return start
+                    .checked_add((logical - ee_block) as u64)
+                    .ok_or(FsError::Io);
+            }
+        }
+        return Ok(0);
+    }
+    if left == 0 {
+        return Err(FsError::Io);
+    }
+    let mut best_at = 0u32;
+    let mut best_leaf = 0u64;
+    let mut found = false;
+    for i in 0..entries {
+        let off = 12 + i * 12;
+        let ei_block = get_u32(node, off);
+        let leaf = ((get_u16(node, off + 8) as u64) << 32) | get_u32(node, off + 4) as u64;
+        if ei_block <= logical && leaf == 0 {
+            return Err(FsError::Io);
+        }
+        if ei_block <= logical && (!found || ei_block >= best_at) {
+            found = true;
+            best_at = ei_block;
+            best_leaf = leaf;
+        }
+    }
+    if !found {
+        return Ok(0);
+    }
+    let child = fetch(best_leaf)?;
+    extent_walk(&child, logical, left - 1, fetch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{serial_print, serial_println};
+
+    fn hdr(buf: &mut [u8], entries: u16, max: u16, depth: u16) {
+        put_u16(buf, 0, EXTENT_MAGIC);
+        put_u16(buf, 2, entries);
+        put_u16(buf, 4, max);
+        put_u16(buf, 6, depth);
+    }
+
+    fn leaf_at(buf: &mut [u8], i: usize, block: u32, len: u16, start: u32) {
+        let off = 12 + i * 12;
+        put_u32(buf, off, block);
+        put_u16(buf, off + 4, len);
+        put_u16(buf, off + 6, 0);
+        put_u32(buf, off + 8, start);
+    }
+
+    fn idx_at(buf: &mut [u8], i: usize, block: u32, leaf: u32) {
+        let off = 12 + i * 12;
+        put_u32(buf, off, block);
+        put_u32(buf, off + 4, leaf);
+        put_u16(buf, off + 8, 0);
+    }
+
+    #[test_case]
+    fn extent_tree_maps_leaves_holes_and_indexes() {
+        serial_print!("test extent_tree_maps_leaves_holes_and_indexes... ");
+        let mut node = [0u8; 60];
+        hdr(&mut node, 2, 4, 0);
+        leaf_at(&mut node, 0, 0, 2, 100);
+        leaf_at(&mut node, 1, 10, 1, 50);
+        let map = |node: &[u8], logical| extent_map(node, logical, &mut |_| Err(FsError::Io));
+        assert_eq!(map(&node, 0).unwrap(), 100);
+        assert_eq!(map(&node, 1).unwrap(), 101);
+        assert_eq!(map(&node, 2).unwrap(), 0);
+        assert_eq!(map(&node, 9).unwrap(), 0);
+        assert_eq!(map(&node, 10).unwrap(), 50);
+        assert_eq!(map(&node, 11).unwrap(), 0);
+
+        leaf_at(&mut node, 0, 0, 0x8003, 10);
+        assert_eq!(map(&node, 1).unwrap(), 0, "unwritten reads as a hole");
+
+        leaf_at(&mut node, 0, 0, 1, 10);
+        put_u16(&mut node, 12 + 6, 1);
+        assert_eq!(map(&node, 0).unwrap(), (1u64 << 32) | 10);
+
+        hdr(&mut node, 1, 4, 0);
+        leaf_at(&mut node, 0, 0, 0, 10);
+        assert!(extent_map(&node, 0, &mut |_| Err(FsError::Io)).is_err());
+
+        node[0] = 0;
+        assert!(extent_map(&node, 0, &mut |_| Err(FsError::Io)).is_err());
+
+        let mut root = [0u8; 60];
+        hdr(&mut root, 2, 4, 1);
+        idx_at(&mut root, 0, 0, 7);
+        idx_at(&mut root, 1, 100, 8);
+        let mut leaf7 = [0u8; 60];
+        hdr(&mut leaf7, 1, 4, 0);
+        leaf_at(&mut leaf7, 0, 0, 4, 200);
+        let mut leaf8 = [0u8; 60];
+        hdr(&mut leaf8, 1, 4, 0);
+        leaf_at(&mut leaf8, 0, 100, 2, 300);
+        let phys = |logical: u32| {
+            extent_map(&root, logical, &mut |b| match b {
+                7 => Ok(leaf7.to_vec()),
+                8 => Ok(leaf8.to_vec()),
+                _ => Err(FsError::Io),
+            })
+        };
+        assert_eq!(phys(3).unwrap(), 203);
+        assert_eq!(phys(4).unwrap(), 0);
+        assert_eq!(phys(100).unwrap(), 300);
+        assert_eq!(phys(101).unwrap(), 301);
+        assert!(phys(99).unwrap() == 0);
+
+        let mut looped = [0u8; 60];
+        hdr(&mut looped, 1, 4, 1);
+        idx_at(&mut looped, 0, 0, 1);
+        let mut fetches = 0u32;
+        let cyc = extent_map(&looped, 0, &mut |b| {
+            fetches += 1;
+            assert_eq!(b, 1);
+            Ok(looped.to_vec())
+        });
+        assert!(cyc.is_err());
+        assert!(fetches <= 5);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn ext4_feature_mask_is_read_only() {
+        serial_print!("test ext4_feature_mask_is_read_only... ");
+        assert_eq!(features(0, 0).unwrap(), false);
+        assert_eq!(features(FILETYPE, 0).unwrap(), false);
+        assert!(features(FILETYPE, 0x1).is_err());
+        assert_eq!(features(FILETYPE | 0x40, 0).unwrap(), true);
+        assert_eq!(features(FILETYPE | 0x40 | 0x200, 0x400).unwrap(), true);
+        assert_eq!(features(FILETYPE | 0x40 | BIT64 | 0x200, 0x1 | 0x2 | 0x400).unwrap(), true);
+        // mke2fs 1.47 ext4: filetype, extent, flex_bg, 64bit, csum_seed
+        // и ro sparse, large, huge, dir_nlink, extra_isize, metadata_csum.
+        let mke2fs = FILETYPE | 0x40 | 0x200 | BIT64 | CSUM_SEED;
+        let mke2fs_ro = 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x400;
+        assert_eq!(features(mke2fs, mke2fs_ro).unwrap(), true);
+        assert!(features(0x40 | 0x4, 0).is_err(), "journal needs recovery");
+        assert!(features(BIT64, 0).is_err(), "64bit without extents");
+        assert!(features(CSUM_SEED, 0).is_err(), "csum seed without extents");
+        assert!(features(0x200, 0).is_err(), "flex_bg without extents");
+        assert!(features(0x40, 0x200).is_err(), "bigalloc");
+        let mut sb = [0u8; 1024];
+        assert_eq!(desc_len(&sb, 4096, false).unwrap(), 32);
+        put_u16(&mut sb, 254, 64);
+        assert_eq!(desc_len(&sb, 4096, true).unwrap(), 64);
+        put_u16(&mut sb, 254, 32);
+        assert!(desc_len(&sb, 4096, true).is_err(), "desc shorter than 64");
+        put_u16(&mut sb, 254, 48);
+        assert!(desc_len(&sb, 4096, true).is_err(), "desc not a power of two");
+        let mut gd = [0u8; 64];
+        put_u32(&mut gd, 8, 0x11);
+        put_u32(&mut gd, 40, 0x2);
+        assert_eq!(gd_inode_table(&gd).unwrap(), (0x2u64 << 32) | 0x11);
+        assert_eq!(gd_inode_table(&gd[..32]).unwrap(), 0x11);
+        gd[8] = 0;
+        gd[9] = 0;
+        gd[10] = 0;
+        gd[11] = 0;
+        assert!(gd_inode_table(&gd[..32]).is_err());
+        let mut inode = [0u8; 128];
+        put_u32(&mut inode, 4, 0x1000);
+        put_u32(&mut inode, 32, HUGE_FL);
+        put_u32(&mut inode, 108, 2);
+        assert_eq!(inode_bytes(&inode), (2u64 << 32) | 0x1000);
+        serial_println!("[ok]");
+    }
 }

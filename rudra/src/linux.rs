@@ -342,6 +342,7 @@ fn fs_err(e: crate::fs::FsError) -> u64 {
         Inval => EINVAL,
         Perm => EPERM,
         Io => EIO,
+        RoFs => EROFS,
     }
 }
 
@@ -536,7 +537,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
             if a2 == 0 {
-                crate::fs::write_canon(&canon, &[]);
+                if let Err(e) = crate::fs::write_canon(&canon, &[]) {
+                    return fs_err(e);
+                }
             }
             0
         }
@@ -545,7 +548,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             match fd_name(a1) {
                 Some(name) => {
                     if a2 == 0 {
-                        crate::fs::write_canon(&name, &[]);
+                        if let Err(e) = crate::fs::write_canon(&name, &[]) {
+                            return fs_err(e);
+                        }
                     }
                     0
                 }
@@ -626,13 +631,15 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
                 return EPERM;
             }
             match crate::fs::read_canon(&o) {
-                Some(data) if crate::fs::write_canon(&n, &data) >= 0 => {
-                    if let Some(m) = crate::fs::mode_of(&o) {
-                        let _ = crate::fs::chmod(&n, (m as u16) & 0o7777);
+                Some(data) => match crate::fs::write_canon(&n, &data) {
+                    Ok(_) => {
+                        if let Some(m) = crate::fs::mode_of(&o) {
+                            let _ = crate::fs::chmod(&n, (m as u16) & 0o7777);
+                        }
+                        0
                     }
-                    0
-                }
-                Some(_) => ENOSPC,
+                    Err(e) => fs_err(e),
+                },
                 None => ENOENT,
             }
         }
@@ -650,10 +657,9 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             let Some(target) = task::copy_user_cstr(a1, 256) else { return EFAULT };
             let Some(path) = task::copy_user_cstr(a2, 256) else { return EFAULT };
             let Some(canon) = task_resolve(&path) else { return ENAMETOOLONG };
-            if crate::fs::write_canon(&canon, target.as_bytes()) >= 0 {
-                0
-            } else {
-                ENOSPC
+            match crate::fs::write_canon(&canon, target.as_bytes()) {
+                Ok(_) => 0,
+                Err(e) => fs_err(e),
             }
         }
         89 => {
@@ -1519,29 +1525,31 @@ fn sys_close(fd: u64) -> u64 {
         Ok(None) => return EBADF,
         Err(e) => return e,
     };
-    let ep_id = match &obj {
+    let (ep_id, flushed) = match &obj {
         Fd::File { name, dirty: Some(data), .. } => {
-            crate::fs::write_canon(name, data);
-            None
+            (None, crate::fs::write_canon(name, data).map(|_| ()))
         }
         Fd::Pipe { id, writable } => {
             pipe_close_end(*id, *writable);
-            None
+            (None, Ok(()))
         }
         Fd::Udp { id } => {
             crate::net::udp_close(*id);
-            None
+            (None, Ok(()))
         }
         Fd::Tcp { id } => {
             crate::net::tcp_close(*id);
-            None
+            (None, Ok(()))
         }
-        Fd::Epoll { id } => Some(*id),
-        _ => None,
+        Fd::Epoll { id } => (Some(*id), Ok(())),
+        _ => (None, Ok(())),
     };
     // Номер освобождён. Интересы, смотревшие на него, снимаем до повторной выдачи.
     epoll_on_close(ep_id, fd);
-    0
+    match flushed {
+        Ok(()) => 0,
+        Err(e) => fs_err(e),
+    }
 }
 
 fn sys_chmod(path_ptr: u64, mode: u64) -> u64 {

@@ -41,6 +41,8 @@ pub enum FsError {
     Inval,
     Perm,
     Io,
+    /// Том смонтирован только на чтение (ext4).
+    RoFs,
 }
 
 /// Базовый образ ramdisk, собранный pack_rfs.py из rootfs при сборке ядра.
@@ -1149,7 +1151,14 @@ pub fn read_path(path: &[u8], buf: &mut [u8]) -> isize {
 }
 
 pub fn write_path(path: &[u8], data: &[u8]) -> isize {
-    with_name(path, |n| write_canon(n, data), -1)
+    with_name(
+        path,
+        |n| match write_canon(n, data) {
+            Ok(n) => n as isize,
+            Err(_) => -1,
+        },
+        -1,
+    )
 }
 
 pub fn delete_path(path: &[u8]) -> bool {
@@ -1202,20 +1211,18 @@ pub fn delete_canon(name: &str) -> bool {
 }
 
 /// Создать/перезаписать файл по каноническому имени.
-pub fn write_canon(name: &str, data: &[u8]) -> isize {
+pub fn write_canon(name: &str, data: &[u8]) -> Result<usize, FsError> {
     if synth_mut(name) {
-        return -1;
+        return Err(FsError::Perm);
     }
     page_inval(name);
-    let n = if ext2_on() {
-        crate::ext2::write_file(name, data)
-    } else {
-        fs().write(name, data)
-    };
-    if n >= 0 {
-        page_inval(name);
+    if ext2_on() {
+        crate::ext2::write_file(name, data)?;
+    } else if fs().write(name, data) < 0 {
+        return Err(FsError::Io);
     }
-    n
+    page_inval(name);
+    Ok(data.len())
 }
 
 #[cfg(test)]
@@ -1394,7 +1401,7 @@ mod tests {
         assert!(text.contains("processes "));
         assert!(text.contains("procs_running "));
         assert_eq!(unlink("/proc/uptime"), Err(FsError::Perm));
-        assert!(write_canon("/proc/uptime", b"x") < 0);
+        assert!(write_canon("/proc/uptime", b"x").is_err());
         serial_println!("[ok]");
     }
 
@@ -1423,7 +1430,7 @@ mod tests {
         assert_eq!(mkdir("/sys"), Err(FsError::Exist));
         assert_eq!(rmdir("/sys/kernel"), Err(FsError::NotEmpty));
         assert_eq!(unlink("/sys/kernel/hostname"), Err(FsError::Perm));
-        assert!(write_canon("/sys/kernel/hostname", b"x") < 0);
+        assert!(write_canon("/sys/kernel/hostname", b"x").is_err());
         serial_println!("[ok]");
     }
 
