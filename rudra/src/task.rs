@@ -144,12 +144,18 @@ struct ElfParsed {
     relative: Vec<RelaRel>,
     needed: Vec<String>,
     dynsym: DynSym,
+    /// `DT_RPATH`. None — тега нет. Пустой вектор — тег есть, каталогов нет.
+    rpath: Option<Vec<String>>,
+    /// `DT_RUNPATH`. Если тег есть, `DT_RPATH` этого объекта не используется.
+    runpath: Option<Vec<String>>,
 }
 
 struct ParsedDyn {
     rels: Vec<RelaRel>,
     needed: Vec<String>,
     dynsym: DynSym,
+    rpath: Option<Vec<String>>,
+    runpath: Option<Vec<String>>,
 }
 
 enum LocalSym {
@@ -258,12 +264,12 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if segs.is_empty() {
         return None;
     }
-    let (relative, needed, dynsym) = match dyn_span {
+    let (relative, needed, dynsym, rpath, runpath) = match dyn_span {
         Some((start, end)) => {
             let parsed = parse_relative(elf, &segs, &elf[start..end])?;
-            (parsed.rels, parsed.needed, parsed.dynsym)
+            (parsed.rels, parsed.needed, parsed.dynsym, parsed.rpath, parsed.runpath)
         }
-        None => (Vec::new(), Vec::new(), DynSym::none()),
+        None => (Vec::new(), Vec::new(), DynSym::none(), None, None),
     };
     Some(ElfParsed {
         kind,
@@ -275,6 +281,8 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
         relative,
         needed,
         dynsym,
+        rpath,
+        runpath,
     })
 }
 
@@ -669,6 +677,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_PLTREL: u64 = 20;
     const DT_JMPREL: u64 = 23;
     const DT_SONAME: u64 = 14;
+    const DT_RPATH: u64 = 15;
+    const DT_RUNPATH: u64 = 29;
     const DT_GNU_HASH: u64 = 0x6fff_fef5;
     const DT_VERSYM: u64 = 0x6fff_fff0;
     const DT_VERDEF: u64 = 0x6fff_fffc;
@@ -696,6 +706,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut verneed_addr = 0u64;
     let mut verneednum = 0u64;
     let mut soname_off: Option<u64> = None;
+    let mut rpath_off: Option<u64> = None;
+    let mut runpath_off: Option<u64> = None;
     let mut rel_addr = 0u64;
     let mut rel_sz = 0u64;
     let mut jmprel = 0u64;
@@ -737,6 +749,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             gnu_addr = val;
         } else if tag == DT_SONAME {
             soname_off = Some(val);
+        } else if tag == DT_RPATH {
+            rpath_off = Some(val);
+        } else if tag == DT_RUNPATH {
+            runpath_off = Some(val);
         } else if tag == DT_VERSYM {
             versym_addr = val;
         } else if tag == DT_VERDEF {
@@ -814,6 +830,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
         }
         None => None,
     };
+    let rpath = path_dirs(elf, strtab_off, rpath_off)?;
+    let runpath = path_dirs(elf, strtab_off, runpath_off)?;
     let vers = parse_symvers(
         elf,
         segs,
@@ -923,7 +941,41 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             vers,
             soname,
         },
+        rpath,
+        runpath,
     })
+}
+
+/// Строка `DT_RPATH` или `DT_RUNPATH`: каталоги через `:`.
+/// None на входе — тега нет. Пустая строка — тег есть.
+fn path_dirs(elf: &[u8], strtab: Option<usize>, off: Option<u64>) -> Option<Option<Vec<String>>> {
+    let Some(off) = off else {
+        return Some(None);
+    };
+    let base = strtab?;
+    let text = match sym_name(elf, base, off as usize) {
+        Ok(Some(raw)) => {
+            if raw.len() > 1024 {
+                return None;
+            }
+            core::str::from_utf8(raw).ok()?
+        }
+        Ok(None) => "",
+        Err(()) => return None,
+    };
+    let mut dirs = Vec::new();
+    if !text.is_empty() {
+        for part in text.split(':') {
+            if part.is_empty() {
+                continue;
+            }
+            if part.len() > 200 || dirs.len() >= 32 {
+                return None;
+            }
+            dirs.push(String::from(part));
+        }
+    }
+    Some(Some(dirs))
 }
 
 fn vaddr_file_off(segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
@@ -996,6 +1048,8 @@ struct LinkObj {
     /// 0 — программа и её DT_NEEDED. 1 — интерпретатор и его DT_NEEDED.
     group: u8,
     path: Option<String>,
+    /// Кто записал этот объект в `DT_NEEDED`. У программы и интерпретатора нет.
+    loaded_by: Option<usize>,
 }
 
 struct Linked {
@@ -1003,21 +1057,160 @@ struct Linked {
     interp_index: Option<usize>,
 }
 
-/// Абсолютный DT_NEEDED берётся как есть. Имя без слэша — `/lib/<имя>`.
-/// Относительный путь со слэшем не ищем: RPATH и LD_LIBRARY_PATH нет.
-fn needed_path(spec: &str) -> Option<String> {
+/// Каталог файла: `/app/bin/prog` → `/app/bin`, `/prog` → пустая строка.
+fn origin_dir(path: Option<&str>) -> Option<String> {
+    let path = path?;
+    match path.rfind('/') {
+        Some(0) | None => Some(String::new()),
+        Some(i) => Some(String::from(&path[..i])),
+    }
+}
+
+/// Длина DST после `$`. `ORIGIN`, `LIB`, `PLATFORM`, в том числе в `${...}`.
+fn dst_len(input: &[u8], name: &[u8]) -> Option<usize> {
+    let (body, curly) = if input.first() == Some(&b'{') {
+        (&input[1..], true)
+    } else {
+        (input, false)
+    };
+    if body.len() < name.len() || &body[..name.len()] != name {
+        return None;
+    }
+    let after = &body[name.len()..];
+    if curly {
+        if after.first() != Some(&b'}') {
+            return None;
+        }
+        return Some(name.len() + 2);
+    }
+    if let Some(&c) = after.first() {
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            return None;
+        }
+    }
+    Some(name.len())
+}
+
+/// `$ORIGIN` — каталог объекта, `$LIB` — `lib`. `$PLATFORM` отвергает строку.
+/// Прочий `$` остаётся как есть.
+fn expand_token(raw: &str, origin: Option<&str>) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let rest = &bytes[i + 1..];
+        if let Some(n) = dst_len(rest, b"ORIGIN") {
+            out.extend_from_slice(origin?.as_bytes());
+            i += 1 + n;
+        } else if let Some(n) = dst_len(rest, b"LIB") {
+            out.extend_from_slice(b"lib");
+            i += 1 + n;
+        } else if dst_len(rest, b"PLATFORM").is_some() {
+            return None;
+        } else {
+            out.push(b'$');
+            i += 1;
+        }
+    }
+    if out.len() > 200 {
+        return None;
+    }
+    core::str::from_utf8(&out).ok().map(String::from)
+}
+
+fn expand_dirs(raw: &[String], origin: Option<&str>, cwd: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for dir in raw {
+        let expanded = expand_token(dir, origin)?;
+        if expanded.is_empty() {
+            continue;
+        }
+        out.push(crate::fs::resolve(cwd, &expanded)?);
+    }
+    Some(out)
+}
+
+/// Каталоги поиска имени без слэша до `/lib`.
+/// `DT_RUNPATH` того объекта, чей `DT_NEEDED` резолвится, отменяет всякий
+/// `DT_RPATH`. Иначе — `DT_RPATH` объекта, затем его загрузчиков. `DT_RPATH`
+/// библиотеки действует и для зависимостей её зависимостей, даже если у неё
+/// самой есть `DT_RUNPATH`: тот смотрит только прямые. `DT_RPATH` программы
+/// не используется, если у программы есть `DT_RUNPATH`. Если цепочка
+/// загрузчиков до программы не дошла, её `DT_RPATH` добавляется в конце.
+fn rpath_dirs(objs: &[LinkObj], index: usize, cwd: &str) -> Option<Vec<String>> {
+    if objs[index].parsed.runpath.is_some() {
+        let origin = origin_dir(objs[index].path.as_deref());
+        let raw = objs[index].parsed.runpath.as_deref().unwrap_or(&[]);
+        return expand_dirs(raw, origin.as_deref(), cwd);
+    }
+    let mut dirs = Vec::new();
+    let mut cur = Some(index);
+    let mut saw_main = false;
+    while let Some(i) = cur {
+        if i == 0 {
+            saw_main = true;
+        }
+        // У программы с DT_RUNPATH её DT_RPATH выключен целиком.
+        if !(i == 0 && objs[0].parsed.runpath.is_some()) {
+            if let Some(raw) = &objs[i].parsed.rpath {
+                let origin = origin_dir(objs[i].path.as_deref());
+                for dir in expand_dirs(raw, origin.as_deref(), cwd)? {
+                    dirs.push(dir);
+                }
+            }
+        }
+        cur = objs[i].loaded_by;
+    }
+    if !saw_main && objs[0].parsed.runpath.is_none() {
+        if let Some(raw) = &objs[0].parsed.rpath {
+            let origin = origin_dir(objs[0].path.as_deref());
+            for dir in expand_dirs(raw, origin.as_deref(), cwd)? {
+                dirs.push(dir);
+            }
+        }
+    }
+    Some(dirs)
+}
+
+fn lib_in(dir: &str, name: &str) -> Option<String> {
+    let mut path = String::from(dir);
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(name);
+    crate::fs::resolve("/", &path)
+}
+
+/// Куда пробовать `DT_NEEDED`, по порядку. Имя без слэша — каталоги выше,
+/// затем `/lib`. Путь со слэшем — один файл, от cwd после подстановки.
+fn locate_needed(objs: &[LinkObj], index: usize, spec: &str, cwd: &str) -> Option<Vec<String>> {
     if spec.is_empty() || spec.len() > 200 || spec.as_bytes().contains(&0) {
         return None;
     }
-    if spec.starts_with('/') {
-        return crate::fs::resolve("/", spec);
-    }
-    if spec.starts_with('.') || spec.contains('/') {
+    let origin = origin_dir(objs[index].path.as_deref());
+    let expanded = expand_token(spec, origin.as_deref())?;
+    if expanded.is_empty() || expanded.len() > 200 {
         return None;
     }
-    let mut path = String::from("/lib/");
-    path.push_str(spec);
-    crate::fs::resolve("/", &path)
+    if expanded.contains('/') {
+        return Some(alloc::vec![crate::fs::resolve(cwd, &expanded)?]);
+    }
+    if expanded.starts_with('.') {
+        return None;
+    }
+    let mut cands = Vec::new();
+    for dir in rpath_dirs(objs, index, cwd)? {
+        cands.push(lib_in(&dir, &expanded)?);
+    }
+    let mut fallback = String::from("/lib/");
+    fallback.push_str(&expanded);
+    cands.push(crate::fs::resolve("/", &fallback)?);
+    Some(cands)
 }
 
 fn reserved_hit(segs: &[LoadSeg], bias: u64) -> bool {
@@ -1094,7 +1287,14 @@ fn place(img: &ElfParsed, role: PlaceRole, objs: &[LinkObj]) -> Option<u64> {
     }
 }
 
-fn load_needed<F>(objs: &mut Vec<LinkObj>, seen: &mut Vec<String>, start: usize, fetch: &mut F, group: u8) -> bool
+fn load_needed<F>(
+    objs: &mut Vec<LinkObj>,
+    seen: &mut Vec<String>,
+    start: usize,
+    fetch: &mut F,
+    group: u8,
+    cwd: &str,
+) -> bool
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
@@ -1105,19 +1305,31 @@ where
         head += 1;
         let needed = objs[index].parsed.needed.clone();
         for spec in needed {
-            let Some(path) = needed_path(&spec) else {
+            let Some(cands) = locate_needed(objs, index, &spec, cwd) else {
                 serial_println!("[task] DT_NEEDED path rejected: {}", spec);
                 return false;
             };
-            if seen.iter().any(|have| have == &path) {
+            let mut skip = false;
+            let mut chosen: Option<(String, Vec<u8>)> = None;
+            for path in cands {
+                if seen.iter().any(|have| have == &path) {
+                    skip = true;
+                    break;
+                }
+                if objs.len() >= MAX_LINK {
+                    serial_println!("[task] DT_NEEDED cap {}", MAX_LINK);
+                    return false;
+                }
+                if let Some(bytes) = fetch(&path) {
+                    chosen = Some((path, bytes));
+                    break;
+                }
+            }
+            if skip {
                 continue;
             }
-            if objs.len() >= MAX_LINK {
-                serial_println!("[task] DT_NEEDED cap {}", MAX_LINK);
-                return false;
-            }
-            let Some(bytes) = fetch(&path) else {
-                serial_println!("[task] DT_NEEDED missing {}", path);
+            let Some((path, bytes)) = chosen else {
+                serial_println!("[task] DT_NEEDED missing {}", spec);
                 return false;
             };
             let Some(parsed) = parse_elf64(&bytes) else {
@@ -1140,6 +1352,7 @@ where
                 bias,
                 group,
                 path: Some(path),
+                loaded_by: Some(index),
             });
             queue.push(objs.len() - 1);
         }
@@ -1292,10 +1505,27 @@ fn bind_all(objs: &mut [LinkObj]) -> bool {
     true
 }
 
-fn link_with<F>(main_bytes: &[u8], mut fetch: F) -> Option<Linked>
+fn link_with<F>(main_bytes: &[u8], fetch: F) -> Option<Linked>
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
+    link_at(main_bytes, None, "/", fetch)
+}
+
+fn link_at<F>(main_bytes: &[u8], origin: Option<&str>, cwd: &str, mut fetch: F) -> Option<Linked>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    let main_path = match origin {
+        Some(path) => match crate::fs::resolve("/", path) {
+            Some(canon) => Some(canon),
+            None => {
+                serial_println!("[task] bad executable path");
+                return None;
+            }
+        },
+        None => None,
+    };
     let parsed = match parse_elf64(main_bytes) {
         Some(parsed) => parsed,
         None => {
@@ -1314,10 +1544,11 @@ where
         parsed,
         bias,
         group: 0,
-        path: None,
+        path: main_path,
+        loaded_by: None,
     });
     let mut seen = Vec::new();
-    if !load_needed(&mut objs, &mut seen, 0, &mut fetch, 0) {
+    if !load_needed(&mut objs, &mut seen, 0, &mut fetch, 0, cwd) {
         return None;
     }
     let mut interp_index = None;
@@ -1357,10 +1588,11 @@ where
             bias: ibias,
             group: 1,
             path: Some(canon),
+            loaded_by: None,
         });
         let index = objs.len() - 1;
         interp_index = Some(index);
-        if !load_needed(&mut objs, &mut seen, index, &mut fetch, 1) {
+        if !load_needed(&mut objs, &mut seen, index, &mut fetch, 1, cwd) {
             return None;
         }
     }
@@ -1370,8 +1602,8 @@ where
     Some(Linked { objs, interp_index })
 }
 
-fn link_program(bytes: &[u8]) -> Option<Linked> {
-    link_with(bytes, |path| crate::fs::read_canon(path))
+fn link_program(bytes: &[u8], origin: &str, cwd: &str) -> Option<Linked> {
+    link_at(bytes, Some(origin), cwd, |path| crate::fs::read_canon(path))
 }
 
 // ---- Адресное пространство ----
@@ -2040,6 +2272,8 @@ fn build_task(
         USER_STACK_TOP,
         frame_allocator,
         Cred::root(),
+        name,
+        "/",
     )?;
     finish_task(aspace, img, name)
 }
@@ -2142,8 +2376,10 @@ pub fn load_elf_image(
     stack_top: u64,
     frame_allocator: &mut BootInfoFrameAllocator,
     cred: Cred,
+    origin: &str,
+    cwd: &str,
 ) -> Result<LoadedImage, MapToError<Size4KiB>> {
-    let linked = match link_program(elf_bytes) {
+    let linked = match link_program(elf_bytes, origin, cwd) {
         Some(linked) => linked,
         None => return Err(MapToError::FrameAllocationFailed),
     };
@@ -3010,12 +3246,10 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
     crate::serial_println!("[execve] tid {} path '{}'", current_tid(), path);
 
     // 2) Разрешить путь и прочитать ELF.
-    let canon = {
-        let cwd = current_cwd();
-        match crate::fs::resolve(&cwd, &path) {
-            Some(c) => c,
-            None => return E2BIG,
-        }
+    let cwd = current_cwd();
+    let canon = match crate::fs::resolve(&cwd, &path) {
+        Some(c) => c,
+        None => return E2BIG,
     };
     let elf = match crate::fs::read_canon(&canon) {
         Some(e) => e,
@@ -3046,7 +3280,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         } else {
             argv
         };
-        let img = load_elf_image(l4, &elf, &argv_full, &envp, USER_STACK_TOP, fa, cred)?;
+        let img = load_elf_image(l4, &elf, &argv_full, &envp, USER_STACK_TOP, fa, cred, &canon, &cwd)?;
         Ok((aspace, img))
     });
     let (aspace, img) = match built {
@@ -5103,6 +5337,257 @@ mod tests {
         bad[0x902] = 5;
         bad[0x903] = 0;
         assert!(parse_elf64(&bad).is_none());
+        serial_println!("[ok]");
+    }
+
+    /// `DT_NEEDED` и, если заданы, `DT_RPATH` / `DT_RUNPATH`. Пустая строка —
+    /// тег есть, каталогов нет.
+    fn craft_search(
+        needed: &[&str],
+        rpath: Option<&str>,
+        runpath: Option<&str>,
+        interp: Option<&str>,
+    ) -> Vec<u8> {
+        let mut strings = alloc::vec![0u8];
+        let mut needed_at = Vec::new();
+        for name in needed {
+            needed_at.push(strings.len() as u64);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let put_path = |strings: &mut Vec<u8>, text: &str| -> u64 {
+            if text.is_empty() {
+                return 0;
+            }
+            let at = strings.len() as u64;
+            strings.extend_from_slice(text.as_bytes());
+            strings.push(0);
+            at
+        };
+        let rpath_at = rpath.map(|text| put_path(&mut strings, text));
+        let runpath_at = runpath.map(|text| put_path(&mut strings, text));
+        assert!(strings.len() <= 0x100, "dynstr overlaps symtab");
+
+        let mut tags: Vec<(u64, u64)> = Vec::new();
+        for at in &needed_at {
+            tags.push((1, *at));
+        }
+        tags.push((5, 0x100));
+        tags.push((6, 0x200));
+        tags.push((11, 24));
+        if let Some(at) = rpath_at {
+            tags.push((15, at));
+        }
+        if let Some(at) = runpath_at {
+            tags.push((29, at));
+        }
+        tags.push((0, 0));
+        let mut dynamic = Vec::new();
+        for (tag, val) in tags {
+            dynamic.extend_from_slice(&tag.to_le_bytes());
+            dynamic.extend_from_slice(&val.to_le_bytes());
+        }
+
+        let mut elf = alloc::vec![0u8; 0x100];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        let phnum: u16 = if interp.is_some() { 3 } else { 2 };
+        elf[56..58].copy_from_slice(&phnum.to_le_bytes());
+        let put_phdr = |elf: &mut Vec<u8>, at: usize, typ: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64| {
+            let p = &mut elf[at..at + 56];
+            p[0..4].copy_from_slice(&typ.to_le_bytes());
+            p[4..8].copy_from_slice(&flags.to_le_bytes());
+            p[8..16].copy_from_slice(&off.to_le_bytes());
+            p[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            p[24..32].copy_from_slice(&vaddr.to_le_bytes());
+            p[32..40].copy_from_slice(&filesz.to_le_bytes());
+            p[40..48].copy_from_slice(&memsz.to_le_bytes());
+            p[48..56].copy_from_slice(&align.to_le_bytes());
+        };
+        put_phdr(&mut elf, 0x40, 1, 7, 0, 0, 0, 0, 0x1000);
+        put_phdr(&mut elf, 0x78, 2, 6, 0x300, 0x300, dynamic.len() as u64, dynamic.len() as u64, 8);
+        if let Some(path) = interp {
+            let mut raw = path.as_bytes().to_vec();
+            raw.push(0);
+            assert!(0xF0 + raw.len() <= 0x100);
+            elf[0xF0..0xF0 + raw.len()].copy_from_slice(&raw);
+            put_phdr(&mut elf, 0xB0, 3, 4, 0xF0, 0xF0, raw.len() as u64, raw.len() as u64, 1);
+        }
+        let place = |elf: &mut Vec<u8>, at: usize, data: &[u8]| {
+            if elf.len() < at + data.len() {
+                elf.resize(at + data.len(), 0);
+            }
+            elf[at..at + data.len()].copy_from_slice(data);
+        };
+        place(&mut elf, 0x100, &strings);
+        place(&mut elf, 0x200, &[0u8; 24]);
+        place(&mut elf, 0x300, &dynamic);
+        let len = elf.len() as u64;
+        elf[0x40 + 32..0x40 + 40].copy_from_slice(&len.to_le_bytes());
+        elf[0x40 + 40..0x40 + 48].copy_from_slice(&len.to_le_bytes());
+        elf
+    }
+
+    fn load_logged(
+        main: &[u8],
+        origin: Option<&str>,
+        cwd: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> (Option<Linked>, Vec<String>) {
+        let log = core::cell::RefCell::new(Vec::new());
+        let linked = link_at(main, origin, cwd, |path| {
+            log.borrow_mut().push(String::from(path));
+            files.iter().find(|(name, _)| *name == path).map(|(_, bytes)| bytes.clone())
+        });
+        (linked, log.into_inner())
+    }
+
+    #[test_case]
+    fn runpath_beats_rpath_and_expands_tokens() {
+        serial_print!("test runpath_beats_rpath_and_expands_tokens... ");
+        let lib = craft_dyn(&[], &[], &[], false, false, None);
+        let main = craft_search(&["libfoo.so"], Some("/wrong"), Some("/opt"), None);
+        let (linked, log) = load_logged(main.as_slice(), None, "/", &[("/opt/libfoo.so", lib.clone())]);
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/opt/libfoo.so")]);
+        let main = craft_search(&["libfoo.so"], None, Some("$ORIGIN/../lib"), None);
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            Some("/app/bin/prog"),
+            "/",
+            &[("/app/lib/libfoo.so", lib.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/app/lib/libfoo.so")]);
+        let main = craft_search(&["libfoo.so"], None, Some("/usr/$LIB"), None);
+        let (linked, log) = load_logged(main.as_slice(), None, "/", &[("/usr/lib/libfoo.so", lib)]);
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/usr/lib/libfoo.so")]);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn rpath_follows_the_loader_until_runpath() {
+        serial_print!("test rpath_follows_the_loader_until_runpath... ");
+        let libb = craft_dyn(&[], &[], &[], false, false, None);
+        let liba = craft_search(&["libb.so"], None, None, None);
+        let main = craft_search(&["liba.so"], Some("/opt"), None, None);
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/",
+            &[("/opt/liba.so", liba), ("/opt/libb.so", libb.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/opt/liba.so"), String::from("/opt/libb.so")]
+        );
+        let liba = craft_search(&["libb.so"], None, Some("/else"), None);
+        let main = craft_search(&["liba.so"], Some("/opt"), None, None);
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/",
+            &[("/opt/liba.so", liba), ("/else/libb.so", libb)],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/opt/liba.so"), String::from("/else/libb.so")]
+        );
+        // У liba есть и RPATH, и RUNPATH. Прямая зависимость берёт только
+        // RUNPATH. Зависимость той зависимости снова видит RPATH liba,
+        // а RUNPATH liba — нет.
+        let libd = craft_dyn(&[], &[], &[], false, false, None);
+        let libb = craft_search(&["libd.so"], None, None, None);
+        let liba = craft_search(&["libb.so"], Some("/froma"), Some("/else"), None);
+        let main = craft_search(&["liba.so"], Some("/opt"), None, None);
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/",
+            &[
+                ("/opt/liba.so", liba),
+                ("/else/libb.so", libb),
+                ("/froma/libd.so", libd),
+            ],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![
+                String::from("/opt/liba.so"),
+                String::from("/else/libb.so"),
+                String::from("/froma/libd.so"),
+            ]
+        );
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn empty_runpath_relative_path_and_platform() {
+        serial_print!("test empty_runpath_relative_path_and_platform... ");
+        let lib = craft_dyn(&[], &[], &[], false, false, None);
+        let main = craft_search(&["libfoo.so"], Some("/opt"), Some(""), None);
+        let (linked, log) = load_logged(main.as_slice(), None, "/", &[("/lib/libfoo.so", lib.clone())]);
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/lib/libfoo.so")]);
+        let main = craft_search(&["./libfoo.so"], None, None, None);
+        let (linked, log) = load_logged(main.as_slice(), None, "/app", &[("/app/libfoo.so", lib.clone())]);
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/app/libfoo.so")]);
+        let main = craft_search(&["libfoo.so"], None, Some("rel"), None);
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/app",
+            &[("/app/rel/libfoo.so", lib)],
+        );
+        assert!(linked.is_some());
+        assert_eq!(log, alloc::vec![String::from("/app/rel/libfoo.so")]);
+        let main = craft_search(&["libfoo.so"], None, Some("/usr/$PLATFORM"), None);
+        assert!(link_at(main.as_slice(), None, "/", |_| Some(Vec::new())).is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn interpreter_uses_the_executable_rpath() {
+        serial_print!("test interpreter_uses_the_executable_rpath... ");
+        let lib = craft_dyn(&[], &[], &[], false, false, None);
+        let ld = craft_dyn(&["libld.so"], &[], &[], false, false, None);
+        let main = craft_search(&[], Some("/opt"), None, Some("/bin/ld.so"));
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/",
+            &[("/bin/ld.so", ld.clone()), ("/opt/libld.so", lib.clone())],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/bin/ld.so"), String::from("/opt/libld.so")]
+        );
+        let main = craft_search(&[], Some("/opt"), Some("/app-run"), Some("/bin/ld.so"));
+        let (linked, log) = load_logged(
+            main.as_slice(),
+            None,
+            "/",
+            &[("/bin/ld.so", ld), ("/lib/libld.so", lib)],
+        );
+        assert!(linked.is_some());
+        assert_eq!(
+            log,
+            alloc::vec![String::from("/bin/ld.so"), String::from("/lib/libld.so")]
+        );
         serial_println!("[ok]");
     }
 }
