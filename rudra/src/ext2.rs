@@ -12,6 +12,7 @@
 //! индекс не разбирается как имена, листья — обычные записи. Короткая ссылка
 //! (меньше 60 байт и без блоков) лежит в `i_block`. `metadata_csum` проверяется
 //! crc32c (суперблок, дескриптор группы, inode, блок каталога, блок extent).
+//! Старый `gdt_csum` без `metadata_csum` проверяет дескриптор группы crc16.
 //! Запись такого тома — `EROFS`. Журнал не проигрывается (флаг RECOVER
 //! отвергает монтирование). `RFS2` остаётся recovery, если суперблок не подошёл.
 
@@ -30,6 +31,9 @@ const BIT64: u32 = 0x80;
 /// Зерно crc32c лежит в суперблоке (`s_checksum_seed`), а не считается из UUID.
 const CSUM_SEED: u32 = 0x2000;
 const METADATA_CSUM: u32 = 0x400;
+/// Старая сумма дескриптора группы. Вместе с `metadata_csum` не считается:
+/// тогда дескриптор проверяет crc32c.
+const GDT_CSUM: u32 = 0x10;
 const INLINE_DATA_FL: u32 = 0x10000000;
 const FT_DIR_CSUM: u8 = 0xDE;
 const EXTENTS_FL: u32 = 0x80000;
@@ -53,6 +57,8 @@ struct Vol {
     readonly: bool,
     /// ro_compat `metadata_csum`. Считаем crc32c, как Linux `ext4_chksum`.
     metadata_csum: bool,
+    /// Старый `gdt_csum` и нет `metadata_csum`. Дескриптор группы — crc16.
+    gdt_crc16: bool,
     /// Зерно crc32c: `s_checksum_seed` либо `crc32c(~0, UUID)`.
     csum_seed: u32,
     /// Сумма inode только у создателя Linux: поле лежит в osd2.
@@ -315,6 +321,7 @@ impl Vol {
         let ro_compat = get_u32(&sb, 100);
         let readonly = features(incompat, ro_compat)?;
         let metadata_csum = ro_compat & METADATA_CSUM != 0;
+        let gdt_crc16 = ro_compat & GDT_CSUM != 0 && !metadata_csum;
         let (csum_seed, csum_inodes) = if metadata_csum {
             // s_checksum_type @ 0x173: ext4 пишет 1 (crc32c). Иное — не наш алгоритм.
             if sb.len() < 1024 || sb[0x173] != 1 || !super_csum_ok(&sb) {
@@ -362,6 +369,9 @@ impl Vol {
         if metadata_csum && !gd_csum_ok(csum_seed, 0, &gd) {
             return Err("checksum");
         }
+        if gdt_crc16 && !gd_crc16_ok(&sb[104..120], 0, &gd) {
+            return Err("checksum");
+        }
         let block_bitmap = get_u32(&gd, 0);
         let inode_bitmap = get_u32(&gd, 4);
         let inode_table = gd_inode_table(&gd).map_err(|_| "group desc")?;
@@ -391,6 +401,7 @@ impl Vol {
             filetype: incompat & FILETYPE != 0,
             readonly,
             metadata_csum,
+            gdt_crc16,
             csum_seed,
             csum_inodes,
             blocks_per_group,
@@ -577,6 +588,9 @@ impl Vol {
         let byte = gdt_byte(self.off, self.block_size) + group as u64 * self.desc_size as u64;
         read_abs(byte, &mut gd)?;
         if self.metadata_csum && !gd_csum_ok(self.csum_seed, group, &gd) {
+            return Err(FsError::Io);
+        }
+        if self.gdt_crc16 && !gd_crc16_ok(&self.sb[104..120], group, &gd) {
             return Err(FsError::Io);
         }
         gd_inode_table(&gd)
@@ -1574,6 +1588,35 @@ fn super_csum_ok(sb: &[u8]) -> bool {
     sb.len() >= 1024 && crc32c(!0, &sb[..1020]) == get_u32(sb, 1020)
 }
 
+/// CRC-16/ARC, как Linux `crc16`: полином `0x8005` отражённый, конечного xor нет.
+/// `crc16(0, b"123456789") == 0xBB3D`, `crc16(0xFFFF, …) == 0x4B37`.
+fn crc16(mut crc: u16, data: &[u8]) -> u16 {
+    for &b in data {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xA001 & mask);
+        }
+    }
+    crc
+}
+
+/// Старый `gdt_csum`: `crc16(~0, UUID || номер группы || дескриптор)`.
+/// Два байта суммы пропускаются, а не зануляются. Хвост длиннее 32 байт
+/// входит в счёт: без 64bit дескриптор короче и хвоста нет.
+fn gd_crc16_ok(uuid: &[u8], group: u32, gd: &[u8]) -> bool {
+    if uuid.len() != 16 || gd.len() < 32 {
+        return false;
+    }
+    let mut c = crc16(0xFFFF, uuid);
+    c = crc16(c, &group.to_le_bytes());
+    c = crc16(c, &gd[..30]);
+    if gd.len() > 32 {
+        c = crc16(c, &gd[32..]);
+    }
+    c == get_u16(gd, 30)
+}
+
 fn gd_csum_ok(seed: u32, group: u32, gd: &[u8]) -> bool {
     if gd.len() < 32 {
         return false;
@@ -1719,7 +1762,7 @@ fn features(incompat: u32, ro: u32) -> Result<bool, &'static str> {
     const OK: u32 = FILETYPE | EXTENTS | FLEX_BG | BIT64 | CSUM_SEED;
     // sparse_super, large_file, huge_file, gdt_csum, dir_nlink, extra_isize,
     // metadata_csum. crc32c проверяет open, если стоит metadata_csum.
-    // Старый gdt_csum (crc16) без metadata_csum не проверяем.
+    // gdt_csum без metadata_csum проверяет дескриптор crc16.
     const RO_OK: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | 0x400;
     if incompat & !OK != 0 {
         return Err("incompat feature");
@@ -2148,6 +2191,35 @@ mod tests {
         assert!(extent_csum_ok(dseed, &ext));
         ext[12] ^= 1;
         assert!(!extent_csum_ok(dseed, &ext));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn ext4_gdt_csum_matches_crc16() {
+        serial_print!("test ext4_gdt_csum_matches_crc16... ");
+        assert_eq!(crc16(0, b"123456789"), 0xBB3D, "crc-16/arc");
+        assert_eq!(crc16(0xFFFF, b"123456789"), 0x4B37, "crc-16/modbus");
+        let uuid = b"rudra-uuid-bytes";
+        let mut gd = [0u8; 32];
+        put_u32(&mut gd, 8, 40);
+        let mut c = crc16(0xFFFF, uuid);
+        c = crc16(c, &7u32.to_le_bytes());
+        c = crc16(c, &gd[..30]);
+        put_u16(&mut gd, 30, c);
+        assert!(gd_crc16_ok(uuid, 7, &gd));
+        gd[8] ^= 1;
+        assert!(!gd_crc16_ok(uuid, 7, &gd));
+
+        // Хвост 64bit входит в сумму, а уже записанное поле суммы — нет.
+        let mut wide = [0xA5u8; 64];
+        let mut c = crc16(0xFFFF, uuid);
+        c = crc16(c, &1u32.to_le_bytes());
+        c = crc16(c, &wide[..30]);
+        c = crc16(c, &wide[32..]);
+        put_u16(&mut wide, 30, c);
+        assert!(gd_crc16_ok(uuid, 1, &wide));
+        wide[40] ^= 1;
+        assert!(!gd_crc16_ok(uuid, 1, &wide));
         serial_println!("[ok]");
     }
 }
