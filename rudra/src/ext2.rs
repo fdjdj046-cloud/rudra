@@ -8,10 +8,12 @@
 //! (степень двойки от 64 до размера блока), номер inode-таблицы собирается
 //! из младшей и старшей половин. Число блоков тоже 64-битное. Дерево extent
 //! (корень в inode, глубина до 5) отдаёт физический блок до 48 бит; дыра и
-//! unwritten читаются нулями. Запись такого тома — `EROFS`. Журнал не
-//! проигрывается (флаг RECOVER отвергает монтирование). Каталог с htree
-//! (`EXT4_INDEX_FL`) не читается. `RFS2` остаётся recovery, если суперблок
-//! не подошёл.
+//! unwritten читаются нулями. Каталог с htree читается по логическим блокам:
+//! индекс не разбирается как имена, листья — обычные записи. Короткая ссылка
+//! (меньше 60 байт и без блоков) лежит в `i_block`. `metadata_csum` проверяется
+//! crc32c (суперблок, дескриптор группы, inode, блок каталога, блок extent).
+//! Запись такого тома — `EROFS`. Журнал не проигрывается (флаг RECOVER
+//! отвергает монтирование). `RFS2` остаётся recovery, если суперблок не подошёл.
 
 use alloc::string::String;
 use alloc::vec;
@@ -25,10 +27,12 @@ pub const EMBED_OFF: u64 = 16 * 1024 * 1024;
 
 const FILETYPE: u32 = 0x2;
 const BIT64: u32 = 0x80;
-/// Зерно crc32c лежит в суперблоке, а не в UUID. Сумму мы не считаем.
+/// Зерно crc32c лежит в суперблоке (`s_checksum_seed`), а не считается из UUID.
 const CSUM_SEED: u32 = 0x2000;
+const METADATA_CSUM: u32 = 0x400;
+const INLINE_DATA_FL: u32 = 0x10000000;
+const FT_DIR_CSUM: u8 = 0xDE;
 const EXTENTS_FL: u32 = 0x80000;
-const INDEX_FL: u32 = 0x1000;
 const HUGE_FL: u32 = 0x40000;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT2_FT_REG: u8 = 1;
@@ -47,6 +51,12 @@ struct Vol {
     filetype: bool,
     /// ext4 с extent: метаданные не переписываем, мутации возвращают `RoFs`.
     readonly: bool,
+    /// ro_compat `metadata_csum`. Считаем crc32c, как Linux `ext4_chksum`.
+    metadata_csum: bool,
+    /// Зерно crc32c: `s_checksum_seed` либо `crc32c(~0, UUID)`.
+    csum_seed: u32,
+    /// Сумма inode только у создателя Linux: поле лежит в osd2.
+    csum_inodes: bool,
     blocks_per_group: u32,
     inodes_per_group: u32,
     /// 32 у ext2. У ext4 с 64bit — `s_desc_size`, от 64 и степень двойки.
@@ -302,7 +312,27 @@ impl Vol {
             return Err("inode size");
         }
         let incompat = get_u32(&sb, 96);
-        let readonly = features(incompat, get_u32(&sb, 100))?;
+        let ro_compat = get_u32(&sb, 100);
+        let readonly = features(incompat, ro_compat)?;
+        let metadata_csum = ro_compat & METADATA_CSUM != 0;
+        let (csum_seed, csum_inodes) = if metadata_csum {
+            // s_checksum_type @ 0x173: ext4 пишет 1 (crc32c). Иное — не наш алгоритм.
+            if sb.len() < 1024 || sb[0x173] != 1 || !super_csum_ok(&sb) {
+                return Err(if sb.len() < 1024 || sb[0x173] != 1 {
+                    "checksum type"
+                } else {
+                    "checksum"
+                });
+            }
+            let seed = if incompat & CSUM_SEED != 0 {
+                get_u32(&sb, 0x270)
+            } else {
+                crc32c(!0, &sb[104..120])
+            };
+            (seed, get_u32(&sb, 72) == 1)
+        } else {
+            (0, false)
+        };
         let bit64 = incompat & BIT64 != 0;
         let blocks_hi = if sb.len() >= 340 { get_u32(&sb, 336) } else { 0 };
         if blocks_hi != 0 && !bit64 {
@@ -329,6 +359,9 @@ impl Vol {
         // 1024: суперблок — блок 1, таблица групп — блок 2.
         // 2048 и 4096: суперблок внутри блока 0, таблица групп — следующий блок.
         read_abs(gdt_byte(off, block_size), &mut gd).map_err(|_| "gdt read")?;
+        if metadata_csum && !gd_csum_ok(csum_seed, 0, &gd) {
+            return Err("checksum");
+        }
         let block_bitmap = get_u32(&gd, 0);
         let inode_bitmap = get_u32(&gd, 4);
         let inode_table = gd_inode_table(&gd).map_err(|_| "group desc")?;
@@ -357,6 +390,9 @@ impl Vol {
             first_ino,
             filetype: incompat & FILETYPE != 0,
             readonly,
+            metadata_csum,
+            csum_seed,
+            csum_inodes,
             blocks_per_group,
             inodes_per_group,
             desc_size,
@@ -540,6 +576,9 @@ impl Vol {
         let mut gd = vec![0u8; self.desc_size];
         let byte = gdt_byte(self.off, self.block_size) + group as u64 * self.desc_size as u64;
         read_abs(byte, &mut gd)?;
+        if self.metadata_csum && !gd_csum_ok(self.csum_seed, group, &gd) {
+            return Err(FsError::Io);
+        }
         gd_inode_table(&gd)
     }
 
@@ -557,9 +596,22 @@ impl Vol {
         let inner = (index % per) * self.inode_size;
         let mut blk = vec![0u8; self.block_size];
         self.read_block(block, &mut blk)?;
-        let mut out = vec![0u8; 128];
-        let n = 128.min(self.inode_size);
-        out[..n].copy_from_slice(&blk[inner..inner + n]);
+        let n = if self.csum_inodes {
+            self.inode_size
+        } else {
+            128.min(self.inode_size)
+        };
+        if inner + n > blk.len() {
+            return Err(FsError::Io);
+        }
+        let mut out = vec![0u8; n];
+        out.copy_from_slice(&blk[inner..inner + n]);
+        if self.csum_inodes {
+            let seed = inode_csum_seed(self.csum_seed, ino, get_u32(&out, 100));
+            if !inode_csum_ok(seed, &out) {
+                return Err(FsError::Io);
+            }
+        }
         Ok(out)
     }
 
@@ -584,11 +636,17 @@ impl Vol {
         Ok(get_u16(&inode, 0) & 0xF000 == 0x4000)
     }
 
-    fn map_block(&self, inode: &[u8], iblock: u32) -> Result<u64, FsError> {
+    fn map_block(&self, ino: u32, inode: &[u8], iblock: u32) -> Result<u64, FsError> {
         if inode.len() >= 100 && get_u32(inode, 32) & EXTENTS_FL != 0 {
             return extent_map(&inode[40..100], iblock, &mut |b| {
                 let mut blk = vec![0u8; self.block_size];
                 self.read_block(b, &mut blk)?;
+                if self.metadata_csum {
+                    let seed = inode_csum_seed(self.csum_seed, ino, get_u32(inode, 100));
+                    if !extent_csum_ok(seed, &blk) {
+                        return Err(FsError::Io);
+                    }
+                }
                 Ok(blk)
             });
         }
@@ -614,6 +672,15 @@ impl Vol {
         if offset >= size || buf.is_empty() {
             return Ok(0);
         }
+        if let Some(src) = inline_symlink(&inode) {
+            let start = offset as usize;
+            if start >= src.len() {
+                return Ok(0);
+            }
+            let n = (src.len() - start).min(buf.len());
+            buf[..n].copy_from_slice(&src[start..start + n]);
+            return Ok(n);
+        }
         let want = ((size - offset) as usize).min(buf.len());
         let mut sib_cache: Option<(u32, Vec<u8>)> = None;
         let mut done = 0usize;
@@ -621,7 +688,7 @@ impl Vol {
             let pos = offset + done as u64;
             let iblock = (pos / self.block_size as u64) as u32;
             let inner = (pos % self.block_size as u64) as usize;
-            let disk = self.map_cached(&inode, iblock, &mut sib_cache)?;
+            let disk = self.map_cached(ino, &inode, iblock, &mut sib_cache)?;
             let n = (self.block_size - inner).min(want - done);
             if disk == 0 {
                 buf[done..done + n].fill(0);
@@ -637,12 +704,13 @@ impl Vol {
 
     fn map_cached(
         &self,
+        ino: u32,
         inode: &[u8],
         iblock: u32,
         cache: &mut Option<(u32, Vec<u8>)>,
     ) -> Result<u64, FsError> {
         if inode.len() >= 100 && get_u32(inode, 32) & EXTENTS_FL != 0 {
-            return self.map_block(inode, iblock);
+            return self.map_block(ino, inode, iblock);
         }
         if iblock < 12 {
             return Ok(get_u32(inode, 40 + iblock as usize * 4) as u64);
@@ -719,38 +787,48 @@ impl Vol {
         mut f: impl FnMut(&[u8], usize, usize, u32) -> Result<bool, FsError>,
     ) -> Result<(), FsError> {
         let inode = self.read_inode(dir)?;
-        if get_u32(&inode, 32) & INDEX_FL != 0 {
-            return Err(FsError::Io);
-        }
+        // htree (`EXT4_INDEX_FL`) — это индекс поверх тех же логических блоков.
+        // Блок 0 закрывает индекс длиной `..`, внутренний узел — одной пустой
+        // записью на весь блок. Имена лежат в листьях и находятся линейным
+        // обходом, без хеша: версия хеша, включая siphash, на поиск не влияет.
         let size = inode_bytes(&inode) as usize;
         let mut off = 0usize;
         while off + 8 <= size {
             let ib = (off / self.block_size) as u32;
-            let disk = self.map_block(&inode, ib)?;
+            let disk = self.map_block(dir, &inode, ib)?;
             if disk == 0 {
                 return Err(FsError::Io);
             }
             let mut block = vec![0u8; self.block_size];
             self.read_block(disk, &mut block)?;
+            self.check_dir_block(dir, &inode, &block)?;
             let base = ib as usize * self.block_size;
-            let mut local = off % self.block_size;
-            while local + 8 <= self.block_size {
-                let rec = get_u16(&block, local + 4) as usize;
-                if rec < 8 || local + rec > self.block_size {
-                    return Err(FsError::Io);
-                }
-                let ino = get_u32(&block, local);
-                if f(&block, local, rec, ino)? {
-                    return Ok(());
-                }
-                local += rec;
-                off = base + local;
-                if off >= size {
-                    return Ok(());
-                }
+            let limit = self.block_size.min(size - base);
+            if scan_dirents(&block, self.filetype, limit, &mut f)? {
+                return Ok(());
             }
+            if limit < self.block_size {
+                return Ok(());
+            }
+            off = base + self.block_size;
         }
         Ok(())
+    }
+
+    fn check_dir_block(&self, dir: u32, inode: &[u8], block: &[u8]) -> Result<(), FsError> {
+        if !self.metadata_csum {
+            return Ok(());
+        }
+        let seed = inode_csum_seed(self.csum_seed, dir, get_u32(inode, 100));
+        let ok = match dx_kind(block) {
+            Some(kind) => dx_csum_ok(seed, block, kind),
+            None => dir_tail_csum_ok(seed, block),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(FsError::Io)
+        }
     }
 
     fn find_in_dir(&self, dir: u32, name: &str) -> Result<Option<u32>, FsError> {
@@ -838,7 +916,7 @@ impl Vol {
         let mut off = 0usize;
         while off + 8 <= size {
             let ib = (off / self.block_size) as u32;
-            let disk = self.map_block(&inode, ib)?;
+            let disk = self.map_block(dir, &inode, ib)?;
             if disk == 0 {
                 return Err(FsError::Io);
             }
@@ -891,7 +969,7 @@ impl Vol {
         let mut off = 0usize;
         while off + 8 <= size {
             let ib = (off / self.block_size) as u32;
-            let disk = self.map_block(&inode, ib)?;
+            let disk = self.map_block(dir, &inode, ib)?;
             let mut block = vec![0u8; self.block_size];
             self.read_block(disk, &mut block)?;
             let base = ib as usize * self.block_size;
@@ -1254,7 +1332,7 @@ impl Vol {
 
     fn set_dotdot(&mut self, dir: u32, parent: u32) -> Result<(), FsError> {
         let inode = self.read_inode(dir)?;
-        let disk = self.map_block(&inode, 0)?;
+        let disk = self.map_block(dir, &inode, 0)?;
         if disk == 0 {
             return Err(FsError::Io);
         }
@@ -1427,6 +1505,211 @@ fn inode_bytes(inode: &[u8]) -> u64 {
     }
 }
 
+/// Обход записей одного блока каталога. Хвост `metadata_csum` (inode 0,
+/// `file_type` 0xDE) пропускается. `limit` — до какого смещения запись ещё
+/// начинается: у каталога это конец файла, если он разрезал блок.
+fn scan_dirents(
+    block: &[u8],
+    filetype: bool,
+    limit: usize,
+    f: &mut impl FnMut(&[u8], usize, usize, u32) -> Result<bool, FsError>,
+) -> Result<bool, FsError> {
+    let limit = limit.min(block.len());
+    let mut local = 0usize;
+    while local + 8 <= limit {
+        let rec = get_u16(block, local + 4) as usize;
+        if rec < 8 || local + rec > block.len() {
+            return Err(FsError::Io);
+        }
+        let ino = get_u32(block, local);
+        let tail = filetype && ino == 0 && block[local + 6] == 0 && block[local + 7] == FT_DIR_CSUM;
+        if !tail && f(block, local, rec, ino)? {
+            return Ok(true);
+        }
+        local += rec;
+    }
+    Ok(false)
+}
+
+/// Корень htree: `..` занимает остаток блока и `info_length == 8`.
+/// Внутренний узел: первая запись длиной в блок.
+fn dx_kind(block: &[u8]) -> Option<DxKind> {
+    if block.len() < 8 {
+        return None;
+    }
+    let rec0 = get_u16(block, 4) as usize;
+    if rec0 == block.len() {
+        return Some(DxKind::Node);
+    }
+    if rec0 == 12 && block.len() >= 32 {
+        let rec1 = get_u16(block, 16) as usize;
+        if rec1 == block.len() - 12 && get_u32(block, 24) == 0 && block[29] == 8 {
+            return Some(DxKind::Root);
+        }
+    }
+    None
+}
+
+enum DxKind {
+    Root,
+    Node,
+}
+
+/// CRC-32C в соглашении Linux `crc32c`: `crc` уже содержит зерно (`!0` для
+/// нового расчёта), конечного xor нет. `crc32c(crc32c(!0, a), b)` равен
+/// `crc32c(!0, a || b)`. Значение из Википедии `0xE3069283` для «123456789» —
+/// это `crc32c(!0, data) ^ !0`.
+fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0x82F63B78 & mask);
+        }
+    }
+    crc
+}
+
+fn super_csum_ok(sb: &[u8]) -> bool {
+    sb.len() >= 1024 && crc32c(!0, &sb[..1020]) == get_u32(sb, 1020)
+}
+
+fn gd_csum_ok(seed: u32, group: u32, gd: &[u8]) -> bool {
+    if gd.len() < 32 {
+        return false;
+    }
+    let mut c = crc32c(seed, &group.to_le_bytes());
+    c = crc32c(c, &gd[..30]);
+    c = crc32c(c, &[0, 0]);
+    if gd.len() > 32 {
+        c = crc32c(c, &gd[32..]);
+    }
+    c as u16 == get_u16(gd, 30)
+}
+
+fn inode_csum_seed(fs_seed: u32, ino: u32, generation: u32) -> u32 {
+    let c = crc32c(fs_seed, &ino.to_le_bytes());
+    crc32c(c, &generation.to_le_bytes())
+}
+
+/// Сумма inode: `i_checksum_lo` @ 124 и, если `i_extra_isize` покрывает его,
+/// `i_checksum_hi` @ 130. Поля на время счёта — нули.
+fn inode_csum_ok(seed: u32, raw: &[u8]) -> bool {
+    if raw.len() < 128 {
+        return false;
+    }
+    let mut c = crc32c(seed, &raw[..124]);
+    c = crc32c(c, &[0, 0]);
+    c = crc32c(c, &raw[126..128]);
+    let mut provided = u32::from(get_u16(raw, 124));
+    let mut full = false;
+    if raw.len() > 128 {
+        let up = 130.min(raw.len());
+        c = crc32c(c, &raw[128..up]);
+        let extra = if raw.len() >= 130 {
+            get_u16(raw, 128) as usize
+        } else {
+            0
+        };
+        if extra >= 4 && raw.len() >= 132 {
+            c = crc32c(c, &[0, 0]);
+            c = crc32c(c, &raw[132..]);
+            provided |= u32::from(get_u16(raw, 130)) << 16;
+            full = true;
+        } else if up < raw.len() {
+            c = crc32c(c, &raw[up..]);
+        }
+    }
+    if !full {
+        c &= 0xFFFF;
+    }
+    c == provided
+}
+
+fn dx_csum_ok(seed: u32, block: &[u8], kind: DxKind) -> bool {
+    let count_off = match kind {
+        DxKind::Root => 32,
+        DxKind::Node => 8,
+    };
+    if count_off + 4 > block.len() {
+        return false;
+    }
+    let limit = get_u16(block, count_off) as usize;
+    let count = get_u16(block, count_off + 2) as usize;
+    if count == 0 || limit == 0 || count > limit {
+        return false;
+    }
+    let tail = count_off.saturating_add(limit.saturating_mul(8));
+    if tail + 8 > block.len() {
+        return false;
+    }
+    let covered = count_off + count * 8;
+    if covered > tail {
+        return false;
+    }
+    let mut c = crc32c(seed, &block[..covered]);
+    c = crc32c(c, &block[tail..tail + 4]);
+    c = crc32c(c, &[0, 0, 0, 0]);
+    c == get_u32(block, tail + 4)
+}
+
+fn dir_tail_csum_ok(seed: u32, block: &[u8]) -> bool {
+    if block.len() < 12 {
+        return false;
+    }
+    let off = block.len() - 12;
+    if get_u32(block, off) != 0
+        || get_u16(block, off + 4) != 12
+        || block[off + 6] != 0
+        || block[off + 7] != FT_DIR_CSUM
+    {
+        return false;
+    }
+    crc32c(seed, &block[..off]) == get_u32(block, off + 8)
+}
+
+/// Хвост блока extent стоит после `eh_max` записей. В самом inode хвоста нет.
+fn extent_csum_ok(seed: u32, block: &[u8]) -> bool {
+    if block.len() < 12 || get_u16(block, 0) != EXTENT_MAGIC {
+        return false;
+    }
+    let max = get_u16(block, 4) as usize;
+    let tail = 12usize.saturating_add(max.saturating_mul(12));
+    if tail + 4 > block.len() {
+        return false;
+    }
+    crc32c(seed, &block[..tail]) == get_u32(block, tail)
+}
+
+/// Цель короткой ссылки лежит в `i_block` (60 байт), а не в блоках.
+/// Extent и `INLINE_DATA` читаются как обычный файл.
+fn inline_symlink(inode: &[u8]) -> Option<&[u8]> {
+    if inode.len() < 100 {
+        return None;
+    }
+    if get_u16(inode, 0) & 0xF000 != 0xA000 {
+        return None;
+    }
+    let flags = get_u32(inode, 32);
+    if flags & (EXTENTS_FL | INLINE_DATA_FL) != 0 {
+        return None;
+    }
+    let size = inode_bytes(inode);
+    if size >= 60 {
+        return None;
+    }
+    let blocks_hi = if inode.len() >= 118 {
+        u64::from(get_u16(inode, 116)) << 32
+    } else {
+        0
+    };
+    if u64::from(get_u32(inode, 28)) | blocks_hi != 0 {
+        return None;
+    }
+    let n = size as usize;
+    Some(&inode[40..40 + n])
+}
+
 /// `Ok(true)` — монтировать только на чтение. `Ok(false)` — обычный ext2.
 /// Журнал с RECOVER, meta_bg, encrypt и прочие incompat отвергаются.
 /// `64bit` и `metadata_csum_seed` принимаются только вместе с extents.
@@ -1435,7 +1718,8 @@ fn features(incompat: u32, ro: u32) -> Result<bool, &'static str> {
     const FLEX_BG: u32 = 0x200;
     const OK: u32 = FILETYPE | EXTENTS | FLEX_BG | BIT64 | CSUM_SEED;
     // sparse_super, large_file, huge_file, gdt_csum, dir_nlink, extra_isize,
-    // metadata_csum. Сумму метаданных не проверяем и не переписываем.
+    // metadata_csum. crc32c проверяет open, если стоит metadata_csum.
+    // Старый gdt_csum (crc16) без metadata_csum не проверяем.
     const RO_OK: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x40 | 0x400;
     if incompat & !OK != 0 {
         return Err("incompat feature");
@@ -1705,6 +1989,165 @@ mod tests {
         put_u32(&mut inode, 32, HUGE_FL);
         put_u32(&mut inode, 108, 2);
         assert_eq!(inode_bytes(&inode), (2u64 << 32) | 0x1000);
+        serial_println!("[ok]");
+    }
+
+    fn put_dirent(block: &mut [u8], off: usize, rec: usize, ino: u32, name: &[u8], ft: u8) {
+        put_u32(block, off, ino);
+        put_u16(block, off + 4, rec as u16);
+        block[off + 6] = name.len() as u8;
+        block[off + 7] = ft;
+        block[off + 8..off + 8 + name.len()].copy_from_slice(name);
+    }
+
+    fn dir_names(block: &[u8]) -> Result<Vec<String>, FsError> {
+        let mut names = Vec::new();
+        scan_dirents(block, true, block.len(), &mut |b, local, rec, ino| {
+            if ino == 0 {
+                return Ok(false);
+            }
+            let nl = (b[local + 6] as usize).min(rec.saturating_sub(8));
+            let raw = &b[local + 8..local + 8 + nl];
+            if let Ok(s) = core::str::from_utf8(raw) {
+                names.push(String::from(s));
+            }
+            Ok(false)
+        })?;
+        Ok(names)
+    }
+
+    #[test_case]
+    fn ext4_htree_and_fast_symlink_read() {
+        serial_print!("test ext4_htree_and_fast_symlink_read... ");
+        // Корень htree: «..» закрывает индекс. Мусор дальше именами не становится.
+        let mut root = [0xABu8; 128];
+        put_dirent(&mut root, 0, 12, 2, b".", 2);
+        put_dirent(&mut root, 12, 116, 2, b"..", 2);
+        root[24..28].fill(0);
+        root[28] = 1; // half_md4
+        root[29] = 8; // info_length
+        assert!(matches!(dx_kind(&root), Some(DxKind::Root)));
+        assert_eq!(
+            dir_names(&root).unwrap(),
+            vec![String::from("."), String::from("..")]
+        );
+
+        // Внутренний узел — одна пустая запись на весь блок.
+        let mut node = [0xABu8; 128];
+        put_u32(&mut node, 0, 0);
+        put_u16(&mut node, 4, 128);
+        node[6] = 0;
+        node[7] = 0;
+        assert!(matches!(dx_kind(&node), Some(DxKind::Node)));
+        assert!(dir_names(&node).unwrap().is_empty());
+
+        // Лист: имя и хвост суммы. Хвост в список не попадает.
+        let mut leaf = [0u8; 128];
+        put_dirent(&mut leaf, 0, 116, 11, b"foo", 1);
+        put_u16(&mut leaf, 116 + 4, 12);
+        leaf[116 + 7] = FT_DIR_CSUM;
+        assert!(dx_kind(&leaf).is_none());
+        assert_eq!(dir_names(&leaf).unwrap(), vec![String::from("foo")]);
+
+        let mut link = [0u8; 128];
+        put_u16(&mut link, 0, 0xA1FF);
+        put_u32(&mut link, 4, 4);
+        link[40..44].copy_from_slice(b"/bin");
+        assert_eq!(inline_symlink(&link), Some(&b"/bin"[..]));
+        put_u32(&mut link, 32, EXTENTS_FL);
+        assert!(inline_symlink(&link).is_none());
+        put_u32(&mut link, 32, 0);
+        put_u32(&mut link, 28, 8);
+        assert!(inline_symlink(&link).is_none(), "blocks mean a real file");
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn ext4_metadata_csum_matches_crc32c() {
+        serial_print!("test ext4_metadata_csum_matches_crc32c... ");
+        let sample = b"123456789";
+        let raw = crc32c(!0, sample);
+        assert_eq!(raw, 0x1cf9_6d7c, "linux crc32c register");
+        assert_eq!(raw ^ !0, 0xE306_9283);
+        assert_eq!(crc32c(crc32c(!0, &sample[..4]), &sample[4..]), raw);
+
+        let mut sb = [0u8; 1024];
+        sb[104..120].copy_from_slice(b"rudra-uuid-bytes");
+        sb[0x173] = 1;
+        let seed = crc32c(!0, &sb[104..120]);
+        let sb_sum = crc32c(!0, &sb[..1020]);
+        put_u32(&mut sb, 1020, sb_sum);
+        assert!(super_csum_ok(&sb));
+        sb[10] ^= 1;
+        assert!(!super_csum_ok(&sb));
+
+        let mut gd = [0u8; 64];
+        put_u32(&mut gd, 8, 40);
+        let mut c = crc32c(seed, &0u32.to_le_bytes());
+        c = crc32c(c, &gd[..30]);
+        c = crc32c(c, &[0, 0]);
+        c = crc32c(c, &gd[32..]);
+        put_u16(&mut gd, 30, c as u16);
+        assert!(gd_csum_ok(seed, 0, &gd));
+        gd[8] ^= 1;
+        assert!(!gd_csum_ok(seed, 0, &gd));
+
+        let mut inode = [0u8; 256];
+        put_u16(&mut inode, 0, 0x81A4);
+        put_u32(&mut inode, 100, 7);
+        put_u16(&mut inode, 128, 32);
+        let iseed = inode_csum_seed(seed, 12, 7);
+        let mut ic = crc32c(iseed, &inode[..124]);
+        ic = crc32c(ic, &[0, 0]);
+        ic = crc32c(ic, &inode[126..128]);
+        ic = crc32c(ic, &inode[128..130]);
+        ic = crc32c(ic, &[0, 0]);
+        ic = crc32c(ic, &inode[132..]);
+        put_u16(&mut inode, 124, ic as u16);
+        put_u16(&mut inode, 130, (ic >> 16) as u16);
+        assert!(inode_csum_ok(iseed, &inode));
+        inode[4] ^= 1;
+        assert!(!inode_csum_ok(iseed, &inode));
+
+        let mut leaf = [0u8; 128];
+        put_dirent(&mut leaf, 0, 116, 11, b"foo", 1);
+        put_u16(&mut leaf, 120, 12);
+        leaf[123] = FT_DIR_CSUM;
+        let dseed = inode_csum_seed(seed, 2, 9);
+        let leaf_sum = crc32c(dseed, &leaf[..116]);
+        put_u32(&mut leaf, 124, leaf_sum);
+        assert!(dir_tail_csum_ok(dseed, &leaf));
+        leaf[8] ^= 1;
+        assert!(!dir_tail_csum_ok(dseed, &leaf));
+
+        let mut dx = [0u8; 128];
+        put_dirent(&mut dx, 0, 12, 2, b".", 2);
+        put_dirent(&mut dx, 12, 116, 2, b"..", 2);
+        dx[29] = 8;
+        let limit = 11u16;
+        put_u16(&mut dx, 32, limit);
+        put_u16(&mut dx, 34, 1);
+        put_u32(&mut dx, 36, 1);
+        let tail = 32 + limit as usize * 8;
+        let mut xc = crc32c(dseed, &dx[..32 + 8]);
+        xc = crc32c(xc, &dx[tail..tail + 4]);
+        xc = crc32c(xc, &[0, 0, 0, 0]);
+        put_u32(&mut dx, tail + 4, xc);
+        assert!(dx_csum_ok(dseed, &dx, DxKind::Root));
+        dx[36] ^= 1;
+        assert!(!dx_csum_ok(dseed, &dx, DxKind::Root));
+
+        let mut ext = [0u8; 128];
+        put_u16(&mut ext, 0, EXTENT_MAGIC);
+        put_u16(&mut ext, 2, 1);
+        let max = 9u16;
+        put_u16(&mut ext, 4, max);
+        let et = 12 + max as usize * 12;
+        let ext_sum = crc32c(dseed, &ext[..et]);
+        put_u32(&mut ext, et, ext_sum);
+        assert!(extent_csum_ok(dseed, &ext));
+        ext[12] ^= 1;
+        assert!(!extent_csum_ok(dseed, &ext));
         serial_println!("[ok]");
     }
 }
