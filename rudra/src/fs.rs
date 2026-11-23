@@ -622,8 +622,20 @@ fn synth_body(name: &str) -> Option<String> {
             let ns = crate::time::monotonic_ns();
             let sec = ns / 1_000_000_000;
             let cent = (ns / 10_000_000) % 100;
-            // Второе поле Linux — idle. Мы его не считаем, поэтому ноль.
-            Some(format!("{}.{:02} 0.00\n", sec, cent))
+            let hz = crate::apic::timer_hz().max(1);
+            let cpus = crate::smp::cpu_count().max(1).min(crate::cpu::MAX_CPUS as u32) as usize;
+            let idle_ticks: u64 = crate::interrupts::IDLE_TICKS[..cpus]
+                .iter()
+                .map(|t| t.load(core::sync::atomic::Ordering::Relaxed))
+                .sum();
+            let idle_cs = idle_ticks.saturating_mul(100) / hz;
+            Some(format!(
+                "{}.{:02} {}.{:02}\n",
+                sec,
+                cent,
+                idle_cs / 100,
+                idle_cs % 100
+            ))
         }
         "/proc/cpuinfo" => Some(format!(
             "processor\t: 0\nsiblings\t: {}\n",
@@ -631,25 +643,45 @@ fn synth_body(name: &str) -> Option<String> {
         )),
         "/proc/meminfo" => {
             let (total, free) = crate::memory::mem_bytes();
+            let kb = free / 1024;
+            // Свопа нет. MemAvailable — свободные кадры: отдавать больше нечем.
             Some(format!(
-                "MemTotal: {} kB\nMemFree: {} kB\n",
+                "MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\n",
                 total / 1024,
-                free / 1024
+                kb,
+                kb
             ))
         }
         "/proc/stat" => {
-            let ticks = crate::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
             let (created, running) = crate::task::proc_counts();
-            // user, nice и idle не считаем. Тики планировщика лежат в system.
-            let mut out = alloc::format!(
-                "cpu  0 0 {} 0 0 0 0 0 0 0\n",
-                ticks
-            );
-            let cpus = crate::smp::cpu_count().min(crate::cpu::MAX_CPUS as u32);
+            let cpus = crate::smp::cpu_count().max(1).min(crate::cpu::MAX_CPUS as u32);
+            let load = |c: usize| {
+                (
+                    crate::interrupts::USER_TICKS[c].load(core::sync::atomic::Ordering::Relaxed),
+                    crate::interrupts::SYS_TICKS[c].load(core::sync::atomic::Ordering::Relaxed),
+                    crate::interrupts::IDLE_TICKS[c].load(core::sync::atomic::Ordering::Relaxed),
+                )
+            };
+            let mut user = 0u64;
+            let mut sys = 0u64;
+            let mut idle = 0u64;
+            let mut out = String::new();
             for c in 0..cpus {
-                let t = crate::interrupts::PER_CPU_TICKS[c as usize]
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                out.push_str(&alloc::format!("cpu{} 0 0 {} 0 0 0 0 0 0 0\n", c, t));
+                let (u, s, i) = load(c as usize);
+                user += u;
+                sys += s;
+                idle += i;
+            }
+            out.push_str(&alloc::format!(
+                "cpu  {} 0 {} {} 0 0 0 0 0 0\n",
+                user, sys, idle
+            ));
+            for c in 0..cpus {
+                let (u, s, i) = load(c as usize);
+                out.push_str(&alloc::format!(
+                    "cpu{} {} 0 {} {} 0 0 0 0 0 0\n",
+                    c, u, s, i
+                ));
             }
             out.push_str(&alloc::format!("processes {}\nprocs_running {}\n", created, running));
             Some(out)
@@ -1346,14 +1378,16 @@ mod tests {
         assert!(buf[0].is_ascii_digit());
         assert!(buf[..n as usize].contains(&b' '));
         assert!(read_at("/proc/cpuinfo", 0, &mut buf) > 0);
-        let mut wide = [0u8; 128];
+        let mut wide = [0u8; 512];
         let n = read_at("/proc/meminfo", 0, &mut wide);
         assert!(n > 0);
         let text = core::str::from_utf8(&wide[..n as usize]).unwrap();
         let total = kb_field(text, "MemTotal:");
         let free = kb_field(text, "MemFree:");
+        let avail = kb_field(text, "MemAvailable:");
         assert!(total > 0);
         assert!(free <= total);
+        assert_eq!(avail, free);
         let n = read_at("/proc/stat", 0, &mut wide);
         let text = core::str::from_utf8(&wide[..n as usize]).unwrap();
         assert!(text.starts_with("cpu  "));

@@ -3,11 +3,10 @@
 //! `read_blocks` / `write_blocks` режут запрос на куски по 4 КиБ: столько
 //! влезает в одну DMA-страницу и одну цепочку из трёх дескрипторов.
 //!
-//! Кэш чтения — 16 слотов по 4 КиБ. Ключ — LBA первого сектора. В кэш
-//! попадает только кусок ровно 4096 байт с LBA, кратным 8. Запись слот
-//! не обновляет: пересекающийся диапазон его сбрасывает, следующее чтение
-//! идёт в устройство. Проверка записи ext2 поэтому не проходит по копии.
-//! Это не page cache.
+//! Кэш — 16 слотов по 4 КиБ. Ключ — LBA, выровненный на 8 секторов.
+//! Чтение любого куска внутри слота обслуживается из него: промах
+//! дочитывает весь слот, если он помещается в диск. Запись целого слота
+//! заполняет кэш, частичная правит уже лежащий слот и не создаёт новый.
 
 use spin::Mutex;
 
@@ -44,13 +43,35 @@ impl ReadCache {
 
 static CACHE: Mutex<ReadCache> = Mutex::new(ReadCache::empty());
 
-fn cache_copy_out(lba: u64, dst: &mut [u8]) -> bool {
+fn cache_read(base: u64, off: usize, dst: &mut [u8]) -> bool {
+    if off.saturating_add(dst.len()) > CHUNK {
+        return false;
+    }
     let c = CACHE.lock();
-    let Some(s) = c.slots.iter().find(|s| s.used && s.lba == lba) else {
+    let Some(s) = c.slots.iter().find(|s| s.used && s.lba == base) else {
         return false;
     };
-    dst.copy_from_slice(&s.data);
+    dst.copy_from_slice(&s.data[off..off + dst.len()]);
     true
+}
+
+/// Целый слот кладётся в кэш. Кусок только правит уже лежащий слот.
+fn cache_merge(base: u64, off: usize, data: &[u8]) {
+    if off.saturating_add(data.len()) > CHUNK {
+        return;
+    }
+    let mut c = CACHE.lock();
+    if let Some(s) = c.slots.iter_mut().find(|s| s.used && s.lba == base) {
+        s.data[off..off + data.len()].copy_from_slice(data);
+        return;
+    }
+    if off == 0 && data.len() == CHUNK {
+        let i = c.next % CACHE_SLOTS;
+        c.next = (c.next + 1) % CACHE_SLOTS;
+        c.slots[i].used = true;
+        c.slots[i].lba = base;
+        c.slots[i].data.copy_from_slice(data);
+    }
 }
 
 fn cache_store(lba: u64, data: &[u8]) {
@@ -67,6 +88,7 @@ fn cache_store(lba: u64, data: &[u8]) {
 }
 
 /// Сбросить слоты, чей диапазон секторов пересекается с `[lba, lba+nsectors)`.
+#[cfg(test)]
 fn cache_invalidate(lba: u64, nsectors: u64) {
     if nsectors == 0 {
         return;
@@ -128,19 +150,25 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
     if !present() {
         return Err(BlockError::NoDevice);
     }
+    let cap = sector_count();
     let mut done = 0usize;
     let mut at = lba;
     while done < buf.len() {
-        let n = (buf.len() - done).min(CHUNK);
-        if n == CHUNK && at % SECTORS_PER_SLOT == 0 && cache_copy_out(at, &mut buf[done..done + n])
-        {
+        let base = at & !(SECTORS_PER_SLOT - 1);
+        let slot_off = ((at - base) as usize) * SECTOR;
+        let n = (buf.len() - done).min(CHUNK - slot_off);
+        if cache_read(base, slot_off, &mut buf[done..done + n]) {
             done += n;
-            at += SECTORS_PER_SLOT;
+            at += (n / SECTOR) as u64;
             continue;
         }
-        crate::virtio_blk::read_sectors(at, &mut buf[done..done + n]).map_err(map_err)?;
-        if n == CHUNK && at % SECTORS_PER_SLOT == 0 {
-            cache_store(at, &buf[done..done + n]);
+        if base.saturating_add(SECTORS_PER_SLOT) <= cap {
+            let mut tmp = [0u8; CHUNK];
+            crate::virtio_blk::read_sectors(base, &mut tmp).map_err(map_err)?;
+            cache_store(base, &tmp);
+            buf[done..done + n].copy_from_slice(&tmp[slot_off..slot_off + n]);
+        } else {
+            crate::virtio_blk::read_sectors(at, &mut buf[done..done + n]).map_err(map_err)?;
         }
         done += n;
         at += (n / SECTOR) as u64;
@@ -158,10 +186,12 @@ pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let mut done = 0usize;
     let mut at = lba;
     while done < buf.len() {
-        let n = (buf.len() - done).min(CHUNK);
+        let base = at & !(SECTORS_PER_SLOT - 1);
+        let slot_off = ((at - base) as usize) * SECTOR;
+        let n = (buf.len() - done).min(CHUNK - slot_off);
         crate::virtio_blk::write_sectors(at, &buf[done..done + n]).map_err(map_err)?;
-        // После успешной записи. Неудача оставляет старый слот: устройство не изменилось.
-        cache_invalidate(at, (n / SECTOR) as u64);
+        // Устройство уже приняло байты. Слот либо правится, либо заполняется целиком.
+        cache_merge(base, slot_off, &buf[done..done + n]);
         done += n;
         at += (n / SECTOR) as u64;
     }
@@ -190,34 +220,59 @@ mod tests {
         let mut out = alloc::vec![0u8; CHUNK];
         page[0] = 0xAB;
         cache_store(0, &page);
-        assert!(cache_copy_out(0, &mut out));
+        assert!(cache_read(0, 0, &mut out));
         assert_eq!(out[0], 0xAB);
         page[0] = 0xCD;
         cache_store(0, &page);
-        assert!(cache_copy_out(0, &mut out));
+        assert!(cache_read(0, 0, &mut out));
         assert_eq!(out[0], 0xCD);
         for i in 1..=16 {
             page[0] = i as u8;
             cache_store((i as u64) * 8, &page);
         }
-        assert!(!cache_copy_out(0, &mut out), "first slot was not evicted");
-        assert!(cache_copy_out(8, &mut out));
+        assert!(!cache_read(0, 0, &mut out), "first slot was not evicted");
+        assert!(cache_read(8, 0, &mut out));
         assert_eq!(out[0], 1);
-        assert!(cache_copy_out(128, &mut out));
+        assert!(cache_read(128, 0, &mut out));
         assert_eq!(out[0], 16);
 
         cache_reset();
         cache_store(64, &page);
         cache_invalidate(68, 1);
-        assert!(!cache_copy_out(64, &mut out), "sector inside the slot");
+        assert!(!cache_read(64, 0, &mut out), "sector inside the slot");
         cache_store(64, &page);
         cache_invalidate(80, 8);
-        assert!(cache_copy_out(64, &mut out), "disjoint write dropped the slot");
+        assert!(cache_read(64, 0, &mut out), "disjoint write dropped the slot");
         cache_invalidate(63, 2);
-        assert!(!cache_copy_out(64, &mut out), "partial overlap at the start");
+        assert!(!cache_read(64, 0, &mut out), "partial overlap at the start");
         cache_store(64, &page);
         cache_invalidate(64, 0);
-        assert!(cache_copy_out(64, &mut out));
+        assert!(cache_read(64, 0, &mut out));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn block_cache_merge_patches_and_fills() {
+        serial_print!("test block_cache_merge_patches_and_fills... ");
+        cache_reset();
+        let mut page = [0u8; CHUNK];
+        page[0] = 1;
+        page[100] = 2;
+        cache_store(16, &page);
+        cache_merge(16, 100, &[9]);
+        let mut one = [0u8; 1];
+        assert!(cache_read(16, 100, &mut one));
+        assert_eq!(one[0], 9);
+        let mut full = [0u8; CHUNK];
+        assert!(cache_read(16, 0, &mut full));
+        assert_eq!(full[0], 1);
+        let mut neu = [0u8; CHUNK];
+        neu[0] = 7;
+        cache_merge(24, 0, &neu);
+        assert!(cache_read(24, 0, &mut full));
+        assert_eq!(full[0], 7);
+        cache_merge(32, 0, &[1, 2, 3, 4]);
+        assert!(!cache_read(32, 0, &mut one));
         serial_println!("[ok]");
     }
 }

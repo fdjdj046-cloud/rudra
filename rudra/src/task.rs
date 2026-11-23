@@ -22,7 +22,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::Msr;
@@ -461,6 +463,7 @@ impl Drop for AddressSpace {
         let l4 = self.l4;
         // Не держим этот кадр как CR3: execve переключает CR3 до drop.
         x86_64::instructions::interrupts::without_interrupts(|| {
+            let _gap = IrqGap::enter();
             crate::memory::with_frame_allocator(|fa| free_user_space(l4, fa));
         });
     }
@@ -837,6 +840,9 @@ pub struct Task {
     kstack_base: u64,
     pub state: TaskState,
     pub exit_code: i64,
+    /// Ненулевой номер: смерть от сигнала. `wait` пишет его в младшие 7 бит
+    /// (`WIFSIGNALED`). Ноль — обычный `exit`, статус `WIFEXITED`.
+    pub term_sig: u8,
     /// Слот родителя (-1 = родитель не отслеживается).
     pub parent: isize,
     /// Поток `CLONE_VM`. Такой exit не шлёт родителю `SIGCHLD`.
@@ -845,10 +851,13 @@ pub struct Task {
     pub fs_base: u64,
     /// Пользовательский GS. В ядре он лежит в `KERNEL_GS_BASE`.
     pub gs_base: u64,
-    /// Единственный CPU, на котором задаче разрешено исполняться.
+    /// CPU, на котором задача стоит сейчас.
     pub cpu: u32,
-    /// `true` — CPU выбрал пользователь через `sched_setaffinity`: ядро его
-    /// не переназначает и не ворует. `false` — ядро балансирует само.
+    /// Разрешённые CPU, если `affinity_set`. Бит `n` — CPU `n`.
+    pub cpu_mask: u64,
+    /// `true` — маску задал `sched_setaffinity`. Задачу можно исполнять на
+    /// любом поднятом бите и переносить только внутри маски.
+    /// `false` — ядро само выбирает CPU и может воровать задачу.
     pub affinity_set: bool,
     /// Кто сейчас её исполняет. -1 — никто.
     pub on_cpu: i8,
@@ -1364,6 +1373,52 @@ pub fn load_elf_image(
 /// Крутилка раскидки новых задач между равно нагруженными CPU.
 static PICK_ROTATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Начало длинного участка с выключенными прерываниями, по CPU.
+static IRQ_OFF_AT: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+/// Сколько тиков LAPIC слиплось в один, пока IF был выключен.
+static OWED: [AtomicU32; crate::cpu::MAX_CPUS] = [const { AtomicU32::new(0) }; crate::cpu::MAX_CPUS];
+
+/// Пока жив guard, измеряется участок без прерываний. На drop пропущенные
+/// тики (кроме одного, который APIC всё ещё доставит) пишутся в долг:
+/// планировщик столько раз не выберет ту же задачу, и `/proc/stat` получит
+/// это время как system.
+struct IrqGap;
+
+impl IrqGap {
+    fn enter() -> Self {
+        let me = crate::smp::this_cpu();
+        if me < crate::cpu::MAX_CPUS {
+            IRQ_OFF_AT[me].store(crate::time::monotonic_ns(), Ordering::Relaxed);
+        }
+        Self
+    }
+}
+
+impl Drop for IrqGap {
+    fn drop(&mut self) {
+        let me = crate::smp::this_cpu();
+        if me >= crate::cpu::MAX_CPUS {
+            return;
+        }
+        let start = IRQ_OFF_AT[me].swap(0, Ordering::Relaxed);
+        if start == 0 {
+            return;
+        }
+        let dt = crate::time::monotonic_ns().saturating_sub(start);
+        let hz = crate::apic::timer_hz().max(1);
+        let tick = 1_000_000_000u64 / hz;
+        let missed = dt / tick;
+        if missed > 1 {
+            let extra = (missed - 1).min(32);
+            OWED[me].fetch_add(extra as u32, Ordering::Relaxed);
+            crate::interrupts::TICKS.fetch_add(extra, Ordering::Relaxed);
+            crate::interrupts::PER_CPU_TICKS[me].fetch_add(extra, Ordering::Relaxed);
+            crate::interrupts::SYS_TICKS[me].fetch_add(extra, Ordering::Relaxed);
+        }
+    }
+}
+
 /// CPU с наименьшим числом Runnable-задач; равенство — round-robin.
 fn pick_cpu() -> u32 {
     let n = crate::smp::cpu_count().max(1);
@@ -1454,11 +1509,13 @@ fn finish_task(
         kstack_base,
         state: TaskState::Runnable,
         exit_code: 0,
+        term_sig: 0,
         parent: -1,
         thread: false,
         fs_base: 0,
         gs_base: 0,
         cpu: pick_cpu(),
+        cpu_mask: 0,
         affinity_set: false,
         on_cpu: -1,
         clear_tid: 0,
@@ -1730,7 +1787,7 @@ pub fn with_task<R>(tid: u64, f: impl FnOnce(&mut Task) -> R) -> Option<R> {
 
 /// Найти завершившегося потомка tid'а (parent == tid). Возвращает
 /// (child_tid, exit_code) и освобождает слот.
-pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
+pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64, u8)> {
     let taken = with_tasks(|tasks| {
         let count = TASK_COUNT.load(Ordering::Acquire);
         let mut found = None;
@@ -1755,10 +1812,18 @@ pub fn reap_child(parent_tid: u64, want: u64) -> Option<(u64, i64)> {
         found
     });
     taken.map(|t| {
-        let result = (t.tid, t.exit_code);
+        let result = (t.tid, t.exit_code, t.term_sig);
         drop(t);
         result
     })
+}
+
+/// Смерть от сигнала: `wait` увидит `WIFSIGNALED`, код в журнале — `128+sig`.
+pub fn note_term_sig(sig: u32) {
+    if sig == 0 || sig >= 128 {
+        return;
+    }
+    let _ = with_current_task(|t| t.term_sig = sig as u8);
 }
 
 /// Количество живых потомков (для wait4 ECHILD).
@@ -1792,6 +1857,7 @@ pub fn sys_clone(
     const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let _gap = IrqGap::enter();
         let cur = current_slot();
         if cur < 0 {
             return u64::MAX;
@@ -1815,6 +1881,7 @@ pub fn sys_clone(
             parent_cred,
             parent_seccomp,
             parent_cpu,
+            parent_cpu_mask,
             parent_affinity_set,
         ) = with_tasks(|tasks| {
             let p = tasks[cur as usize].as_ref().expect("current task vanished");
@@ -1839,6 +1906,7 @@ pub fn sys_clone(
                 p.cred,
                 p.seccomp,
                 p.cpu,
+                p.cpu_mask,
                 p.affinity_set,
             )
         });
@@ -1940,11 +2008,13 @@ pub fn sys_clone(
             kstack_base,
             state: TaskState::Runnable,
             exit_code: 0,
+            term_sig: 0,
             parent: cur as isize,
             thread: flags & CLONE_VM != 0,
             fs_base: if flags & CLONE_SETTLS != 0 { tls } else { parent_fs },
             gs_base: crate::cpu::read_user_gs(),
             cpu: child_cpu,
+            cpu_mask: parent_cpu_mask,
             affinity_set: parent_affinity_set,
             on_cpu: -1,
             clear_tid: if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
@@ -2266,8 +2336,9 @@ fn slot_of(tasks: &[Option<Task>; MAX_TASKS], pid: u64) -> Option<usize> {
     }
 }
 
-/// `sched_setaffinity`. Запоминается младший выставленный бит, если этот CPU поднят.
-/// Перенос случится на тике из ring 3, без IPI из-под `TASKS`.
+/// `sched_setaffinity`. Маска целиком: задача может стоять на любом поднятом
+/// бите. Текущий CPU сохраняется, если он в маске. Перенос на другой —
+/// на тике из ring 3, без IPI из-под `TASKS`.
 pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
     if len == 0 || len > 128 || mask_ptr == 0 {
         return crate::linux::EINVAL;
@@ -2281,8 +2352,14 @@ pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
     if mask == 0 {
         return crate::linux::EINVAL;
     }
-    let cpu = mask.trailing_zeros();
-    if cpu >= crate::smp::cpu_count() {
+    let online = crate::smp::cpu_count().max(1).min(64);
+    let mut allow = 0u64;
+    for b in 0..online {
+        if mask & (1u64 << b) != 0 {
+            allow |= 1u64 << b;
+        }
+    }
+    if allow == 0 {
         return crate::linux::EINVAL;
     }
     with_tasks(|tasks| {
@@ -2292,29 +2369,38 @@ pub fn sys_sched_setaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
         let Some(t) = tasks[idx].as_mut() else {
             return crate::linux::ESRCH;
         };
-        t.cpu = cpu;
+        if t.cpu >= online || allow & (1u64 << t.cpu) == 0 {
+            t.cpu = allow.trailing_zeros();
+        }
+        t.cpu_mask = allow;
         t.affinity_set = true;
         0
     })
 }
 
-/// `sched_getaffinity`. Возвращает 8, как раньше: в маске бит `Task::cpu`.
+/// `sched_getaffinity`. Возвращает 8. Явная маска — как её задали.
+/// Без неё — все поднятые CPU.
 pub fn sys_sched_getaffinity(pid: u64, len: u64, mask_ptr: u64) -> u64 {
     if len == 0 || mask_ptr == 0 {
         return crate::linux::EINVAL;
     }
-    let cpu = with_tasks(|tasks| {
+    let mask = with_tasks(|tasks| {
         let idx = slot_of(tasks, pid)?;
-        tasks[idx].as_ref().map(|t| t.cpu)
+        tasks[idx].as_ref().map(|t| {
+            if t.affinity_set {
+                t.cpu_mask
+            } else {
+                let n = crate::smp::cpu_count().max(1).min(64);
+                (1u64 << n) - 1
+            }
+        })
     });
-    let Some(cpu) = cpu else {
+    let Some(mask) = mask else {
         return crate::linux::ESRCH;
     };
     let n = (len as usize).min(128);
     let mut tmp = [0u8; 128];
-    if (cpu as usize) < n * 8 {
-        tmp[cpu as usize / 8] |= 1 << (cpu % 8);
-    }
+    tmp[..8].copy_from_slice(&mask.to_le_bytes());
     if !user_write(mask_ptr, &tmp[..n]) {
         return crate::linux::EFAULT;
     }
@@ -2476,6 +2562,9 @@ pub fn kill_current_signal(code: u64) {
         if cur >= 0 {
             if let Some(t) = tasks[cur as usize].as_mut() {
                 t.exit_code = code as i64;
+                if (128..192).contains(&code) {
+                    t.term_sig = (code - 128) as u8;
+                }
             }
             death_books(tasks, cur as usize);
             if let Some(t) = tasks[cur as usize].as_mut() {
@@ -2489,6 +2578,7 @@ pub fn kill_current_signal(code: u64) {
 fn kill_slot(tasks: &mut [Option<Task>; MAX_TASKS], slot: usize, sig: u32) {
     if let Some(t) = tasks[slot].as_mut() {
         t.exit_code = 128 + sig as i64;
+        t.term_sig = sig as u8;
     }
     death_books(tasks, slot);
     if let Some(t) = tasks[slot].as_mut() {
@@ -2554,6 +2644,7 @@ pub fn debug_dump() {
 #[no_mangle]
 extern "C" fn timer_switch(current_rsp: u64) -> u64 {
     crate::interrupts::TICKS.fetch_add(1, Ordering::Relaxed);
+    account_tick(current_rsp);
     unsafe {
         crate::interrupts::PICS
             .lock()
@@ -2569,6 +2660,7 @@ extern "C" fn lapic_timer_switch(current_rsp: u64) -> u64 {
     if me < crate::cpu::MAX_CPUS {
         crate::interrupts::PER_CPU_TICKS[me].fetch_add(1, Ordering::Relaxed);
     }
+    account_tick(current_rsp);
     crate::apic::eoi();
     schedule(current_rsp)
 }
@@ -2711,6 +2803,22 @@ pub fn rseq_syscall_abort(frame: *mut u64) {
     }
 }
 
+/// Тик относится к задаче, которая его застала: ring 3 — user, ядро — system,
+/// пустой CPU — idle.
+fn account_tick(kernel_rsp: u64) {
+    let me = crate::smp::this_cpu();
+    if me >= crate::cpu::MAX_CPUS {
+        return;
+    }
+    if CPU_CUR[me].load(Ordering::Relaxed) < 0 {
+        crate::interrupts::IDLE_TICKS[me].fetch_add(1, Ordering::Relaxed);
+    } else if frame_is_user(kernel_rsp) {
+        crate::interrupts::USER_TICKS[me].fetch_add(1, Ordering::Relaxed);
+    } else {
+        crate::interrupts::SYS_TICKS[me].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn frame_is_user(kernel_rsp: u64) -> bool {
     let cs = unsafe { core::ptr::read_unaligned((kernel_rsp + 128) as *const u64) };
     cs & 3 == 3
@@ -2762,6 +2870,7 @@ fn schedule(current_rsp: u64) -> u64 {
         rseq_preempt(prev as usize, current_rsp);
     }
     let from_user = frame_is_user(current_rsp);
+    let punish = me < crate::cpu::MAX_CPUS && OWED[me].load(Ordering::Relaxed) > 0;
 
     let decision = with_tasks(|tasks| {
         if prev < 0 {
@@ -2811,26 +2920,64 @@ fn schedule(current_rsp: u64) -> u64 {
                 if t.on_cpu >= 0 && t.on_cpu != me as i8 {
                     continue;
                 }
-                if t.cpu != me as u32 {
+                if punish && prev >= 0 && i == prev as usize {
                     continue;
+                }
+                let here = me as u32;
+                let fits = if t.affinity_set {
+                    here < 64
+                        && t.cpu_mask & (1u64 << here) != 0
+                        && (t.cpu == here || t.on_cpu < 0)
+                } else {
+                    t.cpu == here
+                };
+                if !fits {
+                    continue;
+                }
+                if t.affinity_set && t.cpu != here {
+                    if let Some(slot) = tasks[i].as_mut() {
+                        slot.cpu = here;
+                    }
                 }
                 found = Some(i);
                 break;
             }
-            // Локальных нет — воруем чужую свободную задачу: не привязанную
-            // пользователем и не исполняющуюся прямо сейчас. Привязанные
-            // (sched_setaffinity) и кадры в ядре чужого CPU не трогаем.
+            // Локальных нет — берём свободную задачу или привязанную, чья
+            // маска разрешает этот CPU. Кадр в ядре чужого CPU не трогаем.
             if found.is_none() {
                 for i in 0..n {
                     let Some(t) = tasks[i].as_ref() else {
                         continue;
                     };
-                    if t.state != TaskState::Runnable || t.affinity_set || t.on_cpu >= 0 {
+                    if t.state != TaskState::Runnable || t.on_cpu >= 0 {
                         continue;
                     }
-                    tasks[i].as_mut().expect("checked").cpu = me as u32;
+                    if punish && prev >= 0 && i == prev as usize {
+                        continue;
+                    }
+                    let here = me as u32;
+                    if t.affinity_set && (here >= 64 || t.cpu_mask & (1u64 << here) == 0) {
+                        continue;
+                    }
+                    tasks[i].as_mut().expect("checked").cpu = here;
                     found = Some(i);
                     break;
+                }
+            }
+            if found.is_none() && prev >= 0 {
+                if let Some(t) = tasks[prev as usize].as_ref() {
+                    if t.state == TaskState::Runnable
+                        && (t.on_cpu < 0 || t.on_cpu == me as i8)
+                        && t.cpu == me as u32
+                    {
+                        found = Some(prev as usize);
+                    }
+                }
+            }
+            if punish {
+                let v = OWED[me].load(Ordering::Relaxed);
+                if v > 0 {
+                    OWED[me].store(v - 1, Ordering::Relaxed);
                 }
             }
             found

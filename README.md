@@ -247,7 +247,7 @@ QEMU ожидается в `C:\Program Files\qemu`.
 - [x] VirtIO-blk (legacy, одна очередь) и ext2 read-write как корень
 - [x] 1.0.0: один raw-образ, reboot сохраняет файлы, smoke и заметки релиза
 - [x] 1.0.1: проверка указателей syscall, возврат кадров и кучи, e2fsck, CI
-- [ ] SMP до конца: очередь и TSS есть на каждом поднятом CPU, задача с affinity исполняется на нём. Нет x2APIC и полной маски
+- [ ] SMP до конца: очередь и TSS есть на каждом поднятом CPU, маска affinity хранится целиком. x2APIC есть. PI-futex нет
 - [ ] mini-libc и `malloc` через brk для своих программ
 - [ ] async/await внутри ядра
 - [ ] Серверный контур 2.x до конца: IPv6, netlink, ext4, пакеты, namespaces, повторы и окно TCP. Петля и провод UDP/TCP, постраничный кэш fs (16 слотов по 4 КиБ), virtio-net, PID1 и `CLONE_FS` уже в ядре

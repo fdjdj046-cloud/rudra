@@ -18,6 +18,14 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 pub static PER_CPU_TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
 
+/// Разложение тика: пользователь, ядро, простой. Сумма по CPU — поля `/proc/stat`.
+pub static USER_TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+pub static SYS_TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+pub static IDLE_TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+
 /// Аптайм в миллисекундах по TSC. `TICKS` — счётчик тиков планировщика, не часы.
 pub fn uptime_ms() -> u64 {
     crate::time::monotonic_ns() / 1_000_000

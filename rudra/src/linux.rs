@@ -9,16 +9,15 @@
 //! arch_prctl, set_tid_address/robust_list), pipe/pipe2, poll, время,
 //! uname, reboot, getrandom и мелочь.
 //!
-//! UDP/`AF_INET` есть (петля и virtio-net). TCP, IPv6 и netlink нет.
+//! UDP/`AF_INET` и TCP есть (петля и провод). IPv6 и netlink нет.
 //! Сигналы 1–31 доставляются на возврате из syscall и с тика в ring 3, если
-//! задан `SA_RESTORER`. Блокирующий сон, futex, pipe, poll и recvfrom
-//! возвращают `EINTR`. Чтение консоли — нет.
+//! задан `SA_RESTORER`. Смерть по сигналу — `WIFSIGNALED`. Блокирующий сон,
+//! futex, pipe, poll и recvfrom возвращают `EINTR`. Чтение консоли — нет.
 //! Задача стартует как root (uid/gid 0). `setuid`/`setgid` меняют id.
 //! `seccomp` strict режет всё, кроме read, write, rt_sigreturn и exit.
-//! epoll — level-triggered по номеру fd, `EPOLLET` даёт edge-триггер,
-//! `epoll_pwait` ставит временную маску сигналов, poll самого epoll-fd пуст.
-//! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих на этом
-//! CPU. Задача исполняется на CPU из `sched_setaffinity`. x2APIC нет.
+//! epoll — level и edge по номеру fd. poll и select видят готовый epoll-fd.
+//! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих.
+//! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
 use alloc::boxed::Box;
@@ -1097,7 +1096,7 @@ fn sys_sendto(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, destlen: u64)
     if len as usize > MAX_IO {
         return EFAULT;
     }
-    if (len as usize) > 1280 {
+    if (len as usize) > crate::net::DGRAM_MAX {
         return EMSGSIZE;
     }
     let bytes = if len == 0 {
@@ -1139,7 +1138,7 @@ fn sys_recvfrom(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, srclen: u64)
     if len as usize > MAX_IO {
         return EFAULT;
     }
-    let cap = (len as usize).min(1280);
+    let cap = (len as usize).min(crate::net::DGRAM_MAX);
     let mut tmp = alloc::vec![0u8; cap];
     let nonblock = crate::net::udp_nonblock(id);
     loop {
@@ -1257,14 +1256,29 @@ fn tcp_read(id: usize, buf: u64, len: u64, src: u64, srclen: u64) -> u64 {
     }
 }
 
-/// `SO_REUSEADDR` и `SO_BROADCAST` принимаем и нигде не храним: UDP и так
-/// может занять свободный порт и слать широковещательные кадры.
-fn sys_setsockopt(fd: u64, level: u64, opt: u64, _val: u64, _len: u64) -> u64 {
-    if sock_kind(fd).is_err() {
-        return ENOTSOCK;
-    }
+/// `SO_REUSEADDR` (2) и `SO_BROADCAST` (6) пишутся в сокет и читаются обратно.
+fn sys_setsockopt(fd: u64, level: u64, opt: u64, val: u64, len: u64) -> u64 {
+    let kind = match sock_kind(fd) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
     if level == 1 && (opt == 2 || opt == 6) {
-        return 0;
+        if len < 4 || val == 0 {
+            return EINVAL;
+        }
+        let mut raw = [0u8; 4];
+        if !u_read(val, &mut raw) {
+            return EFAULT;
+        }
+        let on = i32::from_le_bytes(raw) != 0;
+        let rc = match kind {
+            SockKind::Udp(id) => crate::net::udp_set_opt(id, opt as u32, on),
+            SockKind::Tcp(id) => crate::net::tcp_set_opt(id, opt as u32, on),
+        };
+        return match rc {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        };
     }
     ENOPROTOOPT
 }
@@ -1281,6 +1295,23 @@ fn sys_getsockopt(fd: u64, level: u64, opt: u64, val: u64, len_ptr: u64) -> u64 
             SockKind::Udp(_) => 2,
         };
         if !u_write(val, &typ.to_le_bytes()) {
+            return EFAULT;
+        }
+        if len_ptr != 0 && !u_write(len_ptr, &4u32.to_le_bytes()) {
+            return EFAULT;
+        }
+        return 0;
+    }
+    if level == 1 && (opt == 2 || opt == 6) {
+        let rc = match kind {
+            SockKind::Udp(id) => crate::net::udp_get_opt(id, opt as u32),
+            SockKind::Tcp(id) => crate::net::tcp_get_opt(id, opt as u32),
+        };
+        let v = match rc {
+            Ok(v) => v,
+            Err(e) => return neg_err(e),
+        };
+        if !u_write(val, &v.to_le_bytes()) {
             return EFAULT;
         }
         if len_ptr != 0 && !u_write(len_ptr, &4u32.to_le_bytes()) {
@@ -2132,53 +2163,83 @@ fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
 }
 
 fn poll_ready(fd: u64, events: i16) -> i16 {
+    match with_current_fds(|fds| ready_locked(fds, fd, events, 0)) {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
+
+/// Готовность fd по уже захваченной таблице. `depth` обрывает цикл epoll→epoll.
+fn ready_locked(fds: &[Option<Fd>], fd: u64, events: i16, depth: u8) -> i16 {
     const POLLIN: i16 = 1;
     const POLLOUT: i16 = 4;
+    let Some(f) = fds.get(fd as usize).and_then(|x| x.as_ref()) else {
+        return 0;
+    };
     let mut revents = 0i16;
-    let _ = with_fd(fd, |f| {
-        match f {
-            Fd::Console { writable } => {
-                if !*writable && events & POLLIN != 0 && crate::input::with_input(|q| q.len() > 0) {
+    match f {
+        Fd::Console { writable } => {
+            if !writable && events & POLLIN != 0 && crate::input::with_input(|q| q.len() > 0) {
+                revents |= POLLIN;
+            }
+            if *writable && events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+        }
+        Fd::File { .. } | Fd::Dir { .. } => {
+            revents |= events & (POLLIN | POLLOUT);
+        }
+        Fd::Pipe { id, writable } => {
+            let pipes = PIPES.lock();
+            if let Some(Some(p)) = pipes.get(*id) {
+                if !writable && p.len > 0 && events & POLLIN != 0 {
                     revents |= POLLIN;
                 }
                 if *writable && events & POLLOUT != 0 {
                     revents |= POLLOUT;
                 }
             }
-            Fd::File { .. } | Fd::Dir { .. } => {
-                revents |= events & (POLLIN | POLLOUT);
-            }
-            Fd::Pipe { id, writable } => {
-                let pipes = PIPES.lock();
-                if let Some(Some(p)) = pipes.get(*id) {
-                    if !*writable && p.len > 0 && events & POLLIN != 0 {
-                        revents |= POLLIN;
-                    }
-                    if *writable && events & POLLOUT != 0 {
-                        revents |= POLLOUT;
-                    }
-                }
-            }
-            Fd::Udp { id } => {
-                if events & POLLIN != 0 && crate::net::udp_pending(*id) {
-                    revents |= POLLIN;
-                }
-                if events & POLLOUT != 0 {
-                    revents |= POLLOUT;
-                }
-            }
-            Fd::Tcp { id } => {
-                if events & POLLIN != 0 && crate::net::tcp_pending(*id) {
-                    revents |= POLLIN;
-                }
-                if events & POLLOUT != 0 {
-                    revents |= POLLOUT;
-                }
-            }
-            // with_fd не реентерабелен: готовность набора смотрит только epoll_wait.
-            Fd::Epoll { .. } => {}
         }
-    });
+        Fd::Udp { id } => {
+            if events & POLLIN != 0 && crate::net::udp_pending(*id) {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+        }
+        Fd::Tcp { id } => {
+            if events & POLLIN != 0 && crate::net::tcp_pending(*id) {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+        }
+        Fd::Epoll { id } => {
+            if depth >= 2 || events & POLLIN == 0 {
+                return 0;
+            }
+            let watched: Vec<(u64, i16)> = with_epolls(|tab| {
+                let Some(set) = tab.get(*id).and_then(|s| s.as_ref()) else {
+                    return Vec::new();
+                };
+                set.items
+                    .iter()
+                    .flatten()
+                    .map(|it| (it.fd, (it.events & 5) as i16))
+                    .collect()
+            });
+            for (wfd, want) in watched {
+                if wfd == fd {
+                    continue;
+                }
+                if ready_locked(fds, wfd, want, depth + 1) != 0 {
+                    return POLLIN;
+                }
+            }
+        }
+    }
     revents
 }
 
@@ -2187,12 +2248,13 @@ fn poll_ready(fd: u64, events: i16) -> i16 {
 // Level-triggered по умолчанию; `EPOLLET` — edge: доставляется фронт
 // «не готово → готово» по снимку прошлой готовности. Интерес — номер fd
 // в таблице задачи, не описание файла: close этого номера снимает интерес,
-// даже если остался dup. Больше 16 наборов или 32 интересов — ENOMEM.
-// Таймаут дольше 60 с — EINVAL, чтобы зависший wait не выглядел как рабочий
-// epoll. `epoll_pwait` ставит временную маску сигналов на время ожидания.
+// даже если остался dup. Больше 64 наборов или 128 интересов — ENOMEM.
+// Таймаут — миллисекунды, как int у Linux, включая -1. `epoll_pwait`
+// ставит временную маску сигналов на время ожидания. poll/select по
+// самому epoll-fd видят POLLIN, когда готов хотя бы один интерес.
 
-const EPOLL_MAX_SETS: usize = 16;
-const EPOLL_MAX_ITEMS: usize = 32;
+const EPOLL_MAX_SETS: usize = 64;
+const EPOLL_MAX_ITEMS: usize = 128;
 const EPOLLIN: u32 = 1;
 const EPOLLET: u32 = 0x8000_0000;
 const EPOLLOUT: u32 = 4;
@@ -2443,7 +2505,7 @@ fn epoll_wait_core(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> 
     let max = max as usize;
     // Таймаут — int в младших 32 битах: userspace кладёт -1 через mov r10d.
     let t = timeout as i32;
-    if t < -1 || t > 60_000 {
+    if t < -1 {
         return EINVAL;
     }
     let deadline = if t > 0 {
@@ -2635,11 +2697,15 @@ fn sys_wait4(pid: u64, status: u64, options: u64) -> u64 {
     let wnohang = options & 1 != 0;
     loop {
         let want = if pid == u64::MAX { 0 } else { pid };
-        if let Some((tid, code)) = task::reap_child(me, want) {
+        if let Some((tid, code, term)) = task::reap_child(me, want) {
             if status != 0 {
-                // W_EXITCODE(code, 0)
-                let word = (((code as i32) << 8) & 0xFF00).to_le_bytes();
-                if !u_write(status, &word) {
+                // Сигнал — младшие 7 бит (WIFSIGNALED). Иначе W_EXITCODE.
+                let word = if term != 0 {
+                    u32::from(term)
+                } else {
+                    ((code as u32) << 8) & 0xFF00
+                };
+                if !u_write(status, &word.to_le_bytes()) {
                     return EFAULT;
                 }
             }

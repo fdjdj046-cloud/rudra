@@ -11,9 +11,9 @@
 //! с SA_RESTART у перехваченного обработчика эти же вызовы продолжают ждать
 //! (сон — исключение, как в Linux: nanosleep никогда не перезапускается).
 //! Чтение консоли не прерывается. На стеке нет исполняемого трамплина.
-//! `SIGSTOP` и сигналы остановки сбрасываются. Смерть по умолчанию —
-//! `exit(128+sig)`, статус wait выглядит как обычный код выхода,
-//! не как `WIFSIGNALED`.
+//! `SIGSTOP` и сигналы остановки сбрасываются. Смерть по умолчанию
+//! пишет в статус `wait` номер сигнала (`WIFSIGNALED`), а в журнале
+//! задачи остаётся `128+sig`. `exit` без сигнала — обычный код выхода.
 
 use crate::syscall::FRAME;
 use crate::task::{self, user_read, user_write};
@@ -467,7 +467,10 @@ pub fn deliver_pending(frame: *mut u64, ret: u64) -> u64 {
         match popped {
             None => return ret,
             Some(Pop::Ignored) => continue,
-            Some(Pop::Fatal(sig)) => task::sys_exit(128 + u64::from(sig)),
+            Some(Pop::Fatal(sig)) => {
+                task::note_term_sig(sig);
+                task::sys_exit(128 + u64::from(sig))
+            }
             Some(Pop::Catch(caught)) => {
                 if !arm_handler(frame, &caught, ret) {
                     let _ = task::with_current_task(|t| t.signals.undo(&caught));
@@ -643,6 +646,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
         return 0;
     }
     if sig == u64::from(SIGKILL) && pid == me {
+        task::note_term_sig(SIGKILL);
         task::sys_exit(128 + u64::from(SIGKILL));
     }
     let armed = if pid == me {

@@ -1,9 +1,10 @@
-//! IPv4, UDP и TCP на петле `127.0.0.0/8`.
-//! В провод уходит UDP через virtio-net: ARP на восемь соседей и DHCP.
+//! IPv4, UDP и TCP. Петля `127.0.0.0/8` и провод через virtio-net:
+//! ARP на восемь соседей, DHCP, скользящее окно и медленный старт.
 //! Исходящий UDP считает сумму. Входящая сумма 0 на IPv4 значит «не считали»
 //! и принимается: так QEMU отдаёт DHCP.
-//! TCP завершает рукопожатие только на петле. Адрес не из `127.0.0.0/8` —
-//! `ENETUNREACH`. Повторов, окна на проводе, IPv6 и netlink нет.
+//! Датаграмма длиннее 4096 байт — `EMSGSIZE`. В провод уходит не больше
+//! 1472. `SO_REUSEADDR` и `SO_BROADCAST` хранятся на сокете.
+//! IPv6 и netlink нет.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -11,7 +12,9 @@ use spin::Mutex;
 
 const SOCKS: usize = 16;
 const QLEN: usize = 4;
-const DGRAM_MAX: usize = 1280;
+/// Потолок датаграммы в памяти сокета. В провод — отдельно, по Ethernet MTU.
+pub const DGRAM_MAX: usize = 4096;
+const WIRE_DGRAM_MAX: usize = 1472;
 
 pub const EAGAIN: i32 = 11;
 pub const EFAULT: i32 = 14;
@@ -30,6 +33,7 @@ pub const ECONNREFUSED: i32 = 111;
 pub const ETIMEDOUT: i32 = 110;
 pub const EINPROGRESS: i32 = 115;
 pub const EINTR: i32 = 4;
+pub const EACCES: i32 = 13;
 
 struct Dgram {
     src: u32,
@@ -44,6 +48,8 @@ struct Sock {
     bound: bool,
     peer: Option<(u32, u16)>,
     nonblock: bool,
+    reuse: bool,
+    broadcast: bool,
     q: Vec<Dgram>,
 }
 
@@ -118,6 +124,8 @@ pub fn udp_open(nonblock: bool) -> Result<usize, i32> {
                     bound: false,
                     peer: None,
                     nonblock,
+                    reuse: false,
+                    broadcast: false,
                     q: Vec::new(),
                 });
                 return Ok(i);
@@ -223,7 +231,7 @@ pub fn udp_send(id: usize, data: &[u8], dst: Option<(u32, u16)>) -> Result<usize
     if data.len() > DGRAM_MAX {
         return Err(EMSGSIZE);
     }
-    let (src, sport, dest) = with_socks(|tab| -> Result<_, i32> {
+    let (src, sport, dest, broadcast) = with_socks(|tab| -> Result<_, i32> {
         if tab.get(id).and_then(|s| s.as_ref()).is_none() {
             return Err(EFAULT);
         }
@@ -250,12 +258,19 @@ pub fn udp_send(id: usize, data: &[u8], dst: Option<(u32, u16)>) -> Result<usize
         } else {
             0
         };
-        Ok((src, s.port, dest))
+        Ok((src, s.port, dest, s.broadcast))
     })?;
     let src = if src != 0 { src } else { our_ip() };
+    let bcast = dest.0 == 0xffff_ffff || directed_broadcast(dest.0);
+    if bcast && !broadcast {
+        return Err(EACCES);
+    }
     if is_loopback(dest.0) || (src != 0 && dest.0 == src) {
         deliver(dest.0, dest.1, src, sport, data);
         return Ok(data.len());
+    }
+    if data.len() > WIRE_DGRAM_MAX {
+        return Err(EMSGSIZE);
     }
     if !iface_up() || src == 0 {
         return Err(ENETDOWN);
@@ -302,6 +317,10 @@ pub fn pump() {
 /// RTO вышел. За RTO_TC попыток без ACK — разрыв (eof), как таймаут читателя.
 const RTO_NS: u64 = 500_000_000;
 const RTO_TC: u8 = 8;
+/// Медленный старт: окно растёт на число подтверждённых байт, пока не
+/// упрётся в `ssthresh`, дальше — на MSS²/cwnd за ACK. Потолок 64 КиБ.
+const MSS: u32 = 1280;
+const CWND_MAX: u32 = 64 * 1024;
 
 fn tcp_retransmit() {
     let now = crate::time::monotonic_ns();
@@ -311,12 +330,19 @@ fn tcp_retransmit() {
             if !s.wire || !s.estab || s.unacked.is_empty() {
                 continue;
             }
-            let due = s.unacked.iter_mut().find(|(_, _, last)| {
-                now.saturating_sub(*last) > RTO_NS
-            });
-            let Some((seq, data, last)) = due else { continue };
-            *last = now;
+            let inflight: u32 = s.unacked.iter().map(|(_, d, _)| d.len() as u32).sum();
+            let due = s
+                .unacked
+                .iter()
+                .position(|(_, _, last)| now.saturating_sub(*last) > RTO_NS);
+            let Some(due) = due else { continue };
+            s.unacked[due].2 = now;
+            let seq = s.unacked[due].0;
+            let data = s.unacked[due].1.clone();
             s.rtx = s.rtx.saturating_add(1);
+            // Потеря: окно схлопывается до одного MSS, порог — половина полёта.
+            s.ssthresh = (inflight / 2).max(MSS * 2);
+            s.cwnd = MSS;
             if s.rtx >= RTO_TC {
                 // Пир молчит слишком долго: закрываем передачу.
                 s.eof = true;
@@ -324,7 +350,7 @@ fn tcp_retransmit() {
                 s.unacked.clear();
                 continue;
             }
-            jobs.push((s.addr, s.port, s.peer_addr, s.peer_port, *seq, s.rnext, data.clone()));
+            jobs.push((s.addr, s.port, s.peer_addr, s.peer_port, seq, s.rnext, data));
         }
     });
     for (a, p, pa, pp, seq, ack, data) in jobs {
@@ -478,9 +504,53 @@ fn alloc_port(tab: &[Option<Sock>; SOCKS]) -> u16 {
 }
 
 fn taken(tab: &[Option<Sock>; SOCKS], except: usize, port: u16) -> bool {
+    let reuse = tab
+        .get(except)
+        .and_then(|s| s.as_ref())
+        .map(|s| s.reuse)
+        .unwrap_or(false);
     tab.iter().enumerate().any(|(i, s)| {
-        i != except && s.as_ref().map(|s| s.bound && s.port == port).unwrap_or(false)
+        i != except
+            && s.as_ref()
+                .map(|s| s.bound && s.port == port && !(reuse && s.reuse))
+                .unwrap_or(false)
     })
+}
+
+pub fn udp_set_opt(id: usize, opt: u32, on: bool) -> Result<(), i32> {
+    with_socks(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        match opt {
+            2 => s.reuse = on,
+            6 => s.broadcast = on,
+            _ => return Err(EINVAL),
+        }
+        Ok(())
+    })
+}
+
+pub fn udp_get_opt(id: usize, opt: u32) -> Result<i32, i32> {
+    with_socks(|tab| {
+        let Some(s) = tab.get(id).and_then(|s| s.as_ref()) else {
+            return Err(EFAULT);
+        };
+        let on = match opt {
+            2 => s.reuse,
+            6 => s.broadcast,
+            _ => return Err(EINVAL),
+        };
+        Ok(if on { 1 } else { 0 })
+    })
+}
+
+fn directed_broadcast(addr: u32) -> bool {
+    let (ip, mask) = with_iface(|iface| (iface.ip, iface.mask));
+    if ip == 0 || mask == 0 || mask == 0xffff_ffff {
+        return false;
+    }
+    addr != ip && (addr & mask) == (ip & mask) && (addr & !mask) == !mask
 }
 
 fn deliver(dst: u32, dport: u16, src: u32, sport: u16, data: &[u8]) {
@@ -793,6 +863,10 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                 reorder: Vec::new(),
                 reorder_fin: false,
                 rtx: 0,
+                cwnd: MSS,
+                ssthresh: CWND_MAX,
+                reuse: false,
+                broadcast: false,
             });
             tab[lid].as_mut().unwrap().backlog.push(child);
             // SYN-ACK: seq = наш ISN, ack = их seq + 1.
@@ -840,8 +914,20 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                 // ACK: снимаем подтверждённое с inflight, запоминаем окно.
                 if flags & TH_ACK != 0 {
                     s.win = u32::from(be16(frame, t + 14));
+                    let before: u32 = s.unacked.iter().map(|(_, d, _)| d.len() as u32).sum();
                     s.unacked
                         .retain(|(sq, d, _)| rx_ack.wrapping_sub(*sq) < d.len() as u32);
+                    let after: u32 = s.unacked.iter().map(|(_, d, _)| d.len() as u32).sum();
+                    let acked = before.saturating_sub(after);
+                    if acked > 0 {
+                        if s.cwnd < s.ssthresh {
+                            s.cwnd = s.cwnd.saturating_add(acked).min(CWND_MAX);
+                        } else if s.cwnd > 0 {
+                            s.cwnd = s.cwnd
+                                .saturating_add(MSS.saturating_mul(MSS) / s.cwnd)
+                                .min(CWND_MAX);
+                        }
+                    }
                     if s.unacked.is_empty() {
                         s.rtx = 0;
                     }
@@ -1192,6 +1278,13 @@ struct TcpSock {
     reorder_fin: bool,
     /// Счётчик ретрансмиссий: за пределами — разрыв (eof).
     rtx: u8,
+    /// Окно перегрузки и порог медленного старта. Петля их не смотрит.
+    cwnd: u32,
+    ssthresh: u32,
+    /// `SO_REUSEADDR`: два слушающих сокета делят порт, если флаг у обоих.
+    reuse: bool,
+    /// `SO_BROADCAST`. У TCP не на что влиять, но getsockopt обязан вернуть то, что записали.
+    broadcast: bool,
 }
 
 static TCP_TAB: Mutex<[Option<TcpSock>; TCP_N]> = Mutex::new([
@@ -1227,15 +1320,51 @@ fn tcp_fresh(nonblock: bool) -> TcpSock {
         reorder: Vec::new(),
         reorder_fin: false,
         rtx: 0,
+        cwnd: MSS,
+        ssthresh: CWND_MAX,
+        reuse: false,
+        broadcast: false,
     }
 }
 
 fn tcp_port_taken(tab: &[Option<TcpSock>; TCP_N], except: usize, port: u16) -> bool {
+    let reuse = tab
+        .get(except)
+        .and_then(|s| s.as_ref())
+        .map(|s| s.reuse)
+        .unwrap_or(false);
     tab.iter().enumerate().any(|(i, s)| {
         i != except
             && s.as_ref()
-                .map(|s| s.bound && s.port == port && s.listen)
+                .map(|s| s.bound && s.port == port && s.listen && !(reuse && s.reuse))
                 .unwrap_or(false)
+    })
+}
+
+pub fn tcp_set_opt(id: usize, opt: u32, on: bool) -> Result<(), i32> {
+    with_tcp(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        match opt {
+            2 => s.reuse = on,
+            6 => s.broadcast = on,
+            _ => return Err(EINVAL),
+        }
+        Ok(())
+    })
+}
+
+pub fn tcp_get_opt(id: usize, opt: u32) -> Result<i32, i32> {
+    with_tcp(|tab| {
+        let Some(s) = tab.get(id).and_then(|s| s.as_ref()) else {
+            return Err(EFAULT);
+        };
+        match opt {
+            2 => Ok(if s.reuse { 1 } else { 0 }),
+            6 => Ok(if s.broadcast { 1 } else { 0 }),
+            _ => Err(EINVAL),
+        }
     })
 }
 
@@ -1401,7 +1530,7 @@ pub fn tcp_accept(id: usize) -> Result<(usize, u32, u16), i32> {
 
 /// Проводное соединение: SYN, ожидание SYN-ACK с pump (до 3 попыток),
 /// blocking-до-установления или EINPROGRESS у неблокирующего сокета.
-/// RST от пира — ECONNREFUSED. Повторов сегментов нет: не ответили — ETIMEDOUT.
+/// RST от пира — ECONNREFUSED. Данные после установки повторяются по RTO.
 fn tcp_connect_wire(id: usize, dst_ip: u32, dst_port: u16) -> Result<(), i32> {
     let ip = our_ip();
     if ip == 0 || !crate::virtio_net::present() {
@@ -1575,6 +1704,10 @@ pub fn tcp_connect(id: usize, dst_ip: u32, dst_port: u16) -> Result<(), i32> {
             reorder: Vec::new(),
             reorder_fin: false,
             rtx: 0,
+            cwnd: MSS,
+            ssthresh: CWND_MAX,
+            reuse: false,
+            broadcast: false,
         });
         {
             let s = tab[id].as_mut().unwrap();
@@ -1644,8 +1777,9 @@ pub fn tcp_send(id: usize, data: &[u8]) -> Result<usize, i32> {
                 // Нулевое окно: ждём window update (пока — EAGAIN).
                 return Err(EAGAIN);
             }
-            let avail = s.win.saturating_sub(inflight) as usize;
-            let n = data.len().min(1280).min(avail);
+            let budget = s.win.min(s.cwnd);
+            let avail = budget.saturating_sub(inflight) as usize;
+            let n = data.len().min(MSS as usize).min(avail);
             if n == 0 {
                 return Err(EAGAIN);
             }
@@ -1830,6 +1964,35 @@ mod tests {
         assert_eq!(rn, 0);
         tcp_close(accepted);
         tcp_close(listener);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn udp_remembers_reuse_and_broadcast() {
+        serial_print!("test udp_remembers_reuse_and_broadcast... ");
+        let a = udp_open(true).expect("open");
+        udp_set_opt(a, 2, true).expect("reuse");
+        udp_set_opt(a, 6, true).expect("bcast");
+        assert_eq!(udp_get_opt(a, 2).expect("get"), 1);
+        assert_eq!(udp_get_opt(a, 6).expect("get b"), 1);
+        udp_bind(a, 0x7f00_0001, 19020).expect("bind");
+        let b = udp_open(true).expect("open b");
+        assert_eq!(udp_bind(b, 0x7f00_0001, 19020).expect_err("busy"), EADDRINUSE);
+        udp_set_opt(b, 2, true).expect("reuse b");
+        udp_bind(b, 0x7f00_0001, 19020).expect("share");
+        let c = udp_open(true).expect("open c");
+        assert_eq!(
+            udp_send(c, b"x", Some((0xffff_ffff, 9))).expect_err("bcast"),
+            EACCES
+        );
+        udp_set_opt(c, 6, true).expect("allow");
+        // Флаг снят: в провод можно (или карта ответит своей ошибкой), но не EACCES.
+        if let Err(err) = udp_send(c, b"x", Some((0xffff_ffff, 9))) {
+            assert_ne!(err, EACCES);
+        }
+        udp_close(a);
+        udp_close(b);
+        udp_close(c);
         serial_println!("[ok]");
     }
 
