@@ -11,6 +11,7 @@
 //!   0x400000        ELF-образ (PT_LOAD)
 //!   0x800000        ELF интерпретатора, если у программы есть PT_INTERP
 //!   0x600000        резерв (раньше — страница аргумента)
+//!   0xA0000         страница ленивого PLT-резолвера
 //!   0x2000000       ET_DYN из DT_NEEDED, шаг 2 МиБ, ниже brk
 //!   0x40000000      main-стек (растёт вниз от USER_STACK_TOP)
 //!   0x10000000      brk-heap (растёт вверх до BRK_MAX)
@@ -64,6 +65,19 @@ pub const MAX_TASKS: usize = 32;
 pub struct LoadedImage {
     pub entry: u64,
     pub user_rsp: u64,
+    pub lazy: Option<LazyBind>,
+}
+
+/// Слоты, которые первый вызов дописывает сам. Таблица общая у потоков
+/// одного АП и у fork: пишется пользовательский GOT, не эта таблица.
+pub struct LazyBind {
+    slots: Vec<Vec<LazySlot>>,
+}
+
+struct LazySlot {
+    arg: u64,
+    got: u64,
+    value: Option<u64>,
 }
 
 // ---- ELF64 ----
@@ -92,6 +106,12 @@ struct RelaRel {
     def_bias: Option<u64>,
     /// Внешний символ: в этом объекте его нет, его закроет связь DT_NEEDED.
     ext: Option<ExtSym>,
+    /// Байтовое смещение в `DT_JMPREL`, которое ленивый PLT кладёт на стек.
+    jmprel_off: Option<u64>,
+    /// Слот не писать при загрузке. Адрес запишет резолвер на первом вызове.
+    defer: bool,
+    /// Сильного символа нет. Загрузка жива, вызов убивает процесс.
+    missing: bool,
 }
 
 #[derive(Clone)]
@@ -148,6 +168,10 @@ struct ElfParsed {
     rpath: Option<Vec<String>>,
     /// `DT_RUNPATH`. Если тег есть, `DT_RPATH` этого объекта не используется.
     runpath: Option<Vec<String>>,
+    /// `DT_PLTGOT`. Без него `JUMP_SLOT` связывается сразу.
+    pltgot: Option<u64>,
+    /// `DF_BIND_NOW` или `DF_1_NOW`: `JUMP_SLOT` этого объекта сразу.
+    bind_now: bool,
 }
 
 struct ParsedDyn {
@@ -156,6 +180,8 @@ struct ParsedDyn {
     dynsym: DynSym,
     rpath: Option<Vec<String>>,
     runpath: Option<Vec<String>>,
+    pltgot: Option<u64>,
+    bind_now: bool,
 }
 
 enum LocalSym {
@@ -264,12 +290,20 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if segs.is_empty() {
         return None;
     }
-    let (relative, needed, dynsym, rpath, runpath) = match dyn_span {
+    let (relative, needed, dynsym, rpath, runpath, pltgot, bind_now) = match dyn_span {
         Some((start, end)) => {
             let parsed = parse_relative(elf, &segs, &elf[start..end])?;
-            (parsed.rels, parsed.needed, parsed.dynsym, parsed.rpath, parsed.runpath)
+            (
+                parsed.rels,
+                parsed.needed,
+                parsed.dynsym,
+                parsed.rpath,
+                parsed.runpath,
+                parsed.pltgot,
+                parsed.bind_now,
+            )
         }
-        None => (Vec::new(), Vec::new(), DynSym::none(), None, None),
+        None => (Vec::new(), Vec::new(), DynSym::none(), None, None, None, false),
     };
     Some(ElfParsed {
         kind,
@@ -283,6 +317,8 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
         dynsym,
         rpath,
         runpath,
+        pltgot,
+        bind_now,
     })
 }
 
@@ -677,8 +713,13 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_PLTREL: u64 = 20;
     const DT_JMPREL: u64 = 23;
     const DT_SONAME: u64 = 14;
+    const DT_PLTGOT: u64 = 3;
     const DT_RPATH: u64 = 15;
     const DT_RUNPATH: u64 = 29;
+    const DT_FLAGS: u64 = 30;
+    const DT_FLAGS_1: u64 = 0x6fff_fffb;
+    const DF_BIND_NOW: u64 = 0x8;
+    const DF_1_NOW: u64 = 0x1;
     const DT_GNU_HASH: u64 = 0x6fff_fef5;
     const DT_VERSYM: u64 = 0x6fff_fff0;
     const DT_VERDEF: u64 = 0x6fff_fffc;
@@ -708,6 +749,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut soname_off: Option<u64> = None;
     let mut rpath_off: Option<u64> = None;
     let mut runpath_off: Option<u64> = None;
+    let mut pltgot: Option<u64> = None;
+    let mut flags = 0u64;
+    let mut flags_1 = 0u64;
     let mut rel_addr = 0u64;
     let mut rel_sz = 0u64;
     let mut jmprel = 0u64;
@@ -753,6 +797,12 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             rpath_off = Some(val);
         } else if tag == DT_RUNPATH {
             runpath_off = Some(val);
+        } else if tag == DT_PLTGOT {
+            pltgot = Some(val);
+        } else if tag == DT_FLAGS {
+            flags |= val;
+        } else if tag == DT_FLAGS_1 {
+            flags_1 |= val;
         } else if tag == DT_VERSYM {
             versym_addr = val;
         } else if tag == DT_VERDEF {
@@ -869,8 +919,14 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
         if end > elf.len() {
             return None;
         }
+        let from_jmp = jmprel != 0 && addr == jmprel;
+        let mut jmp_at = 0u64;
         let mut at = start;
         while at + 24 <= end {
+            let entry_off = jmp_at;
+            if from_jmp {
+                jmp_at += 24;
+            }
             let offset = rd64(elf, at);
             let info = rd64(elf, at + 8);
             let mut addend = rd64(elf, at + 16);
@@ -883,6 +939,11 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                 // S, не S+A.
                 addend = 0;
             }
+            let jmprel_off = if from_jmp && typ == R_JUMP_SLOT {
+                Some(entry_off)
+            } else {
+                None
+            };
             let rel = match typ {
                 R_RELATIVE => RelaRel {
                     offset,
@@ -890,6 +951,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     sym: None,
                     def_bias: None,
                     ext: None,
+                    jmprel_off,
+                    defer: false,
+                    missing: false,
                 },
                 R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
                     let local = resolve_local(
@@ -908,6 +972,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             sym: Some(v),
                             def_bias: None,
                             ext: None,
+                            jmprel_off,
+                            defer: false,
+                            missing: false,
                         },
                         LocalSym::Abs(v) => RelaRel {
                             offset,
@@ -915,6 +982,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             sym: Some(v),
                             def_bias: Some(0),
                             ext: None,
+                            jmprel_off,
+                            defer: false,
+                            missing: false,
                         },
                         LocalSym::Ext { name, weak, ver, file } => RelaRel {
                             offset,
@@ -922,6 +992,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             sym: None,
                             def_bias: None,
                             ext: Some(ExtSym { name, weak, ver, file }),
+                            jmprel_off,
+                            defer: false,
+                            missing: false,
                         },
                     }
                 }
@@ -943,6 +1016,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
         },
         rpath,
         runpath,
+        pltgot,
+        bind_now: flags & DF_BIND_NOW != 0 || flags_1 & DF_1_NOW != 0,
     })
 }
 
@@ -1033,6 +1108,10 @@ fn hits_stack(segs: &[LoadSeg], bias: u64) -> bool {
 const MAX_LINK: usize = 16;
 /// Первая база ET_DYN из DT_NEEDED. Ниже — программа и интерпретатор, выше — brk.
 const LIB_BASE: u64 = 0x0200_0000;
+/// Одна страница кода ленивого резолвера. Её адрес пишется в GOT[2].
+const RESOLVE_PAGE: u64 = 0xA_0000;
+/// Приватный номер: вход резолвера, не вызов Linux.
+pub const DL_FIXUP_NR: u64 = 1024;
 const LIB_STEP: u64 = 0x20_0000;
 
 enum PlaceRole {
@@ -1217,6 +1296,12 @@ fn ld_library_path(envp: &[String]) -> Option<&str> {
         .find_map(|ent| ent.strip_prefix("LD_LIBRARY_PATH="))
 }
 
+/// Переменная есть — даже пустая. Тогда все `JUMP_SLOT` связываются сразу.
+fn ld_bind_now(envp: &[String]) -> bool {
+    envp.iter()
+        .any(|ent| ent == "LD_BIND_NOW" || ent.starts_with("LD_BIND_NOW="))
+}
+
 fn lib_in(dir: &str, name: &str) -> Option<String> {
     let mut path = String::from(dir);
     if !path.ends_with('/') {
@@ -1275,6 +1360,7 @@ fn reserved_hit(segs: &[LoadSeg], bias: u64) -> bool {
         (BRK_BASE, BRK_MAX),
         (MMAP_BASE, MMAP_TOP),
         (THREAD_STACK_BASE, thread_end),
+        (RESOLVE_PAGE, RESOLVE_PAGE + 0x1000),
     ];
     for seg in segs {
         let Some((a0, a1)) = seg_span(seg, bias) else {
@@ -1523,7 +1609,25 @@ fn lookup(
     weak.map(|(value, bias)| Hit::Found { value, bias })
 }
 
-fn bind_all(objs: &mut [LinkObj]) -> bool {
+/// `JUMP_SLOT` из `DT_JMPREL` остаётся на первый вызов, если у объекта есть
+/// `DT_PLTGOT` и ни объект, ни `LD_BIND_NOW` не просят связать сразу.
+fn object_is_lazy(obj: &LinkObj, env_now: bool) -> bool {
+    !env_now
+        && !obj.parsed.bind_now
+        && obj.parsed.pltgot.is_some()
+        && obj.parsed.relative.iter().any(|rel| rel.jmprel_off.is_some())
+}
+
+fn bind_all(objs: &mut [LinkObj], env_now: bool) -> bool {
+    for obj in objs.iter_mut() {
+        if object_is_lazy(obj, env_now) {
+            for rel in &mut obj.parsed.relative {
+                if rel.jmprel_off.is_some() {
+                    rel.defer = true;
+                }
+            }
+        }
+    }
     for i in 0..objs.len() {
         for r in 0..objs[i].parsed.relative.len() {
             let Some(ext) = objs[i].parsed.relative[r].ext.clone() else {
@@ -1543,11 +1647,14 @@ fn bind_all(objs: &mut [LinkObj]) -> bool {
                     return false;
                 }
                 None => {
+                    let rel = &mut objs[i].parsed.relative[r];
                     if ext.weak {
-                        let rel = &mut objs[i].parsed.relative[r];
                         rel.sym = Some(0);
                         rel.def_bias = Some(0);
                         rel.ext = None;
+                    } else if rel.defer {
+                        rel.missing = true;
+                        serial_println!("[task] lazy undefined {}", shown);
                     } else {
                         serial_println!("[task] undefined symbol {}", shown);
                         return false;
@@ -1563,7 +1670,7 @@ fn link_with<F>(main_bytes: &[u8], fetch: F) -> Option<Linked>
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
 {
-    link_at(main_bytes, None, "/", None, fetch)
+    link_at(main_bytes, None, "/", None, false, fetch)
 }
 
 fn link_at<F>(
@@ -1571,6 +1678,7 @@ fn link_at<F>(
     origin: Option<&str>,
     cwd: &str,
     libpath: Option<&str>,
+    bind_now: bool,
     mut fetch: F,
 ) -> Option<Linked>
 where
@@ -1664,16 +1772,21 @@ where
             return None;
         }
     }
-    if !bind_all(&mut objs) {
+    if !bind_all(&mut objs, bind_now) {
         return None;
     }
     Some(Linked { objs, interp_index })
 }
 
 fn link_program(bytes: &[u8], origin: &str, cwd: &str, envp: &[String]) -> Option<Linked> {
-    link_at(bytes, Some(origin), cwd, ld_library_path(envp), |path| {
-        crate::fs::read_canon(path)
-    })
+    link_at(
+        bytes,
+        Some(origin),
+        cwd,
+        ld_library_path(envp),
+        ld_bind_now(envp),
+        |path| crate::fs::read_canon(path),
+    )
 }
 
 // ---- Адресное пространство ----
@@ -1687,6 +1800,7 @@ pub struct AddressSpace {
     pub brk: u64,
     pub mmap_next: u64,
     pub thread_stacks: u64,
+    pub lazy: Option<Arc<LazyBind>>,
 }
 
 impl AddressSpace {
@@ -1698,6 +1812,7 @@ impl AddressSpace {
             brk: BRK_BASE,
             mmap_next: MMAP_BASE,
             thread_stacks: 0,
+            lazy: None,
         })))
     }
 }
@@ -2414,6 +2529,9 @@ fn map_and_copy(
 
 fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapToError<Size4KiB>> {
     for rel in rels {
+        if rel.defer {
+            continue;
+        }
         if rel.ext.is_some() {
             return Err(MapToError::FrameAllocationFailed);
         }
@@ -2435,9 +2553,191 @@ fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapT
     Ok(())
 }
 
+fn resolved_value(rel: &RelaRel, bias: u64) -> u64 {
+    let base = if rel.sym.is_none() {
+        bias
+    } else {
+        rel.def_bias.unwrap_or(bias)
+    };
+    rel.addend.wrapping_add(rel.sym.unwrap_or(0)).wrapping_add(base)
+}
+
+fn collect_lazy(objs: &[LinkObj]) -> Option<LazyBind> {
+    let mut any = false;
+    let mut slots = Vec::new();
+    for obj in objs {
+        let mut one = Vec::new();
+        for rel in &obj.parsed.relative {
+            if !rel.defer {
+                continue;
+            }
+            let Some(arg) = rel.jmprel_off else {
+                continue;
+            };
+            any = true;
+            one.push(LazySlot {
+                arg,
+                got: rel.offset.wrapping_add(obj.bias),
+                value: if rel.missing {
+                    None
+                } else {
+                    Some(resolved_value(rel, obj.bias))
+                },
+            });
+        }
+        slots.push(one);
+    }
+    if any { Some(LazyBind { slots }) } else { None }
+}
+
+fn resolver_stub() -> &'static [u8] {
+    extern "C" {
+        static resolve_stub_start: u8;
+        static resolve_stub_end: u8;
+    }
+    unsafe {
+        let start = core::ptr::addr_of!(resolve_stub_start);
+        let end = core::ptr::addr_of!(resolve_stub_end);
+        let n = (end as usize).wrapping_sub(start as usize);
+        core::slice::from_raw_parts(start, n)
+    }
+}
+
+const STUB_FLAGS: PageTableFlags = PageTableFlags::from_bits_truncate(
+    PageTableFlags::PRESENT.bits() | PageTableFlags::USER_ACCESSIBLE.bits(),
+);
+
+fn install_resolver(
+    l4: PhysFrame,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> Result<(), MapToError<Size4KiB>> {
+    let bytes = resolver_stub();
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(MapToError::FrameAllocationFailed);
+    }
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(RESOLVE_PAGE));
+    map_zeroed(l4, page, frame_allocator, STUB_FLAGS)?;
+    write_user(l4, RESOLVE_PAGE, bytes)
+}
+
+/// GOT[1] — номер объекта, GOT[2] — страница резолвера.
+fn arm_plt(
+    l4: PhysFrame,
+    objs: &[LinkObj],
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> Result<(), MapToError<Size4KiB>> {
+    let mut armed = false;
+    for (index, obj) in objs.iter().enumerate() {
+        if !obj.parsed.relative.iter().any(|rel| rel.defer) {
+            continue;
+        }
+        let Some(pltgot) = obj.parsed.pltgot else {
+            return Err(MapToError::FrameAllocationFailed);
+        };
+        let base = pltgot.wrapping_add(obj.bias);
+        write_user(l4, base.wrapping_add(8), &(index as u64).to_le_bytes())?;
+        write_user(l4, base.wrapping_add(16), &RESOLVE_PAGE.to_le_bytes())?;
+        armed = true;
+    }
+    if armed {
+        install_resolver(l4, frame_allocator)?;
+    }
+    Ok(())
+}
+
+/// Записать адрес в GOT и вернуть его. Сильного символа нет — `None`.
+fn fixup_slot(l4: PhysFrame, lazy: &LazyBind, index: u64, arg: u64) -> Option<u64> {
+    let obj = lazy.slots.get(index as usize)?;
+    let slot = obj.iter().find(|slot| slot.arg == arg)?;
+    let value = slot.value?;
+    write_user(l4, slot.got, &value.to_le_bytes()).ok()?;
+    Some(value)
+}
+
+/// Вызов из резолвера. Неизвестный слот и промах сильного символа убивают задачу.
+pub fn sys_dl_fixup(index: u64, arg: u64) -> u64 {
+    let found = with_current_task(|t| {
+        let space = t.aspace.lock();
+        let lazy = space.lazy.clone();
+        (space.l4, lazy)
+    });
+    let Some((l4, lazy)) = found else {
+        serial_println!("[task] lazy PLT without a task");
+        sys_exit(128 + 9);
+    };
+    let Some(lazy) = lazy else {
+        serial_println!("[task] lazy PLT without a link map");
+        sys_exit(128 + 9);
+    };
+    match fixup_slot(l4, &lazy, index, arg) {
+        Some(value) => value,
+        None => {
+            serial_println!("[task] lazy PLT miss obj {} off {}", index, arg);
+            sys_exit(128 + 9);
+        }
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .text
+    .global resolve_stub_start
+    .global resolve_stub_end
+resolve_stub_start:
+    # Стек от PLT: [GOT1][reloc_off][адрес возврата вызывающего].
+    # Аргументы функции и xmm0-7 сохраняем: syscall и Rust их затирают.
+    sub rsp, 128
+    movdqu xmmword ptr [rsp + 0], xmm0
+    movdqu xmmword ptr [rsp + 16], xmm1
+    movdqu xmmword ptr [rsp + 32], xmm2
+    movdqu xmmword ptr [rsp + 48], xmm3
+    movdqu xmmword ptr [rsp + 64], xmm4
+    movdqu xmmword ptr [rsp + 80], xmm5
+    movdqu xmmword ptr [rsp + 96], xmm6
+    movdqu xmmword ptr [rsp + 112], xmm7
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rdi, qword ptr [rsp + 200]
+    mov rsi, qword ptr [rsp + 208]
+    mov eax, {nr}
+    syscall
+    mov qword ptr [rsp + 200], rax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    movdqu xmm7, xmmword ptr [rsp + 112]
+    movdqu xmm6, xmmword ptr [rsp + 96]
+    movdqu xmm5, xmmword ptr [rsp + 80]
+    movdqu xmm4, xmmword ptr [rsp + 64]
+    movdqu xmm3, xmmword ptr [rsp + 48]
+    movdqu xmm2, xmmword ptr [rsp + 32]
+    movdqu xmm1, xmmword ptr [rsp + 16]
+    movdqu xmm0, xmmword ptr [rsp + 0]
+    add rsp, 128
+    pop r11
+    add rsp, 8
+    jmp r11
+resolve_stub_end:
+    "#,
+    nr = const DL_FIXUP_NR,
+);
+
 /// Загрузить ELF в АП l4 и построить начальный стек (argc/argv/envp/auxv).
 /// Если есть `PT_INTERP`, вход — в интерпретатор, а `AT_ENTRY` остаётся
-/// входом основной программы. Возвращает (entry, user_rsp).
+/// входом основной программы. `lazy` — слоты, которые первый вызов дописывает.
 pub fn load_elf_image(
     l4: PhysFrame,
     elf_bytes: &[u8],
@@ -2457,6 +2757,8 @@ pub fn load_elf_image(
         map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, frame_allocator)?;
         apply_relative(l4, &obj.parsed.relative, obj.bias)?;
     }
+    arm_plt(l4, &linked.objs, frame_allocator)?;
+    let lazy = collect_lazy(&linked.objs);
     let main = &linked.objs[0];
     let phdr_vaddr = main.parsed.phdr_vaddr.wrapping_add(main.bias);
     let phnum = main.parsed.phnum;
@@ -2598,7 +2900,7 @@ pub fn load_elf_image(
     sp -= 8;
     write_user(l4, sp, &argv.len().to_le_bytes())?;
 
-    Ok(LoadedImage { entry, user_rsp: sp })
+    Ok(LoadedImage { entry, user_rsp: sp, lazy })
 }
 
 /// Kernel-стек в куче. База запоминается в задаче и освобождается в Drop.
@@ -2704,6 +3006,10 @@ fn finish_task(
     img: LoadedImage,
     name: &str,
 ) -> Result<Task, MapToError<Size4KiB>> {
+    let LoadedImage { entry, user_rsp, lazy } = img;
+    if let Some(lazy) = lazy {
+        aspace.lock().lazy = Some(Arc::new(lazy));
+    }
     let l4 = aspace.lock().l4;
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
 
@@ -2725,10 +3031,10 @@ fn finish_task(
     unsafe {
         let f = rsp as *mut u64;
         // GPR-слоты (15 штук) — нули; потом iret-фрейм.
-        core::ptr::write(f.add(GPRS + 0), img.entry); // rip
+        core::ptr::write(f.add(GPRS + 0), entry); // rip
         core::ptr::write(f.add(GPRS + 1), u64::from(user_code.0)); // cs (0x30|3)
         core::ptr::write(f.add(GPRS + 2), 0x202); // rflags: IF
-        core::ptr::write(f.add(GPRS + 3), img.user_rsp); // user rsp
+        core::ptr::write(f.add(GPRS + 3), user_rsp); // user rsp
         core::ptr::write(f.add(GPRS + 4), u64::from(user_data.0)); // ss (0x28|3)
     }
 
@@ -3157,9 +3463,9 @@ pub fn sys_clone(
             // fork: глубокая копия userspace.
             let copied = crate::memory::with_frame_allocator(|fa| {
                 copy_user_space(parent_cr3, fa).and_then(|l4| {
-                    let (brk_base, brk, mmap_next, thread_stacks) = {
+                    let (brk_base, brk, mmap_next, thread_stacks, lazy) = {
                         let a = parent_as.lock();
-                        (a.brk_base, a.brk, a.mmap_next, a.thread_stacks)
+                        (a.brk_base, a.brk, a.mmap_next, a.thread_stacks, a.lazy.clone())
                     };
                     Ok(Arc::new(Mutex::new(AddressSpace {
                         l4,
@@ -3167,6 +3473,7 @@ pub fn sys_clone(
                         brk,
                         mmap_next,
                         thread_stacks,
+                        lazy,
                     })))
                 })
             });
@@ -3357,6 +3664,10 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         Ok(v) => v,
         Err(_) => return ENOEXEC,
     };
+    let LoadedImage { entry, user_rsp, lazy } = img;
+    if let Some(lazy) = lazy {
+        aspace.lock().lazy = Some(Arc::new(lazy));
+    }
 
     // 4) Переключиться на новое АП и переписать фрейм syscall:
     //    sysret уйдёт в точку входа нового образа.
@@ -3399,8 +3710,8 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         *f.add(FRAME::RDI) = 0;
         *f.add(FRAME::RAX) = 0;
         *f.add(FRAME::RFLAGS) = 0x202;
-        *f.add(FRAME::RIP) = img.entry;
-        *f.add(FRAME::RSP) = img.user_rsp;
+        *f.add(FRAME::RIP) = entry;
+        *f.add(FRAME::RSP) = user_rsp;
     }
     drop(old);
     0
@@ -4470,6 +4781,7 @@ mod tests {
         assert!(!c.set_gid(0));
         assert!(strict_permits(0) && strict_permits(1));
         assert!(strict_permits(15) && strict_permits(60));
+        assert!(!strict_permits(DL_FIXUP_NR));
         assert!(!strict_permits(39));
         assert!(!strict_permits(157));
         assert!(!strict_permits(231));
@@ -4594,7 +4906,9 @@ mod tests {
         dt_rel: bool,
         interp: Option<&str>,
     ) -> Vec<u8> {
-        craft_elf(needed, syms, rels, jmprel, dt_rel, interp, false, false)
+        craft_elf(
+            needed, syms, rels, jmprel, dt_rel, interp, false, false, None, false,
+        )
     }
 
     /// `gnu_chain`: только `DT_GNU_HASH`, одна цепочка на все символы.
@@ -4609,6 +4923,8 @@ mod tests {
         interp: Option<&str>,
         gnu_chain: bool,
         gnu_empty: bool,
+        pltgot: Option<u64>,
+        bind_now: bool,
     ) -> Vec<u8> {
         let mut strings = alloc::vec![0u8];
         let mut needed_at = Vec::new();
@@ -4662,6 +4978,12 @@ mod tests {
         if dt_rel {
             tags.push((17, 1));
             tags.push((18, 8));
+        }
+        if let Some(got) = pltgot {
+            tags.push((3, got));
+        }
+        if bind_now {
+            tags.push((0x6fff_fffb, 1));
         }
         tags.push((0, 0));
         let mut dynamic = Vec::new();
@@ -4806,6 +5128,9 @@ mod tests {
         assert_eq!(app.sym, Some(0x100));
         assert_eq!(app.def_bias, Some(0x0200_0000));
         assert!(app.ext.is_none());
+        // Без DT_PLTGOT JUMP_SLOT пишется при загрузке.
+        assert_eq!(app.jmprel_off, Some(0));
+        assert!(!app.defer);
         let loader = &linked.objs[2].parsed.relative[0];
         assert_eq!(loader.addend, 3);
         assert_eq!(loader.sym, Some(0x999));
@@ -4868,6 +5193,9 @@ mod tests {
                     sym: Some(0x100),
                     def_bias: Some(0x400000),
                     ext: None,
+                    jmprel_off: None,
+                    defer: false,
+                    missing: false,
                 },
                 RelaRel {
                     offset: 8,
@@ -4875,6 +5203,9 @@ mod tests {
                     sym: None,
                     def_bias: None,
                     ext: None,
+                    jmprel_off: None,
+                    defer: false,
+                    missing: false,
                 },
             ];
             apply_relative(l4, &rels, 0x2000_0000).expect("apply");
@@ -4908,6 +5239,8 @@ mod tests {
             false,
             None,
             true,
+            false,
+            None,
             false,
         );
         let parsed = parse_elf64(&lib).expect("lib");
@@ -4948,6 +5281,8 @@ mod tests {
             None,
             false,
             true,
+            None,
+            false,
         );
         let parsed = parse_elf64(&lib).expect("lib");
         assert_eq!(parsed.dynsym.nchain, 1);
@@ -4979,6 +5314,8 @@ mod tests {
             false,
             None,
             true,
+            false,
+            None,
             false,
         );
         let filesz = u64::from_le_bytes(elf[0x40 + 32..0x40 + 40].try_into().unwrap());
@@ -5513,7 +5850,7 @@ mod tests {
         files: &[(&str, Vec<u8>)],
     ) -> (Option<Linked>, Vec<String>) {
         let log = core::cell::RefCell::new(Vec::new());
-        let linked = link_at(main, origin, cwd, None, |path| {
+        let linked = link_at(main, origin, cwd, None, false, |path| {
             log.borrow_mut().push(String::from(path));
             files.iter().find(|(name, _)| *name == path).map(|(_, bytes)| bytes.clone())
         });
@@ -5625,7 +5962,7 @@ mod tests {
         assert!(linked.is_some());
         assert_eq!(log, alloc::vec![String::from("/app/rel/libfoo.so")]);
         let main = craft_search(&["libfoo.so"], None, Some("/usr/$PLATFORM"), None);
-        assert!(link_at(main.as_slice(), None, "/", None, |_| Some(Vec::new())).is_none());
+        assert!(link_at(main.as_slice(), None, "/", None, false, |_| Some(Vec::new())).is_none());
         serial_println!("[ok]");
     }
 
@@ -5669,7 +6006,7 @@ mod tests {
         files: &[(&str, Vec<u8>)],
     ) -> (Option<Linked>, Vec<String>) {
         let log = core::cell::RefCell::new(Vec::new());
-        let linked = link_at(main, origin, cwd, libpath, |path| {
+        let linked = link_at(main, origin, cwd, libpath, false, |path| {
             log.borrow_mut().push(String::from(path));
             files
                 .iter()
@@ -5754,11 +6091,11 @@ mod tests {
             alloc::vec![String::from("/bin/ld.so"), String::from("/mid/libld.so")]
         );
         let main = craft_search(&["libfoo.so"], None, None, None);
-        assert!(link_at(main.as_slice(), None, "/", Some("/usr/$PLATFORM"), |_| {
+        assert!(link_at(main.as_slice(), None, "/", Some("/usr/$PLATFORM"), false, |_| {
             Some(Vec::new())
         })
         .is_none());
-        assert!(link_at(main.as_slice(), None, "/", Some("$ORIGIN/lib"), |_| {
+        assert!(link_at(main.as_slice(), None, "/", Some("$ORIGIN/lib"), false, |_| {
             Some(Vec::new())
         })
         .is_none());
@@ -5769,7 +6106,213 @@ mod tests {
             }
             wide.push('a');
         }
-        assert!(link_at(main.as_slice(), None, "/", Some(&wide), |_| Some(Vec::new())).is_none());
+        assert!(link_at(main.as_slice(), None, "/", Some(&wide), false, |_| Some(Vec::new())).is_none());
+        serial_println!("[ok]");
+    }
+
+    fn extend_load(elf: &mut Vec<u8>, end: usize) {
+        if elf.len() < end {
+            elf.resize(end, 0);
+        }
+        let n = elf.len() as u64;
+        elf[0x40 + 32..0x40 + 40].copy_from_slice(&n.to_le_bytes());
+        elf[0x40 + 40..0x40 + 48].copy_from_slice(&n.to_le_bytes());
+    }
+
+    fn read_u64(l4: PhysFrame, addr: u64) -> u64 {
+        let mapper = unsafe { mapper_for(l4) };
+        let phys = mapper.translate_addr(VirtAddr::new(addr)).expect("mapped");
+        let ptr = (phys_offset().as_u64() + phys.as_u64()) as *const u8;
+        let mut buf = [0u8; 8];
+        unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 8) };
+        u64::from_le_bytes(buf)
+    }
+
+    fn read_bytes(l4: PhysFrame, addr: u64, n: usize) -> Vec<u8> {
+        let mapper = unsafe { mapper_for(l4) };
+        let phys = mapper.translate_addr(VirtAddr::new(addr)).expect("mapped");
+        let ptr = (phys_offset().as_u64() + phys.as_u64()) as *const u8;
+        let mut buf = alloc::vec![0u8; n];
+        unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
+        buf
+    }
+
+    /// `JUMP_SLOT` из `DT_JMPREL` не пишется при загрузке. `RELATIVE` в той же
+    /// таблице пишется. Первый вызов кладёт адрес определившего объекта.
+    #[test_case]
+    fn lazy_jump_slot_is_filled_on_the_first_call() {
+        serial_print!("test lazy_jump_slot_is_filled_on_the_first_call... ");
+        let lib = craft_dyn(&[], &[("foo", 1, 0x100, 0x12)], &[], false, false, None);
+        let mut main = craft_elf(
+            &["libfoo.so"],
+            &[("foo", 0, 0, 0x10)],
+            &[(0x480, 8, 0, 7), (0x518, 7, 1, 9)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            false,
+        );
+        extend_load(&mut main, 0x520);
+        let marker: u64 = 0x0123_4567_89AB_CDEF;
+        main[0x518..0x520].copy_from_slice(&marker.to_le_bytes());
+        let linked = link_at(main.as_slice(), None, "/", None, false, |path| {
+            if path == "/lib/libfoo.so" {
+                Some(lib.clone())
+            } else {
+                None
+            }
+        })
+        .expect("lazy link");
+        assert_eq!(linked.objs[0].bias, 0x400000);
+        assert_eq!(linked.objs[1].bias, 0x0200_0000);
+        let relative = &linked.objs[0].parsed.relative[0];
+        assert!(!relative.defer);
+        assert!(relative.jmprel_off.is_none());
+        let jump = &linked.objs[0].parsed.relative[1];
+        assert!(jump.defer);
+        assert!(!jump.missing);
+        assert_eq!(jump.jmprel_off, Some(24));
+        assert_eq!(jump.addend, 0);
+        assert_eq!(jump.sym, Some(0x100));
+        assert_eq!(jump.def_bias, Some(0x0200_0000));
+        let checked = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            for obj in &linked.objs {
+                map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+                apply_relative(l4, &obj.parsed.relative, obj.bias).expect("apply");
+            }
+            let relative_at = read_u64(l4, 0x400480);
+            let still = read_u64(l4, 0x400518);
+            arm_plt(l4, &linked.objs, fa).expect("arm");
+            let got1 = read_u64(l4, 0x400508);
+            let got2 = read_u64(l4, 0x400510);
+            let lazy = collect_lazy(&linked.objs).expect("lazy");
+            let filled = fixup_slot(l4, &lazy, 0, 24).expect("fixup");
+            let slot = read_u64(l4, 0x400518);
+            let stub = read_bytes(l4, RESOLVE_PAGE, 256);
+            free_user_space(l4, fa);
+            (relative_at, still, got1, got2, filled, slot, stub)
+        });
+        assert_eq!(checked.0, 0x400000 + 7);
+        assert_eq!(checked.1, marker);
+        assert_eq!(checked.2, 0);
+        assert_eq!(checked.3, RESOLVE_PAGE);
+        assert_eq!(checked.4, 0x0200_0100);
+        assert_eq!(checked.5, 0x0200_0100);
+        assert!(checked.6.windows(2).any(|w| w == [0x0f, 0x05]));
+        assert!(checked.6.windows(5).any(|w| w == [0xb8, 0x00, 0x04, 0x00, 0x00]));
+        serial_println!("[ok]");
+    }
+
+    /// `DF_1_NOW` и `LD_BIND_NOW` связывают сразу и роняют загрузку, если
+    /// сильного символа нет. Без них промах доживает до вызова.
+    #[test_case]
+    fn bind_now_keeps_the_slot_eager() {
+        serial_print!("test bind_now_keeps_the_slot_eager... ");
+        assert!(ld_bind_now(&[String::from("LD_BIND_NOW")]));
+        assert!(ld_bind_now(&[String::from("LD_BIND_NOW=")]));
+        assert!(ld_bind_now(&[String::from("LD_BIND_NOW=1")]));
+        assert!(!ld_bind_now(&[String::from("LD_LIBRARY_PATH=/a")]));
+
+        let lib = craft_dyn(&[], &[("foo", 1, 0x100, 0x12)], &[], false, false, None);
+        let mut main = craft_elf(
+            &["libfoo.so"],
+            &[("foo", 0, 0, 0x10)],
+            &[(0x480, 7, 1, 9)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            true,
+        );
+        extend_load(&mut main, 0x488);
+        let linked = link_at(main.as_slice(), None, "/", None, false, |path| {
+            if path == "/lib/libfoo.so" {
+                Some(lib.clone())
+            } else {
+                None
+            }
+        })
+        .expect("df_1_now");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert!(!rel.defer);
+        assert_eq!(rel.sym, Some(0x100));
+        assert_eq!(rel.addend, 0);
+        let written = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let obj = &linked.objs[0];
+            map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+            apply_relative(l4, &obj.parsed.relative, obj.bias).expect("apply");
+            let v = read_u64(l4, obj.bias + 0x480);
+            free_user_space(l4, fa);
+            v
+        });
+        assert_eq!(written, 0x0200_0100);
+
+        let missing_now = craft_elf(
+            &[],
+            &[("missing", 0, 0, 0x10)],
+            &[(0x480, 7, 1, 0)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            true,
+        );
+        assert!(link_at(missing_now.as_slice(), None, "/", None, false, |_| None).is_none());
+
+        let lazy_missing = craft_elf(
+            &[],
+            &[("missing", 0, 0, 0x10)],
+            &[(0x480, 7, 1, 0)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            false,
+        );
+        assert!(link_at(lazy_missing.as_slice(), None, "/", None, true, |_| None).is_none());
+        let linked = link_at(lazy_missing.as_slice(), None, "/", None, false, |_| None).expect("lazy miss");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert!(rel.defer && rel.missing);
+        let lazy = collect_lazy(&linked.objs).expect("table");
+        assert!(lazy.slots[0][0].value.is_none());
+        let missed = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let got = fixup_slot(l4, &lazy, 0, 0);
+            free_user_space(l4, fa);
+            got
+        });
+        assert!(missed.is_none());
+
+        let weak = craft_elf(
+            &[],
+            &[("missing", 0, 0, 0x20)],
+            &[(0x480, 7, 1, 4)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            false,
+        );
+        let linked = link_at(weak.as_slice(), None, "/", None, false, |_| None).expect("weak");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert!(rel.defer && !rel.missing);
+        assert_eq!(rel.sym, Some(0));
+        assert_eq!(rel.def_bias, Some(0));
+        let lazy = collect_lazy(&linked.objs).expect("weak table");
+        assert_eq!(lazy.slots[0][0].value, Some(0));
         serial_println!("[ok]");
     }
 }

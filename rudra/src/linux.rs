@@ -15,6 +15,8 @@
 //! futex, pipe, poll и recvfrom возвращают `EINTR`. Чтение консоли — нет.
 //! Задача стартует как root (uid/gid 0). `setuid`/`setgid` меняют id.
 //! `seccomp` strict режет всё, кроме read, write, rt_sigreturn и exit.
+//! Номер 1024 — резолвер ленивого PLT: он идёт до фильтра и пишет только
+//! уже посчитанный адрес в известный слот GOT.
 //! epoll — level и edge по номеру fd. poll и select видят готовый epoll-fd.
 //! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
@@ -420,6 +422,10 @@ static SEEN_UNKNOWN: Mutex<[u64; 16]> = Mutex::new([u64::MAX; 16]);
 pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) -> u64 {
     let a5 = unsafe { *frame.add(FRAME::R8) };
     let a6 = unsafe { *frame.add(FRAME::R9) };
+    // До фильтра: иначе строгий seccomp убивает процесс на первом PLT-вызове.
+    if nr == task::DL_FIXUP_NR {
+        return task::sys_dl_fixup(a1, a2);
+    }
     if task::seccomp_kills(nr) {
         // Не ENOSYS: процесс умирает, запрещённый вызов не выполняется.
         task::sys_exit(128 + 9);
