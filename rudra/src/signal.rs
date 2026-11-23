@@ -1,5 +1,7 @@
 //! Сигналы 1–31 для текущего потока плюс очередь rt 34–64 (глубина 8,
-//! несколько ожидающих одного номера не схлопываются).
+//! несколько ожидающих одного номера не схлопываются). `sigqueue` rt-номера
+//! кладёт u64 рядом с номером: в кадре это `si_code` −1 и слово по смещению
+//! 24 siginfo. `kill` и номера 1–31 значения не несут.
 //!
 //! Перехваченный сигнал с `SA_RESTORER` ставится и на возврате из syscall,
 //! и когда тик таймера возвращается в ring 3. Кадр тика — не кадр syscall:
@@ -26,6 +28,10 @@ const SA_RESTART: u32 = 0x1000_0000;
 const SA_NODEFER: u32 = 0x4000_0000;
 const SA_RESETHAND: u32 = 0x8000_0000;
 const KEEP_FLAGS: u32 = SA_SIGINFO | SA_RESTORER | SA_RESTART | SA_NODEFER | SA_RESETHAND;
+/// `SI_USER`: kill, raise и всё, что не `sigqueue`.
+const SI_USER: i32 = 0;
+/// `SI_QUEUE`: у rt-сигнала, пришедшего через `sigqueue`, в siginfo лежит значение.
+const SI_QUEUE: i32 = -1;
 
 /// `rt_sigframe`: pretcode, ucontext (304 байта), siginfo (128 байт).
 const FRAME_BYTES: usize = 440;
@@ -45,6 +51,10 @@ pub struct Signals {
     /// не схлопываются, как в Linux. Глубина 8 на задачу, дальше — тихий
     /// сброс (Linux тут EAGAIN по RLIMIT_SIGPENDING).
     rt_q: [u8; 8],
+    /// `si_code` той же ячейки: `SI_USER` у kill/raise, `SI_QUEUE` у sigqueue.
+    rt_code: [i32; 8],
+    /// `sigval` той же ячейки. У kill/raise ноль.
+    rt_val: [u64; 8],
     rt_n: u8,
 }
 
@@ -72,6 +82,9 @@ struct Catch {
     restorer: u64,
     old_mask: u64,
     flags: u32,
+    /// `SI_USER` у kill/raise, `SI_QUEUE` у sigqueue rt-номера.
+    si_code: i32,
+    value: u64,
 }
 
 impl Signals {
@@ -84,6 +97,8 @@ impl Signals {
             sa_mask: [0; 65],
             sa_flags: [0; 65],
             rt_q: [0; 8],
+            rt_code: [0; 8],
+            rt_val: [0; 8],
             rt_n: 0,
         }
     }
@@ -104,14 +119,38 @@ impl Signals {
         best
     }
 
-    fn rt_dequeue(&mut self, sig: u32) {
-        if let Some(pos) = self.rt_q[..self.rt_n as usize]
+    /// Снять первую ячейку этого номера вместе с её кодом и значением.
+    /// Хвост сдвигается, а не меняется с концом: иначе значение другого
+    /// номера или более позднего того же номера встало бы на это место.
+    fn rt_dequeue(&mut self, sig: u32) -> (i32, u64) {
+        let n = self.rt_n as usize;
+        let Some(pos) = self.rt_q[..n]
             .iter()
             .position(|&x| u32::from(x) == sig)
-        {
-            self.rt_n -= 1;
-            self.rt_q[pos] = self.rt_q[self.rt_n as usize];
+        else {
+            return (SI_USER, 0);
+        };
+        let code = self.rt_code[pos];
+        let val = self.rt_val[pos];
+        for i in pos..n - 1 {
+            self.rt_q[i] = self.rt_q[i + 1];
+            self.rt_code[i] = self.rt_code[i + 1];
+            self.rt_val[i] = self.rt_val[i + 1];
         }
+        self.rt_n -= 1;
+        (code, val)
+    }
+
+    /// Поставить rt-сигнал. Девятый и номер вне 34–64 пропадают молча.
+    fn enqueue_rt(&mut self, sig: u32, si_code: i32, value: u64) {
+        if !(34..=64).contains(&sig) || self.rt_n >= 8 {
+            return;
+        }
+        let i = self.rt_n as usize;
+        self.rt_q[i] = sig as u8;
+        self.rt_code[i] = si_code;
+        self.rt_val[i] = value;
+        self.rt_n += 1;
     }
 
     /// Потомок копирует обработчики и маску. Ожидающие сигналы — нет.
@@ -119,6 +158,8 @@ impl Signals {
         let mut child = self;
         child.pending = 0;
         child.rt_q = [0; 8];
+        child.rt_code = [0; 8];
+        child.rt_val = [0; 8];
         child.rt_n = 0;
         child
     }
@@ -128,14 +169,14 @@ impl Signals {
         let bits = self.pending & !blocked;
         // Обычные 1–31 — младшие номера, Linux доставляет минимальный:
         // сначала битовая маска, потом очередь rt.
-        let sig = if bits != 0 {
+        let (sig, si_code, value) = if bits != 0 {
             let sig = bits.trailing_zeros() + 1;
             self.pending &= !bit(sig);
-            sig
+            (sig, SI_USER, 0)
         } else {
             let sig = self.rt_min_unblocked(blocked)?;
-            self.rt_dequeue(sig);
-            sig
+            let (si_code, value) = self.rt_dequeue(sig);
+            (sig, si_code, value)
         };
         let mark = bit(sig);
         if sig == SIGKILL || (self.handler[sig as usize] == 0 && fatal_default(sig)) {
@@ -173,15 +214,16 @@ impl Signals {
             restorer,
             old_mask,
             flags,
+            si_code,
+            value,
         }))
     }
 
     pub fn raise(&mut self, sig: u32) {
         if (1..=31).contains(&sig) {
             self.pending |= bit(sig);
-        } else if (34..=64).contains(&sig) && self.rt_n < 8 {
-            self.rt_q[self.rt_n as usize] = sig as u8;
-            self.rt_n += 1;
+        } else {
+            self.enqueue_rt(sig, SI_USER, 0);
         }
     }
 
@@ -283,11 +325,8 @@ impl Signals {
 
     fn undo(&mut self, caught: &Catch) {
         if caught.sig >= 32 {
-            // rt возвращается в очередь, не в битовую маску.
-            if self.rt_n < 8 {
-                self.rt_q[self.rt_n as usize] = caught.sig as u8;
-                self.rt_n += 1;
-            }
+            // rt возвращается в очередь вместе со значением, не в битовую маску.
+            self.enqueue_rt(caught.sig, caught.si_code, caught.value);
         } else {
             self.pending |= bit(caught.sig);
         }
@@ -330,6 +369,22 @@ fn put_u64(buf: &mut [u8], off: usize, val: u64) {
 
 fn put_u32(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+fn put_i32(buf: &mut [u8], off: usize, val: i32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Байты siginfo в кадре. Их пишут и `arm_timer`, и `arm_handler`: `rsi`
+/// обработчика указывает на `SIGINFO_AT`. `kill` оставляет `SI_USER` и ноль,
+/// `sigqueue` rt пишет `SI_QUEUE` и сохранённое u64 по смещению 24.
+fn write_siginfo(raw: &mut [u8], caught: &Catch, pid: u32) {
+    put_u32(raw, SIGINFO_AT, caught.sig);
+    put_u32(raw, SIGINFO_AT + 4, 0);
+    put_i32(raw, SIGINFO_AT + 8, caught.si_code);
+    put_u32(raw, SIGINFO_AT + 16, pid);
+    put_u32(raw, SIGINFO_AT + 20, 0);
+    put_u64(raw, SIGINFO_AT + 24, caught.value);
 }
 
 fn get_u64(buf: &[u8], off: usize) -> u64 {
@@ -439,8 +494,7 @@ fn arm_timer(kernel_rsp: u64, caught: &Catch) -> bool {
     put_u64(&mut raw, sc + 128, rip);
     put_u64(&mut raw, sc + 136, rflags);
     put_u64(&mut raw, SIGMASK_AT, caught.old_mask);
-    put_u32(&mut raw, SIGINFO_AT, caught.sig);
-    put_u32(&mut raw, SIGINFO_AT + 16, task::current_tid() as u32);
+    write_siginfo(&mut raw, caught, task::current_tid() as u32);
     if !user_write(sp, &raw) {
         return false;
     }
@@ -511,8 +565,7 @@ fn arm_handler(frame: *mut u64, caught: &Catch, ret: u64) -> bool {
     put_u64(&mut raw, sc + 128, read_frame_u64(frame, FRAME::RIP));
     put_u64(&mut raw, sc + 136, read_frame_u64(frame, FRAME::RFLAGS));
     put_u64(&mut raw, SIGMASK_AT, caught.old_mask);
-    put_u32(&mut raw, SIGINFO_AT, caught.sig);
-    put_u32(&mut raw, SIGINFO_AT + 16, task::current_tid() as u32);
+    write_siginfo(&mut raw, caught, task::current_tid() as u32);
     if !user_write(sp, &raw) {
         return false;
     }
@@ -667,9 +720,37 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
     }
 }
 
-/// `sigqueue` (109): как kill, значение не сохраняется — siginfo нулевой.
-pub fn sys_sigqueue(pid: u64, sig: u64, _value: u64) -> u64 {
-    sys_kill(pid, sig)
+/// `sigqueue` (109). Для rt 34–64 третье слово — `sigval`: оно стоит в очереди
+/// рядом с номером и попадает в siginfo. Номера 1–31 — битовая маска, значение
+/// класть некуда, вызов совпадает с `kill`. Переполнение очереди — тихий сброс.
+/// `rt_sigqueueinfo` (129) нет.
+pub fn sys_sigqueue(pid: u64, sig: u64, value: u64) -> u64 {
+    if !(34..=64).contains(&sig) {
+        return sys_kill(pid, sig);
+    }
+    if task::current_slot() < 0 {
+        return crate::linux::EINVAL;
+    }
+    let me = task::current_tid();
+    if pid != me && task::with_task(pid, |_| ()).is_none() {
+        return crate::linux::ESRCH;
+    }
+    let armed = if pid == me {
+        task::with_current_task(|t| {
+            t.signals.enqueue_rt(sig as u32, SI_QUEUE, value);
+        })
+        .is_some()
+    } else {
+        task::with_task(pid, |t| {
+            t.signals.enqueue_rt(sig as u32, SI_QUEUE, value);
+        })
+        .is_some()
+    };
+    if armed {
+        0
+    } else {
+        crate::linux::ESRCH
+    }
 }
 
 #[cfg(test)]
@@ -748,6 +829,131 @@ mod tests {
         }
         assert_eq!(sys_rt_sigaction(10, 0, 0, 8), crate::linux::EINVAL);
         assert_eq!(sys_kill(1, 10), crate::linux::EINVAL);
+        crate::serial_println!("[ok]");
+    }
+
+    fn arm(s: &mut Signals, sig: u32) {
+        s.handler[sig as usize] = 0x5000;
+        s.restorer[sig as usize] = 0x6000;
+        s.sa_flags[sig as usize] = SA_NODEFER | SA_SIGINFO;
+    }
+
+    fn take(s: &mut Signals) -> Catch {
+        match s.pop() {
+            Some(Pop::Catch(c)) => c,
+            _ => panic!("expected catch"),
+        }
+    }
+
+    /// Те же байты, которые `arm_timer` и `arm_handler` кладут в siginfo.
+    #[test_case]
+    fn sigqueue_value_lands_in_siginfo() {
+        crate::serial_print!("test sigqueue_value_lands_in_siginfo... ");
+        let mut s = Signals::new();
+        arm(&mut s, 34);
+        arm(&mut s, 40);
+        arm(&mut s, 50);
+        s.raise(34);
+        s.enqueue_rt(40, SI_QUEUE, 0x1122_3344_5566_7788);
+        s.enqueue_rt(50, SI_QUEUE, 0xB);
+        s.enqueue_rt(40, SI_QUEUE, 0x99);
+
+        let raised = take(&mut s);
+        assert_eq!(raised.sig, 34);
+        assert_eq!(raised.si_code, SI_USER);
+        assert_eq!(raised.value, 0);
+        let mut raw = [0xA5u8; FRAME_BYTES];
+        write_siginfo(&mut raw, &raised, 0x42);
+        assert_eq!(
+            u32::from_le_bytes(raw[SIGINFO_AT..SIGINFO_AT + 4].try_into().unwrap()),
+            34
+        );
+        assert_eq!(
+            i32::from_le_bytes(raw[SIGINFO_AT + 8..SIGINFO_AT + 12].try_into().unwrap()),
+            SI_USER
+        );
+        assert_eq!(
+            u32::from_le_bytes(raw[SIGINFO_AT + 16..SIGINFO_AT + 20].try_into().unwrap()),
+            0x42
+        );
+        assert_eq!(
+            u64::from_le_bytes(raw[SIGINFO_AT + 24..SIGINFO_AT + 32].try_into().unwrap()),
+            0
+        );
+
+        // Один номер не схлопывается: первое значение, потом второе.
+        // 50 ждёт, пока не кончатся 40.
+        let first = take(&mut s);
+        assert_eq!(first.sig, 40);
+        assert_eq!(first.si_code, SI_QUEUE);
+        assert_eq!(first.value, 0x1122_3344_5566_7788);
+        let mut raw = [0u8; FRAME_BYTES];
+        write_siginfo(&mut raw, &first, 7);
+        assert_eq!(
+            &raw[SIGINFO_AT + 4..SIGINFO_AT + 8],
+            &[0, 0, 0, 0]
+        );
+        assert_eq!(
+            i32::from_le_bytes(raw[SIGINFO_AT + 8..SIGINFO_AT + 12].try_into().unwrap()),
+            -1
+        );
+        assert_eq!(
+            u32::from_le_bytes(raw[SIGINFO_AT + 16..SIGINFO_AT + 20].try_into().unwrap()),
+            7
+        );
+        assert_eq!(&raw[SIGINFO_AT + 20..SIGINFO_AT + 24], &[0, 0, 0, 0]);
+        assert_eq!(
+            u64::from_le_bytes(raw[SIGINFO_AT + 24..SIGINFO_AT + 32].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+
+        let second = take(&mut s);
+        assert_eq!(second.sig, 40);
+        assert_eq!(second.value, 0x99);
+        assert_eq!(second.si_code, SI_QUEUE);
+
+        // Неудачная постановка кадра возвращает значение вместе с номером.
+        s.undo(&second);
+        let back = take(&mut s);
+        assert_eq!(back.sig, 40);
+        assert_eq!(back.value, 0x99);
+        assert_eq!(back.si_code, SI_QUEUE);
+
+        let later = take(&mut s);
+        assert_eq!(later.sig, 50);
+        assert_eq!(later.value, 0xB);
+
+        // Потомок очередь не наследует, родитель своё значение не теряет.
+        s.undo(&later);
+        let mut child = s.for_child();
+        assert!(child.pop().is_none());
+        let parent = take(&mut s);
+        assert_eq!(parent.sig, 50);
+        assert_eq!(parent.value, 0xB);
+        assert_eq!(parent.si_code, SI_QUEUE);
+
+        // Девятый пропадает, первые восемь остаются по порядку.
+        let mut q = Signals::new();
+        arm(&mut q, 50);
+        for v in 1u64..=9 {
+            q.enqueue_rt(50, SI_QUEUE, v);
+        }
+        for v in 1u64..=8 {
+            assert_eq!(take(&mut q).value, v);
+        }
+        assert!(q.pop().is_none());
+
+        // 1–31 схлопываются и значения не несут.
+        let mut std = Signals::new();
+        arm(&mut std, 15);
+        std.raise(15);
+        std.raise(15);
+        let once = take(&mut std);
+        assert_eq!(once.sig, 15);
+        assert_eq!(once.si_code, SI_USER);
+        assert_eq!(once.value, 0);
+        assert!(std.pop().is_none());
+
         crate::serial_println!("[ok]");
     }
 }

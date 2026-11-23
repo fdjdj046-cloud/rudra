@@ -532,7 +532,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         }
         61 => sys_wait4(a1, a2, a3),
         62 => crate::signal::sys_kill(a1, a2),
-        // sigqueue: значение не сохраняется, siginfo нулевой.
+        // sigqueue: rt 34–64 кладёт значение в siginfo; 1–31 как kill.
         109 => crate::signal::sys_sigqueue(a1, a2, a3),
         63 => sys_uname(a1),
         169 => sys_reboot(a1, a2, a3),
