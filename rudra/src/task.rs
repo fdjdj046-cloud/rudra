@@ -191,6 +191,8 @@ struct ElfParsed {
     pltgot: Option<u64>,
     /// `DF_BIND_NOW` или `DF_1_NOW`: `JUMP_SLOT` этого объекта сразу.
     bind_now: bool,
+    /// Слова `DT_RELR`. Пусто — тега нет.
+    relr: Vec<u64>,
 }
 
 struct ParsedDyn {
@@ -201,6 +203,7 @@ struct ParsedDyn {
     runpath: Option<Vec<String>>,
     pltgot: Option<u64>,
     bind_now: bool,
+    relr: Vec<u64>,
 }
 
 enum LocalSym {
@@ -248,7 +251,8 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// `STT_GNU_IFUNC` (в `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`) не пишутся
 /// здесь: их резолвер вызовет стартовая страница до входа в программу.
 /// `R_X86_64_COPY` копирует байты после обычных релокаций и до IFUNC.
-/// Прочие типы — отказ.
+/// `DT_RELR`: к уже лежащему слову прибавляется база. Чётная запись — адрес,
+/// нечётная — битовая карта следующих 63 слотов. Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -323,7 +327,7 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if segs.is_empty() {
         return None;
     }
-    let (relative, needed, dynsym, rpath, runpath, pltgot, bind_now) = match dyn_span {
+    let (relative, needed, dynsym, rpath, runpath, pltgot, bind_now, relr) = match dyn_span {
         Some((start, end)) => {
             let parsed = parse_relative(elf, &segs, &elf[start..end])?;
             (
@@ -334,9 +338,10 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
                 parsed.runpath,
                 parsed.pltgot,
                 parsed.bind_now,
+                parsed.relr,
             )
         }
-        None => (Vec::new(), Vec::new(), DynSym::none(), None, None, None, false),
+        None => (Vec::new(), Vec::new(), DynSym::none(), None, None, None, false, Vec::new()),
     };
     Some(ElfParsed {
         kind,
@@ -352,6 +357,7 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
         runpath,
         pltgot,
         bind_now,
+        relr,
     })
 }
 
@@ -810,6 +816,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_VERDEFNUM: u64 = 0x6fff_fffd;
     const DT_VERNEED: u64 = 0x6fff_fffe;
     const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
+    const DT_RELRSZ: u64 = 35;
+    const DT_RELR: u64 = 36;
+    const DT_RELRENT: u64 = 37;
     const R_X86_64_64: u64 = 1;
     const R_COPY: u64 = 5;
     const R_GLOB_DAT: u64 = 6;
@@ -843,6 +852,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut jmprel = 0u64;
     let mut pltrelsz = 0u64;
     let mut pltrel = 0u64;
+    let mut relr_addr = 0u64;
+    let mut relr_sz = 0u64;
+    let mut relrent = 0u64;
+    let mut saw_relrent = false;
     let mut needed_off: Vec<u64> = Vec::new();
     let mut i = 0;
     while i + 16 <= dynamic.len() {
@@ -907,6 +920,13 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             pltrel = val;
         } else if tag == DT_JMPREL {
             jmprel = val;
+        } else if tag == DT_RELR {
+            relr_addr = val;
+        } else if tag == DT_RELRSZ {
+            relr_sz = val;
+        } else if tag == DT_RELRENT {
+            relrent = val;
+            saw_relrent = true;
         }
     }
     // REL (не RELA) не применяется. Молча пропустить — значит оставить нули.
@@ -1214,7 +1234,109 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
         runpath,
         pltgot,
         bind_now: flags & DF_BIND_NOW != 0 || flags_1 & DF_1_NOW != 0,
+        relr: read_relr(elf, segs, relr_addr, relr_sz, relrent, saw_relrent)?,
     })
+}
+
+/// Слово целиком лежит в `PT_LOAD` и выровнено на 8. Дырка memsz — тоже слот:
+/// там ноль, база прибавляется к нулю.
+fn word_in_seg(segs: &[LoadSeg], place: u64) -> bool {
+    if place & 7 != 0 {
+        return false;
+    }
+    segs.iter().any(|s| {
+        let Some(end) = s.vaddr.checked_add(s.mem_size) else {
+            return false;
+        };
+        let Some(word_end) = place.checked_add(8) else {
+            return false;
+        };
+        place >= s.vaddr && word_end <= end
+    })
+}
+
+/// Обход `DT_RELR`, как glibc `ELF_DYNAMIC_DO_RELR`. Чётное слово — адрес,
+/// курсор встаёт на следующее. Нечётное — младший бит маркер, остальные 63
+/// бита отмечают слоты по 8 байт, затем курсор перешагивает все 63.
+/// Битмап до первого адреса — отказ. `visit` ложен — отказ.
+fn walk_relr(entries: &[u64], mut visit: impl FnMut(u64) -> bool) -> bool {
+    let mut cursor: Option<u64> = None;
+    for entry in entries {
+        if entry & 1 == 0 {
+            if !visit(*entry) {
+                return false;
+            }
+            cursor = match entry.checked_add(8) {
+                Some(next) => Some(next),
+                None => return false,
+            };
+        } else {
+            let Some(base) = cursor else {
+                return false;
+            };
+            let mut bits = *entry;
+            let mut i = 0u64;
+            loop {
+                bits >>= 1;
+                if bits == 0 {
+                    break;
+                }
+                if bits & 1 != 0 {
+                    let Some(place) = i.checked_mul(8).and_then(|off| base.checked_add(off)) else {
+                        return false;
+                    };
+                    if !visit(place) {
+                        return false;
+                    }
+                }
+                i = match i.checked_add(1) {
+                    Some(n) if n <= 63 => n,
+                    _ => return false,
+                };
+            }
+            cursor = match base.checked_add(63 * 8) {
+                Some(next) => Some(next),
+                None => return false,
+            };
+        }
+    }
+    true
+}
+
+/// Прочитать `DT_RELR`. Оба нуля — таблицы нет. Один нуль, кривой шаг,
+/// некратный размер, таблица больше `RELR_MAX` или слот вне сегмента — отказ.
+fn read_relr(
+    elf: &[u8],
+    segs: &[LoadSeg],
+    addr: u64,
+    sz: u64,
+    ent: u64,
+    saw_ent: bool,
+) -> Option<Vec<u64>> {
+    if addr == 0 && sz == 0 {
+        return Some(Vec::new());
+    }
+    if addr == 0 || sz == 0 || sz % 8 != 0 || sz > RELR_MAX {
+        return None;
+    }
+    if saw_ent && ent != 8 {
+        return None;
+    }
+    let start = vaddr_file_off(segs, addr)? as usize;
+    let end = start.checked_add(sz as usize)?;
+    if end > elf.len() {
+        return None;
+    }
+    let mut entries = Vec::new();
+    let mut at = start;
+    while at + 8 <= end {
+        entries.push(rd64(elf, at));
+        at += 8;
+    }
+    if !walk_relr(&entries, |place| word_in_seg(segs, place)) {
+        return None;
+    }
+    Some(entries)
 }
 
 /// Строка `DT_RPATH` или `DT_RUNPATH`: каталоги через `:`.
@@ -1315,6 +1437,8 @@ const IFUNC_TABLE: u64 = 0xA_2000;
 const IFUNC_MAX: usize = 256;
 /// Потолок `min(st_size)` у `R_X86_64_COPY`. Больший из двух размеров не важен.
 const COPY_MAX: u64 = 64 * 1024;
+/// Потолок таблицы `DT_RELR` в байтах. Тот же, что у суммы `DT_RELA`.
+const RELR_MAX: u64 = 8192 * 24;
 /// Приватный номер: вход резолвера, не вызов Linux.
 pub const DL_FIXUP_NR: u64 = 1024;
 const LIB_STEP: u64 = 0x20_0000;
@@ -2492,6 +2616,27 @@ fn copy_user(
     write_user(l4, dst, &buf)
 }
 
+/// `DT_RELR`: к слову, уже лежащему по адресу, прибавляется база этого объекта.
+/// Не `B + A` из записи RELA — addend живёт в самом слоте.
+fn apply_relr(l4: PhysFrame, relr: &[u64], bias: u64) -> Result<(), MapToError<Size4KiB>> {
+    let ok = walk_relr(relr, |place| {
+        let Some(addr) = place.checked_add(bias) else {
+            return false;
+        };
+        let mut buf = [0u8; 8];
+        if read_user(l4, addr, &mut buf).is_err() {
+            return false;
+        }
+        let val = u64::from_le_bytes(buf).wrapping_add(bias);
+        write_user(l4, addr, &val.to_le_bytes()).is_ok()
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(MapToError::FrameAllocationFailed)
+    }
+}
+
 /// `R_X86_64_COPY` после обычных релокаций всех объектов. Ноль байт — пустая
 /// удача. Дырка в источнике или слоте роняет загрузку.
 fn apply_copies(l4: PhysFrame, objs: &[LinkObj]) -> Result<(), MapToError<Size4KiB>> {
@@ -3327,6 +3472,9 @@ pub fn load_elf_image(
     };
     for obj in &linked.objs {
         map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, frame_allocator)?;
+        // Сначала RELR, потом RELA: как glibc. Оба — обычные релокации,
+        // до COPY и до резолверов IFUNC.
+        apply_relr(l4, &obj.parsed.relr, obj.bias)?;
         apply_relative(l4, &obj.parsed.relative, obj.bias)?;
     }
     // Слот программы заполняется из уже перемещённого источника.
@@ -7326,6 +7474,131 @@ mod tests {
         assert_eq!(slot, 0x0200_0000 + 0x800);
         assert_eq!(got, alloc::vec![0x11, 0x22, 0x33, 0x44, 0xAA, 0xAA, 0xAA, 0xAA]);
         assert_eq!(src, alloc::vec![0x11, 0x22, 0x33, 0x44]);
+        serial_println!("[ok]");
+    }
+
+    /// Вставить тег в `.dynamic` перед `DT_NULL` и растянуть `PT_DYNAMIC`.
+    fn add_dyn(elf: &mut Vec<u8>, tag: u64, val: u64) {
+        let mut at = 0x300usize;
+        loop {
+            assert!(at + 16 <= 0x3C0, "dynamic ran into the hash");
+            let have = u64::from_le_bytes(elf[at..at + 8].try_into().unwrap());
+            if have == 0 {
+                let null = elf[at..at + 16].to_vec();
+                if elf.len() < at + 32 {
+                    elf.resize(at + 32, 0);
+                }
+                elf[at..at + 8].copy_from_slice(&tag.to_le_bytes());
+                elf[at + 8..at + 16].copy_from_slice(&val.to_le_bytes());
+                elf[at + 16..at + 32].copy_from_slice(&null);
+                let sz = (at + 32 - 0x300) as u64;
+                elf[0x78 + 32..0x78 + 40].copy_from_slice(&sz.to_le_bytes());
+                elf[0x78 + 40..0x78 + 48].copy_from_slice(&sz.to_le_bytes());
+                let n = elf.len() as u64;
+                let load = u64::from_le_bytes(elf[0x40 + 32..0x40 + 40].try_into().unwrap());
+                if n > load {
+                    elf[0x40 + 32..0x40 + 40].copy_from_slice(&n.to_le_bytes());
+                    elf[0x40 + 40..0x40 + 48].copy_from_slice(&n.to_le_bytes());
+                }
+                return;
+            }
+            at += 16;
+        }
+    }
+
+    fn put_u64(elf: &mut Vec<u8>, at: usize, val: u64) {
+        plant(elf, at, &val.to_le_bytes());
+    }
+
+    /// `DT_RELR`: чётный адрес и битовая карта. К слову прибавляется база,
+    /// сосед без бита не трогается, вторая карта прыгает на 63 слота.
+    /// `R_X86_64_RELATIVE` рядом пишет `B + A`. Кривая таблица — отказ.
+    #[test_case]
+    fn relr_adds_the_bias_to_the_stored_word() {
+        serial_print!("test relr_adds_the_bias_to_the_stored_word... ");
+        let mut bare = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut bare, 36, 0x500);
+        assert!(parse_elf64(&bare).is_none());
+        let mut step = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut step, 35, 8);
+        add_dyn(&mut step, 36, 0x500);
+        add_dyn(&mut step, 37, 4);
+        put_u64(&mut step, 0x500, 0x800);
+        assert!(parse_elf64(&step).is_none());
+        let mut odd = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut odd, 35, 4);
+        add_dyn(&mut odd, 36, 0x500);
+        assert!(parse_elf64(&odd).is_none());
+        let mut lead = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut lead, 35, 8);
+        add_dyn(&mut lead, 36, 0x500);
+        put_u64(&mut lead, 0x500, 1);
+        assert!(parse_elf64(&lead).is_none());
+        let mut skew = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut skew, 35, 8);
+        add_dyn(&mut skew, 36, 0x500);
+        put_u64(&mut skew, 0x500, 0x802);
+        assert!(parse_elf64(&skew).is_none());
+        let mut outside = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut outside, 35, 8);
+        add_dyn(&mut outside, 36, 0x500);
+        put_u64(&mut outside, 0x500, 0x8000_0000);
+        assert!(parse_elf64(&outside).is_none());
+        let mut huge = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut huge, 35, RELR_MAX + 8);
+        add_dyn(&mut huge, 36, 0x500);
+        assert!(parse_elf64(&huge).is_none());
+        let mut short = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut short, 35, 16);
+        add_dyn(&mut short, 36, 0x500);
+        put_u64(&mut short, 0x500, 0x800);
+        put_u64(&mut short, 0x508, 3);
+        put_u64(&mut short, 0x800, 0x11);
+        assert!(parse_elf64(&short).is_none());
+
+        let mut elf = craft_dyn(&[], &[], &[(0x830, 8, 0, 7)], false, false, None);
+        add_dyn(&mut elf, 35, 24);
+        add_dyn(&mut elf, 36, 0x500);
+        add_dyn(&mut elf, 37, 8);
+        // 0x800, затем биты на 0x808 и 0x810, затем через 63 слота — 0xA00.
+        put_u64(&mut elf, 0x500, 0x800);
+        put_u64(&mut elf, 0x508, 0b0111);
+        put_u64(&mut elf, 0x510, 0b0011);
+        put_u64(&mut elf, 0x800, 0x11);
+        put_u64(&mut elf, 0x808, 0x22);
+        put_u64(&mut elf, 0x810, 0x33);
+        put_u64(&mut elf, 0x818, 0x44);
+        put_u64(&mut elf, 0x900, 0x66);
+        put_u64(&mut elf, 0xA00, 0x55);
+        let linked = link_with(elf.as_slice(), |_| None).expect("relr");
+        assert_eq!(linked.objs[0].bias, 0x400000);
+        assert_eq!(linked.objs[0].parsed.relr.len(), 3);
+        let bias = 0x400000u64;
+        let got = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let obj = &linked.objs[0];
+            map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+            apply_relr(l4, &obj.parsed.relr, obj.bias).expect("relr");
+            apply_relative(l4, &obj.parsed.relative, obj.bias).expect("rela");
+            let vals = [
+                read_u64(l4, bias + 0x800),
+                read_u64(l4, bias + 0x808),
+                read_u64(l4, bias + 0x810),
+                read_u64(l4, bias + 0x818),
+                read_u64(l4, bias + 0x900),
+                read_u64(l4, bias + 0xA00),
+                read_u64(l4, bias + 0x830),
+            ];
+            free_user_space(l4, fa);
+            vals
+        });
+        assert_eq!(got[0], 0x11 + bias);
+        assert_eq!(got[1], 0x22 + bias);
+        assert_eq!(got[2], 0x33 + bias);
+        assert_eq!(got[3], 0x44);
+        assert_eq!(got[4], 0x66);
+        assert_eq!(got[5], 0x55 + bias);
+        assert_eq!(got[6], 7 + bias);
         serial_println!("[ok]");
     }
 }
