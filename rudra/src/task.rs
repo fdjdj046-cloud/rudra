@@ -120,6 +120,17 @@ struct RelaRel {
     /// `STT_GNU_IFUNC`: резолвер — `st_value` плюс база определения, к
     /// возврату прибавляется `addend` (у `GLOB_DAT` и `JUMP_SLOT` он уже 0).
     ifunc: bool,
+    /// `R_X86_64_COPY`: байты определения другого объекта пишутся в этот слот
+    /// после обычных релокаций. Addend не используется. Ленивым слот не бывает.
+    copy: bool,
+    /// `st_size` символа в этом объекте. У COPY это размер слота назначения.
+    ref_size: u64,
+    /// `st_size` источника COPY. Ноль, пока связь не нашла определение.
+    src_size: u64,
+    /// Определение `STB_GLOBAL` или `STB_WEAK` с `STV_DEFAULT`. На связи его
+    /// перехватывает более ранний объект. Локальный, скрытый и защищённый —
+    /// None, они остаются в этом объекте.
+    preempt: Option<ExtSym>,
 }
 
 #[derive(Clone)]
@@ -223,16 +234,20 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 }
 
 /// ELF64 x86_64, ET_EXEC или ET_DYN. PT_INTERP запоминается, а не отвергается.
-/// Релокации: `R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT` и
-/// `R_X86_64_JUMP_SLOT` (в `DT_RELA` и в `DT_JMPREL`, если `DT_PLTREL` —
-/// RELA). Символ, определённый в этом объекте, берётся сразу. `SHN_UNDEF`
-/// ищется здесь же по имени, иначе остаётся внешним до связи `DT_NEEDED`.
+/// Релокации: `R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_COPY`,
+/// `R_X86_64_GLOB_DAT` и `R_X86_64_JUMP_SLOT` (в `DT_RELA` и в `DT_JMPREL`,
+/// если `DT_PLTREL` — RELA). Локальный, скрытый и защищённый символ этого
+/// объекта берётся сразу. Глобальный с видимостью по умолчанию на связи
+/// ищется снова: более ранний объект в поиске перехватывает его.
+/// `SHN_UNDEF` ищется здесь же по имени, иначе остаётся внешним до связи
+/// `DT_NEEDED`.
 /// Граница `.dynsym` — `nchain` из `DT_HASH`, а если его нет — число символов
 /// из `DT_GNU_HASH`. Без обеих таблиц символьная релокация отвергается.
 /// Версия символа — `DT_VERSYM` и имя из `DT_VERDEF` или `DT_VERNEED`.
 /// `DT_REL` отвергается. `R_X86_64_IRELATIVE` и определённый
 /// `STT_GNU_IFUNC` (в `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`) не пишутся
 /// здесь: их резолвер вызовет стартовая страница до входа в программу.
+/// `R_X86_64_COPY` копирует байты после обычных релокаций и до IFUNC.
 /// Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
@@ -377,9 +392,45 @@ fn local_defined(elf: &[u8], ent: usize, shndx: u64) -> Option<LocalSym> {
     }
 }
 
+/// Имя определения, которое более ранний объект может перехватить.
+/// `STB_LOCAL`, пустое имя и видимость кроме `STV_DEFAULT` остаются местными.
+/// Кривая запись версии тоже: символ не перехватывается, разбор жив.
+/// `file` пуст: поиск не запирается на `DT_SONAME` этого объекта.
+fn preempt_name(
+    elf: &[u8],
+    ent: usize,
+    idx: u64,
+    strtab: usize,
+    vers: &[SymVer],
+) -> Option<ExtSym> {
+    let bind = elf[ent + 4] >> 4;
+    if bind != 1 && bind != 2 {
+        return None;
+    }
+    if elf[ent + 5] & 3 != 0 {
+        return None;
+    }
+    let name = match sym_name(elf, strtab, rd32(elf, ent) as usize) {
+        Ok(Some(n)) if !n.is_empty() && n.len() <= 256 => n,
+        _ => return None,
+    };
+    let ver = if vers.is_empty() {
+        None
+    } else {
+        vers.get(idx as usize)?.name.clone()
+    };
+    Some(ExtSym {
+        name: name.to_vec(),
+        weak: bind == 2,
+        ver,
+        file: None,
+    })
+}
+
 /// Символ по индексу внутри этого объекта. Определённый — его st_value.
-/// SHN_UNDEF ищется по имени среди определённых. Если здесь его нет, это
-/// внешний символ: связь с DT_NEEDED закроет его позже.
+/// Второй элемент — имя для перехвата, и только у выбранного определения,
+/// не у индекса релокации. SHN_UNDEF ищется по имени среди определённых.
+/// Если здесь его нет, это внешний символ: связь с DT_NEEDED закроет его позже.
 fn resolve_local(
     elf: &[u8],
     symtab: usize,
@@ -388,7 +439,7 @@ fn resolve_local(
     nchain: u64,
     vers: &[SymVer],
     idx: u64,
-) -> Option<LocalSym> {
+) -> Option<(LocalSym, Option<ExtSym>)> {
     if syment < 24 || idx >= nchain {
         return None;
     }
@@ -399,7 +450,9 @@ fn resolve_local(
     let shndx = rd16(elf, ent + 6);
     let bind = elf[ent + 4] >> 4;
     if shndx != 0 {
-        return local_defined(elf, ent, shndx);
+        let sym = local_defined(elf, ent, shndx)?;
+        let pre = preempt_name(elf, ent, idx, strtab, vers);
+        return Some((sym, pre));
     }
     let name = match sym_name(elf, strtab, rd32(elf, ent) as usize) {
         Ok(Some(n)) => n,
@@ -425,7 +478,9 @@ fn resolve_local(
             Err(()) => return None,
         };
         if other == name && ver_accepts(vers, i, want_name) {
-            return local_defined(elf, e, sx);
+            let sym = local_defined(elf, e, sx)?;
+            let pre = preempt_name(elf, e, i, strtab, vers);
+            return Some((sym, pre));
         }
     }
     if name.len() > 256 {
@@ -437,12 +492,15 @@ fn resolve_local(
         let v = vers.get(idx as usize)?;
         (v.name.clone(), v.file.clone(), v.ver_weak)
     };
-    Some(LocalSym::Ext {
-        name: name.to_vec(),
-        weak: bind == 2 || ver_weak,
-        ver,
-        file,
-    })
+    Some((
+        LocalSym::Ext {
+            name: name.to_vec(),
+            weak: bind == 2 || ver_weak,
+            ver,
+            file,
+        },
+        None,
+    ))
 }
 
 fn ver_accepts(vers: &[SymVer], idx: u64, want: Option<&[u8]>) -> bool {
@@ -753,6 +811,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_VERNEED: u64 = 0x6fff_fffe;
     const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
     const R_X86_64_64: u64 = 1;
+    const R_COPY: u64 = 5;
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
     const R_RELATIVE: u64 = 8;
@@ -982,6 +1041,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     defer: false,
                     missing: false,
                     ifunc: false,
+                    copy: false,
+                    ref_size: 0,
+                    src_size: 0,
+                    preempt: None,
                 },
                 R_IRELATIVE => RelaRel {
                     offset,
@@ -993,9 +1056,58 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     defer: false,
                     missing: false,
                     ifunc: true,
+                    copy: false,
+                    ref_size: 0,
+                    src_size: 0,
+                    preempt: None,
                 },
+                R_COPY => {
+                    // Источник ищется в других объектах. Своё определение
+                    // здесь не подставляется: копия читала бы саму себя.
+                    // Слот не ленивый, даже если релокация лежит в DT_JMPREL.
+                    let idx = info >> 32;
+                    if syment < 24 || idx == 0 || idx >= nchain {
+                        return None;
+                    }
+                    let step = (idx as usize).checked_mul(syment as usize)?;
+                    let ent = symtab_off?.checked_add(step)?;
+                    if ent.checked_add(24)? > elf.len() {
+                        return None;
+                    }
+                    let name = match sym_name(elf, strtab_off?, rd32(elf, ent) as usize) {
+                        Ok(Some(n)) if !n.is_empty() && n.len() <= 256 => n.to_vec(),
+                        _ => return None,
+                    };
+                    let bind = elf[ent + 4] >> 4;
+                    let (ver, file, ver_weak) = if vers.is_empty() {
+                        (None, None, false)
+                    } else {
+                        let v = vers.get(idx as usize)?;
+                        (v.name.clone(), v.file.clone(), v.ver_weak)
+                    };
+                    RelaRel {
+                        offset,
+                        addend: 0,
+                        sym: None,
+                        def_bias: None,
+                        ext: Some(ExtSym {
+                            name,
+                            weak: bind == 2 || ver_weak,
+                            ver,
+                            file,
+                        }),
+                        jmprel_off: None,
+                        defer: false,
+                        missing: false,
+                        ifunc: false,
+                        copy: true,
+                        ref_size: rd64(elf, ent + 16),
+                        src_size: 0,
+                        preempt: None,
+                    }
+                }
                 R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
-                    let local = resolve_local(
+                    let (local, preempt) = resolve_local(
                         elf,
                         symtab_off?,
                         syment,
@@ -1015,6 +1127,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             defer: false,
                             missing: false,
                             ifunc: true,
+                            copy: false,
+                            ref_size: 0,
+                            src_size: 0,
+                            preempt,
                         },
                         LocalSym::IfuncAbs(v) => RelaRel {
                             offset,
@@ -1026,6 +1142,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             defer: false,
                             missing: false,
                             ifunc: true,
+                            copy: false,
+                            ref_size: 0,
+                            src_size: 0,
+                            preempt,
                         },
                         LocalSym::Own(v) => RelaRel {
                             offset,
@@ -1037,6 +1157,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             defer: false,
                             missing: false,
                             ifunc: false,
+                            copy: false,
+                            ref_size: 0,
+                            src_size: 0,
+                            preempt,
                         },
                         LocalSym::Abs(v) => RelaRel {
                             offset,
@@ -1048,6 +1172,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             defer: false,
                             missing: false,
                             ifunc: false,
+                            copy: false,
+                            ref_size: 0,
+                            src_size: 0,
+                            preempt: None,
                         },
                         LocalSym::Ext { name, weak, ver, file } => RelaRel {
                             offset,
@@ -1059,6 +1187,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             defer: false,
                             missing: false,
                             ifunc: false,
+                            copy: false,
+                            ref_size: 0,
+                            src_size: 0,
+                            preempt: None,
                         },
                     }
                 }
@@ -1181,6 +1313,8 @@ const IFUNC_PAGE: u64 = 0xA_1000;
 /// (слот, резолвер, addend). Две страницы, не больше `IFUNC_MAX` записей.
 const IFUNC_TABLE: u64 = 0xA_2000;
 const IFUNC_MAX: usize = 256;
+/// Потолок `min(st_size)` у `R_X86_64_COPY`. Больший из двух размеров не важен.
+const COPY_MAX: u64 = 64 * 1024;
 /// Приватный номер: вход резолвера, не вызов Linux.
 pub const DL_FIXUP_NR: u64 = 1024;
 const LIB_STEP: u64 = 0x20_0000;
@@ -1574,7 +1708,12 @@ where
 }
 
 enum Hit {
-    Found { value: u64, bias: u64, ifunc: bool },
+    Found {
+        value: u64,
+        bias: u64,
+        ifunc: bool,
+        size: u64,
+    },
     Bad,
 }
 
@@ -1600,7 +1739,7 @@ fn defined(
     name: &[u8],
     ver: Option<&[u8]>,
     file: Option<&[u8]>,
-) -> Result<Option<(u64, u64, u8, bool)>, ()> {
+) -> Result<Option<(u64, u64, u8, bool, u64)>, ()> {
     if let Some(want_file) = file {
         match object_id(obj) {
             Some(got) if got == want_file => {}
@@ -1615,7 +1754,7 @@ fn defined(
         return Ok(None);
     }
     let elf = obj.bytes.as_slice();
-    let mut weak: Option<(u64, u64, bool)> = None;
+    let mut weak: Option<(u64, u64, bool, u64)> = None;
     for i in 0..dynsym.nchain {
         let step = (i as usize).checked_mul(dynsym.syment as usize).ok_or(())?;
         let ent = symtab.checked_add(step).ok_or(())?;
@@ -1642,17 +1781,18 @@ fn defined(
             return Err(());
         }
         let value = rd64(elf, ent + 8);
+        let size = rd64(elf, ent + 16);
         let bias = if shndx == 0xfff1 { 0 } else { obj.bias };
         let ifunc = elf[ent + 4] & 0xf == STT_GNU_IFUNC;
         if bind == 2 {
             if weak.is_none() {
-                weak = Some((value, bias, ifunc));
+                weak = Some((value, bias, ifunc, size));
             }
             continue;
         }
-        return Ok(Some((value, bias, bind, ifunc)));
+        return Ok(Some((value, bias, bind, ifunc, size)));
     }
-    Ok(weak.map(|(value, bias, ifunc)| (value, bias, 2, ifunc)))
+    Ok(weak.map(|(value, bias, ifunc, size)| (value, bias, 2, ifunc, size)))
 }
 
 fn lookup(
@@ -1661,26 +1801,40 @@ fn lookup(
     name: &[u8],
     ver: Option<&[u8]>,
     file: Option<&[u8]>,
+    skip: Option<usize>,
 ) -> Option<Hit> {
-    let mut weak: Option<(u64, u64, bool)> = None;
+    let mut weak: Option<(u64, u64, bool, u64)> = None;
     let passes: &[u8] = if group == 0 { &[0] } else { &[1, 0] };
     for pass in passes {
-        for obj in objs.iter().filter(|obj| obj.group == *pass) {
+        for (oi, obj) in objs.iter().enumerate() {
+            if obj.group != *pass || skip == Some(oi) {
+                continue;
+            }
             match defined(obj, name, ver, file) {
                 Ok(None) => {}
-                Ok(Some((value, bias, 2, ifunc))) => {
+                Ok(Some((value, bias, 2, ifunc, size))) => {
                     if weak.is_none() {
-                        weak = Some((value, bias, ifunc));
+                        weak = Some((value, bias, ifunc, size));
                     }
                 }
-                Ok(Some((value, bias, _, ifunc))) => {
-                    return Some(Hit::Found { value, bias, ifunc });
+                Ok(Some((value, bias, _, ifunc, size))) => {
+                    return Some(Hit::Found {
+                        value,
+                        bias,
+                        ifunc,
+                        size,
+                    });
                 }
                 Err(()) => return Some(Hit::Bad),
             }
         }
     }
-    weak.map(|(value, bias, ifunc)| Hit::Found { value, bias, ifunc })
+    weak.map(|(value, bias, ifunc, size)| Hit::Found {
+        value,
+        bias,
+        ifunc,
+        size,
+    })
 }
 
 /// `JUMP_SLOT` из `DT_JMPREL` остаётся на первый вызов, если у объекта есть
@@ -1704,13 +1858,75 @@ fn bind_all(objs: &mut [LinkObj], env_now: bool) -> bool {
     }
     for i in 0..objs.len() {
         for r in 0..objs[i].parsed.relative.len() {
+            if objs[i].parsed.relative[r].copy {
+                let Some(ext) = objs[i].parsed.relative[r].ext.clone() else {
+                    serial_println!("[task] COPY undefined");
+                    return false;
+                };
+                let group = objs[i].group;
+                let ref_size = objs[i].parsed.relative[r].ref_size;
+                let shown = core::str::from_utf8(&ext.name).unwrap_or("?");
+                match lookup(
+                    objs,
+                    group,
+                    &ext.name,
+                    ext.ver.as_deref(),
+                    ext.file.as_deref(),
+                    Some(i),
+                ) {
+                    Some(Hit::Found {
+                        value,
+                        bias,
+                        ifunc,
+                        size,
+                    }) => {
+                        if ifunc {
+                            serial_println!("[task] COPY of IFUNC {}", shown);
+                            return false;
+                        }
+                        // Отказ только когда копируется больше потолка.
+                        // Огромный второй размер при маленьком минимуме жив.
+                        if size.min(ref_size) > COPY_MAX {
+                            serial_println!("[task] COPY too large {}", shown);
+                            return false;
+                        }
+                        let rel = &mut objs[i].parsed.relative[r];
+                        rel.sym = Some(value);
+                        rel.def_bias = Some(bias);
+                        rel.src_size = size;
+                        rel.ext = None;
+                    }
+                    Some(Hit::Bad) => {
+                        serial_println!("[task] bad dynsym while resolving {}", shown);
+                        return false;
+                    }
+                    None => {
+                        // Слабый COPY без источника — тоже отказ, не ноль.
+                        serial_println!("[task] COPY undefined {}", shown);
+                        return false;
+                    }
+                }
+                continue;
+            }
             let Some(ext) = objs[i].parsed.relative[r].ext.clone() else {
                 continue;
             };
             let group = objs[i].group;
             let shown = core::str::from_utf8(&ext.name).unwrap_or("?");
-            match lookup(objs, group, &ext.name, ext.ver.as_deref(), ext.file.as_deref()) {
-                Some(Hit::Found { value, bias, ifunc }) => {
+            match lookup(
+                objs,
+                group,
+                &ext.name,
+                ext.ver.as_deref(),
+                ext.file.as_deref(),
+                None,
+            ) {
+                Some(Hit::Found {
+                    value,
+                    bias,
+                    ifunc,
+                    size: _,
+                }) => {
                     let rel = &mut objs[i].parsed.relative[r];
                     rel.sym = Some(value);
                     rel.def_bias = Some(bias);
@@ -1741,6 +1957,58 @@ fn bind_all(objs: &mut [LinkObj], env_now: bool) -> bool {
                         return false;
                     }
                 }
+            }
+        }
+    }
+    // Перехват после внешней связи. Победитель — тот же адрес и тот же
+    // IFUNC: поле базы не трогаем, свой символ остаётся со своей базой.
+    for i in 0..objs.len() {
+        let group = objs[i].group;
+        let own_bias = objs[i].bias;
+        for r in 0..objs[i].parsed.relative.len() {
+            if objs[i].parsed.relative[r].copy {
+                continue;
+            }
+            let Some(pre) = objs[i].parsed.relative[r].preempt.clone() else {
+                continue;
+            };
+            let shown = core::str::from_utf8(&pre.name).unwrap_or("?");
+            match lookup(
+                objs,
+                group,
+                &pre.name,
+                pre.ver.as_deref(),
+                pre.file.as_deref(),
+                None,
+            ) {
+                Some(Hit::Found {
+                    value,
+                    bias,
+                    ifunc,
+                    size: _,
+                }) => {
+                    let rel = &mut objs[i].parsed.relative[r];
+                    if rel.sym == Some(value)
+                        && rel.def_bias.unwrap_or(own_bias) == bias
+                        && rel.ifunc == ifunc
+                    {
+                        continue;
+                    }
+                    rel.sym = Some(value);
+                    rel.def_bias = Some(bias);
+                    if ifunc {
+                        rel.ifunc = true;
+                        rel.defer = false;
+                        rel.jmprel_off = None;
+                    } else if rel.ifunc {
+                        rel.ifunc = false;
+                    }
+                }
+                Some(Hit::Bad) => {
+                    serial_println!("[task] bad dynsym while resolving {}", shown);
+                    return false;
+                }
+                None => {}
             }
         }
     }
@@ -2189,6 +2457,79 @@ fn write_user(l4: PhysFrame, addr: u64, data: &[u8]) -> Result<(), MapToError<Si
     Ok(())
 }
 
+/// Читать байты user-памяти АП `l4` через physmap. Несмапленная страница —
+/// ошибка, частичное чтение не возвращается.
+fn read_user(l4: PhysFrame, addr: u64, data: &mut [u8]) -> Result<(), MapToError<Size4KiB>> {
+    let mapper = unsafe { mapper_for(l4) };
+    let mut done = 0usize;
+    while done < data.len() {
+        let a = addr + done as u64;
+        let phys = mapper
+            .translate_addr(VirtAddr::new(a))
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        let page_off = (a & 0xFFF) as usize;
+        let n = (4096 - page_off).min(data.len() - done);
+        let src = (phys_offset().as_u64() + phys.as_u64()) as *const u8;
+        unsafe { core::ptr::copy_nonoverlapping(src, data.as_mut_ptr().add(done), n) };
+        done += n;
+    }
+    Ok(())
+}
+
+/// Скопировать `n` байт внутри одного АП. Буфер на куче: 64 КиБ не кладутся
+/// на kernel-стек. Перекрытие источника и назначения определено.
+fn copy_user(
+    l4: PhysFrame,
+    dst: u64,
+    src: u64,
+    n: usize,
+) -> Result<(), MapToError<Size4KiB>> {
+    if n == 0 {
+        return Ok(());
+    }
+    let mut buf = alloc::vec![0u8; n];
+    read_user(l4, src, &mut buf)?;
+    write_user(l4, dst, &buf)
+}
+
+/// `R_X86_64_COPY` после обычных релокаций всех объектов. Ноль байт — пустая
+/// удача. Дырка в источнике или слоте роняет загрузку.
+fn apply_copies(l4: PhysFrame, objs: &[LinkObj]) -> Result<(), MapToError<Size4KiB>> {
+    for obj in objs {
+        for rel in &obj.parsed.relative {
+            if !rel.copy {
+                continue;
+            }
+            if rel.ext.is_some() {
+                return Err(MapToError::FrameAllocationFailed);
+            }
+            let n64 = rel.src_size.min(rel.ref_size);
+            if n64 == 0 {
+                continue;
+            }
+            if n64 > COPY_MAX {
+                return Err(MapToError::FrameAllocationFailed);
+            }
+            let n = n64 as usize;
+            let sym = rel.sym.ok_or(MapToError::FrameAllocationFailed)?;
+            let def_bias = rel.def_bias.ok_or(MapToError::FrameAllocationFailed)?;
+            let src = sym
+                .checked_add(def_bias)
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            let dst = rel
+                .offset
+                .checked_add(obj.bias)
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            src.checked_add(n64)
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            dst.checked_add(n64)
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            copy_user(l4, dst, src, n)?;
+        }
+    }
+    Ok(())
+}
+
 // ---- Задачи ----
 
 /// Учётные данные. Отдельного fsuid нет: в `/proc/self/status` он равен euid.
@@ -2620,8 +2961,9 @@ fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapT
         }
         // IFUNC закроет стартовая страница, когда все обычные релокации
         // всех объектов уже записаны. Ранний вызов здесь был бы вызовом
-        // ещё не перемещённого кода.
-        if rel.defer || rel.ifunc {
+        // ещё не перемещённого кода. COPY тоже ждёт: в источнике могут
+        // лежать указатели, которые эта же петля ещё пишет.
+        if rel.defer || rel.ifunc || rel.copy {
             continue;
         }
         let addr = rel
@@ -2987,6 +3329,9 @@ pub fn load_elf_image(
         map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, frame_allocator)?;
         apply_relative(l4, &obj.parsed.relative, obj.bias)?;
     }
+    // Слот программы заполняется из уже перемещённого источника.
+    // Возвраты IFUNC в эти байты не входят: резолверы бегут позже.
+    apply_copies(l4, &linked.objs)?;
     arm_plt(l4, &linked.objs, frame_allocator)?;
     let lazy = collect_lazy(&linked.objs);
     let main = &linked.objs[0];
@@ -5470,6 +5815,10 @@ mod tests {
                     defer: false,
                     missing: false,
                     ifunc: false,
+                    copy: false,
+                    ref_size: 0,
+                    src_size: 0,
+                    preempt: None,
                 },
                 RelaRel {
                     offset: 8,
@@ -5481,6 +5830,10 @@ mod tests {
                     defer: false,
                     missing: false,
                     ifunc: false,
+                    copy: false,
+                    ref_size: 0,
+                    src_size: 0,
+                    preempt: None,
                 },
             ];
             apply_relative(l4, &rels, 0x2000_0000).expect("apply");
@@ -6791,6 +7144,188 @@ mod tests {
         });
         assert_eq!(foo_slot, 0x77);
         assert_eq!(bar_slot, other);
+        serial_println!("[ok]");
+    }
+
+    /// `st_size` и `st_other` у символа `index`. Нулевой символ — индекс 0.
+    fn patch_sym(elf: &mut Vec<u8>, index: usize, size: u64, other: u8) {
+        let at = 0x200 + index * 24;
+        elf[at + 5] = other;
+        elf[at + 16..at + 24].copy_from_slice(&size.to_le_bytes());
+    }
+
+    fn with_lib(lib: Vec<u8>) -> impl FnMut(&str) -> Option<Vec<u8>> {
+        move |path: &str| {
+            if path == "/lib/libfoo.so" {
+                Some(lib.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Слот библиотеки и восемь байт слота программы после копирования.
+    fn copied(linked: &Linked) -> (u64, Vec<u8>, Vec<u8>) {
+        crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            for obj in &linked.objs {
+                map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+                apply_relative(l4, &obj.parsed.relative, obj.bias).expect("apply");
+            }
+            apply_copies(l4, &linked.objs).expect("copy");
+            let slot = read_u64(l4, linked.objs[1].bias + 0x820);
+            let got = read_bytes(l4, linked.objs[0].bias + 0x900, 8);
+            let src = read_bytes(l4, linked.objs[1].bias + 0x800, 4);
+            free_user_space(l4, fa);
+            (slot, got, src)
+        })
+    }
+
+    /// `R_X86_64_COPY` переносит минимум `st_size` из библиотеки в программу,
+    /// а `GLOB_DAT` библиотеки начинает указывать на слот программы.
+    /// Защищённый символ библиотека оставляет себе. Нет источника, источник
+    /// IFUNC и минимум больше 64 КиБ — отказ.
+    #[test_case]
+    fn copy_reloc_fills_the_executable_slot() {
+        serial_print!("test copy_reloc_fills_the_executable_slot... ");
+        let mut alone = craft_dyn(
+            &[],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut alone, 1, 8, 0);
+        assert!(link_with(alone.as_slice(), |_| None).is_none());
+
+        let mut weak_alone = craft_dyn(
+            &[],
+            &[("var", 1, 0x900, 0x21)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut weak_alone, 1, 8, 0);
+        assert!(link_with(weak_alone.as_slice(), |_| None).is_none());
+
+        let mut ifunc_lib = craft_dyn(&[], &[("var", 1, 0x800, 0x1A)], &[], false, false, None);
+        patch_sym(&mut ifunc_lib, 1, 4, 0);
+        let mut ifunc_main = craft_dyn(
+            &["libfoo.so"],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut ifunc_main, 1, 8, 0);
+        assert!(link_with(ifunc_main.as_slice(), with_lib(ifunc_lib)).is_none());
+
+        let big = COPY_MAX + 1;
+        let mut big_lib = craft_dyn(&[], &[("var", 1, 0x800, 0x11)], &[], false, false, None);
+        patch_sym(&mut big_lib, 1, big, 0);
+        let mut big_main = craft_dyn(
+            &["libfoo.so"],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut big_main, 1, big, 0);
+        assert!(link_with(big_main.as_slice(), with_lib(big_lib)).is_none());
+
+        let mut small_lib = craft_dyn(&[], &[("var", 1, 0x800, 0x11)], &[], false, false, None);
+        patch_sym(&mut small_lib, 1, 4, 0);
+        let mut huge_ref = craft_dyn(
+            &["libfoo.so"],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut huge_ref, 1, big, 0);
+        let linked = link_with(huge_ref.as_slice(), with_lib(small_lib)).expect("min under the cap");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert!(rel.copy);
+        assert_eq!(rel.ref_size, big);
+        assert_eq!(rel.src_size, 4);
+
+        let mut lib = craft_dyn(
+            &[],
+            &[("var", 1, 0x800, 0x11)],
+            &[(0x820, 6, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut lib, 1, 4, 0);
+        plant(&mut lib, 0x800, &[0x11, 0x22, 0x33, 0x44]);
+        plant(&mut lib, 0x820, &[0u8; 8]);
+        let mut main = craft_dyn(
+            &["libfoo.so"],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut main, 1, 8, 0);
+        plant(&mut main, 0x900, &[0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        let linked = link_with(main.as_slice(), with_lib(lib)).expect("copy");
+        assert_eq!(linked.objs[0].bias, 0x400000);
+        assert_eq!(linked.objs[1].bias, 0x0200_0000);
+        let main_rel = &linked.objs[0].parsed.relative[0];
+        assert!(main_rel.copy && main_rel.ext.is_none());
+        assert!(!main_rel.defer && main_rel.jmprel_off.is_none());
+        assert_eq!(main_rel.sym, Some(0x800));
+        assert_eq!(main_rel.def_bias, Some(0x0200_0000));
+        assert_eq!(main_rel.src_size, 4);
+        assert_eq!(main_rel.ref_size, 8);
+        let lib_rel = &linked.objs[1].parsed.relative[0];
+        assert!(!lib_rel.copy && !lib_rel.ifunc);
+        assert_eq!(lib_rel.sym, Some(0x900));
+        assert_eq!(lib_rel.def_bias, Some(0x400000));
+        let (slot, got, src) = copied(&linked);
+        assert_eq!(slot, 0x400900);
+        assert_eq!(got, alloc::vec![0x11, 0x22, 0x33, 0x44, 0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(src, alloc::vec![0x11, 0x22, 0x33, 0x44]);
+
+        let mut plib = craft_dyn(
+            &[],
+            &[("var", 1, 0x800, 0x11)],
+            &[(0x820, 6, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut plib, 1, 4, 3);
+        plant(&mut plib, 0x800, &[0x11, 0x22, 0x33, 0x44]);
+        plant(&mut plib, 0x820, &[0u8; 8]);
+        let mut pmain = craft_dyn(
+            &["libfoo.so"],
+            &[("var", 1, 0x900, 0x11)],
+            &[(0x900, 5, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        patch_sym(&mut pmain, 1, 8, 0);
+        plant(&mut pmain, 0x900, &[0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        let linked = link_with(pmain.as_slice(), with_lib(plib)).expect("protected");
+        let lib_rel = &linked.objs[1].parsed.relative[0];
+        assert_eq!(lib_rel.sym, Some(0x800));
+        assert!(lib_rel.def_bias.is_none());
+        let main_rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(main_rel.sym, Some(0x800));
+        assert_eq!(main_rel.def_bias, Some(0x0200_0000));
+        let (slot, got, src) = copied(&linked);
+        assert_eq!(slot, 0x0200_0000 + 0x800);
+        assert_eq!(got, alloc::vec![0x11, 0x22, 0x33, 0x44, 0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(src, alloc::vec![0x11, 0x22, 0x33, 0x44]);
         serial_println!("[ok]");
     }
 }
