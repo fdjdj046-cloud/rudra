@@ -11,6 +11,7 @@
 //!   0x400000        ELF-образ (PT_LOAD)
 //!   0x800000        ELF интерпретатора, если у программы есть PT_INTERP
 //!   0x600000        резерв (раньше — страница аргумента)
+//!   0x2000000       ET_DYN из DT_NEEDED, шаг 2 МиБ, ниже brk
 //!   0x40000000      main-стек (растёт вниз от USER_STACK_TOP)
 //!   0x10000000      brk-heap (растёт вверх до BRK_MAX)
 //!   0x50000000      mmap-регион (bump вверх)
@@ -83,9 +84,38 @@ enum ElfKind {
 struct RelaRel {
     offset: u64,
     addend: u64,
-    /// Для R_X86_64_64/GLOB_DAT/JUMP_SLOT — разрешённое значение символа
-    /// (st_value до bias) либо None для R_X86_64_RELATIVE.
+    /// st_value до базы определившего объекта. None — это R_X86_64_RELATIVE
+    /// либо ещё не связанный внешний символ.
     sym: Option<u64>,
+    /// База объекта, который определил символ. None — применить базу того
+    /// объекта, в котором лежит релокация (свой символ или RELATIVE).
+    def_bias: Option<u64>,
+    /// Внешний символ: в этом объекте его нет, его закроет связь DT_NEEDED.
+    ext: Option<ExtSym>,
+}
+
+#[derive(Clone)]
+struct ExtSym {
+    name: Vec<u8>,
+    weak: bool,
+}
+
+struct DynSym {
+    symtab: Option<usize>,
+    syment: u64,
+    strtab: Option<usize>,
+    nchain: u64,
+}
+
+impl DynSym {
+    const fn none() -> Self {
+        Self {
+            symtab: None,
+            syment: 24,
+            strtab: None,
+            nchain: 0,
+        }
+    }
 }
 
 struct ElfParsed {
@@ -96,6 +126,22 @@ struct ElfParsed {
     segments: Vec<LoadSeg>,
     interp: Option<String>,
     relative: Vec<RelaRel>,
+    needed: Vec<String>,
+    dynsym: DynSym,
+}
+
+struct ParsedDyn {
+    rels: Vec<RelaRel>,
+    needed: Vec<String>,
+    dynsym: DynSym,
+}
+
+enum LocalSym {
+    /// st_value, к нему прибавится база этого объекта.
+    Own(u64),
+    /// SHN_ABS: значение уже абсолютное, базу не прибавлять.
+    Abs(u64),
+    Ext { name: Vec<u8>, weak: bool },
 }
 
 fn rd16(b: &[u8], off: usize) -> u64 {
@@ -110,8 +156,11 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 
 /// ELF64 x86_64, ET_EXEC или ET_DYN. PT_INTERP запоминается, а не отвергается.
 /// Релокации: `R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT` и
-/// `R_X86_64_JUMP_SLOT` — символ ищется в .dynsym того же объекта (по имени
-/// для UNDEF; DT_NEEDED-библиотек нет). Прочие типы — отказ.
+/// `R_X86_64_JUMP_SLOT` (в `DT_RELA` и в `DT_JMPREL`, если `DT_PLTREL` —
+/// RELA). Символ, определённый в этом объекте, берётся сразу. `SHN_UNDEF`
+/// ищется здесь же по имени, иначе остаётся внешним до связи `DT_NEEDED`.
+/// Граница `.dynsym` — `nchain` из `DT_HASH`. Без хеша символьная релокация
+/// отвергается. `DT_REL` отвергается. Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -186,9 +235,12 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if segs.is_empty() {
         return None;
     }
-    let relative = match dyn_span {
-        Some((start, end)) => parse_relative(elf, &segs, &elf[start..end])?,
-        None => Vec::new(),
+    let (relative, needed, dynsym) = match dyn_span {
+        Some((start, end)) => {
+            let parsed = parse_relative(elf, &segs, &elf[start..end])?;
+            (parsed.rels, parsed.needed, parsed.dynsym)
+        }
+        None => (Vec::new(), Vec::new(), DynSym::none()),
     };
     Some(ElfParsed {
         kind,
@@ -198,72 +250,109 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
         segments: segs,
         interp,
         relative,
+        needed,
+        dynsym,
     })
 }
 
-/// Значение символа по индексу. Символ разрешён внутри того же объекта:
-/// определённый — сразу его st_value, неопределённый (SHN_UNDEF) — по имени
-/// среди определённых записей .dynsym. `nchain` из DT_HASH — граница таблицы.
-/// Библиотек (DT_NEEDED) нет, наружу резолвить некуда.
-#[allow(clippy::too_many_arguments)]
-fn resolve_symbol(
+/// Имя в таблице строк. Пустое имя — `Ok(None)`. Выход за файл — ошибка.
+fn sym_name(elf: &[u8], strtab: usize, name_off: usize) -> Result<Option<&[u8]>, ()> {
+    let Some(start) = strtab.checked_add(name_off) else {
+        return Err(());
+    };
+    if start >= elf.len() {
+        return Err(());
+    }
+    if elf[start] == 0 {
+        return Ok(None);
+    }
+    let Some(rel) = elf[start..].iter().position(|b| *b == 0) else {
+        return Err(());
+    };
+    Ok(Some(&elf[start..start + rel]))
+}
+
+fn local_defined(elf: &[u8], ent: usize, shndx: u64) -> Option<LocalSym> {
+    if shndx == 0xfff2 || shndx == 0xffff {
+        return None;
+    }
+    let val = rd64(elf, ent + 8);
+    if shndx == 0xfff1 {
+        Some(LocalSym::Abs(val))
+    } else {
+        Some(LocalSym::Own(val))
+    }
+}
+
+/// Символ по индексу внутри этого объекта. Определённый — его st_value.
+/// SHN_UNDEF ищется по имени среди определённых. Если здесь его нет, это
+/// внешний символ: связь с DT_NEEDED закроет его позже.
+fn resolve_local(
     elf: &[u8],
     symtab: usize,
     syment: u64,
     strtab: usize,
     nchain: u64,
     idx: u64,
-) -> Option<u64> {
+) -> Option<LocalSym> {
     if syment < 24 || idx >= nchain {
         return None;
     }
-    let ent = symtab.checked_add((idx.checked_mul(syment)?) as usize)?;
+    let ent = symtab.checked_add((idx as usize).checked_mul(syment as usize)?)?;
     if ent.checked_add(24)? > elf.len() {
         return None;
     }
     let shndx = rd16(elf, ent + 6);
+    let bind = elf[ent + 4] >> 4;
     if shndx != 0 {
-        // Определён в этом объекте.
-        return Some(rd64(elf, ent + 8));
+        return local_defined(elf, ent, shndx);
     }
-    // UNDEF: ищем по имени среди определённых.
-    let name_off = rd32(elf, ent) as usize;
-    let name_start = strtab.checked_add(name_off)?;
-    if name_start >= elf.len() || elf[name_start] == 0 {
-        return None;
-    }
-    let name_end = elf[name_start..].iter().position(|b| *b == 0)? + name_start;
-    let name = &elf[name_start..name_end];
+    let name = match sym_name(elf, strtab, rd32(elf, ent) as usize) {
+        Ok(Some(n)) => n,
+        _ => return None,
+    };
     for i in 0..nchain {
-        let e = symtab.checked_add((i.checked_mul(syment)?) as usize)?;
+        let e = symtab.checked_add((i as usize).checked_mul(syment as usize)?)?;
         if e + 24 > elf.len() {
             return None;
         }
-        if rd16(elf, e + 6) == 0 {
+        let sx = rd16(elf, e + 6);
+        if sx == 0 {
             continue;
         }
-        let no = rd32(elf, e) as usize;
-        let ns = strtab.checked_add(no)?;
-        if ns >= elf.len() {
-            return None;
-        }
-        let ne = elf[ns..].iter().position(|b| *b == 0)? + ns;
-        if &elf[ns..ne] == name {
-            return Some(rd64(elf, e + 8));
+        let other = match sym_name(elf, strtab, rd32(elf, e) as usize) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(()) => return None,
+        };
+        if other == name {
+            return local_defined(elf, e, sx);
         }
     }
-    None
+    if name.len() > 256 {
+        return None;
+    }
+    Some(LocalSym::Ext {
+        name: name.to_vec(),
+        weak: bind == 2,
+    })
 }
 
-fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<RelaRel>> {
+fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<ParsedDyn> {
     const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_PLTRELSZ: u64 = 2;
+    const DT_HASH: u64 = 4;
     const DT_STRTAB: u64 = 5;
     const DT_SYMTAB: u64 = 6;
     const DT_RELA: u64 = 7;
     const DT_RELASZ: u64 = 8;
     const DT_RELAENT: u64 = 9;
     const DT_SYMENT: u64 = 11;
-    const DT_HASH: u64 = 4;
+    const DT_REL: u64 = 17;
+    const DT_RELSZ: u64 = 18;
+    const DT_PLTREL: u64 = 20;
+    const DT_JMPREL: u64 = 23;
     const R_X86_64_64: u64 = 1;
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
@@ -273,9 +362,17 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
     let mut rela_ent = 24u64;
     let mut saw_rela = false;
     let mut strtab = 0u64;
+    let mut saw_strtab = false;
     let mut symtab = 0u64;
+    let mut saw_symtab = false;
     let mut syment = 24u64;
     let mut hash_addr = 0u64;
+    let mut rel_addr = 0u64;
+    let mut rel_sz = 0u64;
+    let mut jmprel = 0u64;
+    let mut pltrelsz = 0u64;
+    let mut pltrel = 0u64;
+    let mut needed_off: Vec<u64> = Vec::new();
     let mut i = 0;
     while i + 16 <= dynamic.len() {
         let tag = rd64(dynamic, i);
@@ -283,6 +380,13 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
         i += 16;
         if tag == DT_NULL {
             break;
+        } else if tag == DT_NEEDED {
+            if needed_off.len() >= 32 {
+                return None;
+            }
+            needed_off.push(val);
+        } else if tag == DT_PLTRELSZ {
+            pltrelsz = val;
         } else if tag == DT_RELA {
             rela_addr = val;
             saw_rela = true;
@@ -292,28 +396,57 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
             rela_ent = val;
         } else if tag == DT_STRTAB {
             strtab = val;
+            saw_strtab = true;
         } else if tag == DT_SYMTAB {
             symtab = val;
+            saw_symtab = true;
         } else if tag == DT_SYMENT {
             syment = val;
         } else if tag == DT_HASH {
             hash_addr = val;
+        } else if tag == DT_REL {
+            rel_addr = val;
+        } else if tag == DT_RELSZ {
+            rel_sz = val;
+        } else if tag == DT_PLTREL {
+            pltrel = val;
+        } else if tag == DT_JMPREL {
+            jmprel = val;
         }
     }
-    if !saw_rela || rela_sz == 0 {
-        return Some(Vec::new());
-    }
-    if rela_ent != 24 || rela_sz % 24 != 0 || rela_sz > 8192 * 24 {
+    // REL (не RELA) не применяется. Молча пропустить — значит оставить нули.
+    if rel_addr != 0 || rel_sz != 0 {
         return None;
     }
-    // Границы .dynsym: nchain из DT_HASH. Без хеш-таблицы символьные
-    // релокации не поддерживаем: резолвить по таблице без границы небезопасно.
-    // Требуем лениво: RELATIVE-only бинарники без DT_HASH пропускаем.
-    let symtab_off = if symtab != 0 {
+    if jmprel != 0 && (pltrel != DT_RELA || pltrelsz == 0) {
+        return None;
+    }
+    let strtab_off = if saw_strtab {
+        Some(vaddr_file_off(segs, strtab)? as usize)
+    } else {
+        None
+    };
+    let mut needed = Vec::new();
+    if !needed_off.is_empty() {
+        let base = strtab_off?;
+        for off in needed_off {
+            let at = base.checked_add(off as usize)?;
+            let raw = sym_name(elf, 0, at).ok()??;
+            let text = core::str::from_utf8(raw).ok()?;
+            if text.len() > 200 {
+                return None;
+            }
+            needed.push(String::from(text));
+        }
+    }
+    let symtab_off = if saw_symtab {
         Some(vaddr_file_off(segs, symtab)? as usize)
     } else {
         None
     };
+    // Граница .dynsym — nchain из DT_HASH. Без таблицы символьную релокацию
+    // не резолвим: обходить .dynsym без границы небезопасно. RELATIVE-only
+    // без DT_HASH по-прежнему принимается.
     let nchain = if hash_addr != 0 {
         let hoff = vaddr_file_off(segs, hash_addr)? as usize;
         if hoff.checked_add(8)? > elf.len() {
@@ -327,58 +460,101 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Vec<Re
     } else {
         0
     };
-    let strtab_off = if strtab != 0 {
-        Some(vaddr_file_off(segs, strtab)? as usize)
-    } else {
-        None
+    let dynsym = DynSym {
+        symtab: symtab_off,
+        syment,
+        strtab: strtab_off,
+        nchain,
     };
-    let start = vaddr_file_off(segs, rela_addr)? as usize;
-    let end = start.checked_add(rela_sz as usize)?;
-    if end > elf.len() {
+    let mut tables: Vec<(u64, u64)> = Vec::new();
+    if saw_rela && rela_sz != 0 {
+        if rela_ent != 24 || rela_sz % 24 != 0 {
+            return None;
+        }
+        tables.push((rela_addr, rela_sz));
+    }
+    if jmprel != 0 {
+        if pltrel != DT_RELA || pltrelsz == 0 || pltrelsz % 24 != 0 {
+            return None;
+        }
+        tables.push((jmprel, pltrelsz));
+    }
+    let total: u64 = tables.iter().map(|(_, sz)| *sz).fold(0, |a, b| a.saturating_add(b));
+    if total > 8192 * 24 {
         return None;
     }
     let mut out = Vec::new();
-    let mut at = start;
-    while at + 24 <= end {
-        let offset = rd64(elf, at);
-        let info = rd64(elf, at + 8);
-        let addend = rd64(elf, at + 16);
-        let typ = info & 0xffff_ffff;
-        if typ == 0 {
-            at += 24;
-            continue;
+    for (addr, sz) in tables {
+        let start = vaddr_file_off(segs, addr)? as usize;
+        let end = start.checked_add(sz as usize)?;
+        if end > elf.len() {
+            return None;
         }
-        let rel = match typ {
-            R_RELATIVE => RelaRel {
-                offset,
-                addend,
-                sym: None,
-            },
-            R_X86_64_64 => {
-                let (soff, nc) = (symtab_off?, nchain);
-                let st = resolve_symbol(elf, soff, syment, strtab_off?, nc, info >> 32)?;
-                RelaRel {
+        let mut at = start;
+        while at + 24 <= end {
+            let offset = rd64(elf, at);
+            let info = rd64(elf, at + 8);
+            let mut addend = rd64(elf, at + 16);
+            let typ = info & 0xffff_ffff;
+            at += 24;
+            if typ == 0 {
+                continue;
+            }
+            if typ == R_GLOB_DAT || typ == R_JUMP_SLOT {
+                // S, не S+A.
+                addend = 0;
+            }
+            let rel = match typ {
+                R_RELATIVE => RelaRel {
                     offset,
                     addend,
-                    sym: Some(st),
+                    sym: None,
+                    def_bias: None,
+                    ext: None,
+                },
+                R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
+                    let local = resolve_local(
+                        elf,
+                        symtab_off?,
+                        syment,
+                        strtab_off?,
+                        nchain,
+                        info >> 32,
+                    )?;
+                    match local {
+                        LocalSym::Own(v) => RelaRel {
+                            offset,
+                            addend,
+                            sym: Some(v),
+                            def_bias: None,
+                            ext: None,
+                        },
+                        LocalSym::Abs(v) => RelaRel {
+                            offset,
+                            addend,
+                            sym: Some(v),
+                            def_bias: Some(0),
+                            ext: None,
+                        },
+                        LocalSym::Ext { name, weak } => RelaRel {
+                            offset,
+                            addend,
+                            sym: None,
+                            def_bias: None,
+                            ext: Some(ExtSym { name, weak }),
+                        },
+                    }
                 }
-            }
-            R_GLOB_DAT | R_JUMP_SLOT => {
-                let (soff, nc) = (symtab_off?, nchain);
-                let st = resolve_symbol(elf, soff, syment, strtab_off?, nc, info >> 32)?;
-                // GLOB_DAT/JUMP_SLOT: S без A.
-                RelaRel {
-                    offset,
-                    addend: 0,
-                    sym: Some(st),
-                }
-            }
-            _ => return None,
-        };
-        out.push(rel);
-        at += 24;
+                _ => return None,
+            };
+            out.push(rel);
+        }
     }
-    Some(out)
+    Some(ParsedDyn {
+        rels: out,
+        needed,
+        dynsym,
+    })
 }
 
 fn vaddr_file_off(segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
@@ -430,6 +606,371 @@ fn hits_stack(segs: &[LoadSeg], bias: u64) -> bool {
         }
     }
     false
+}
+
+/// Сколько объектов в одной загрузке, считая программу и интерпретатор.
+const MAX_LINK: usize = 16;
+/// Первая база ET_DYN из DT_NEEDED. Ниже — программа и интерпретатор, выше — brk.
+const LIB_BASE: u64 = 0x0200_0000;
+const LIB_STEP: u64 = 0x20_0000;
+
+enum PlaceRole {
+    Main,
+    Interp,
+    Lib,
+}
+
+struct LinkObj {
+    bytes: Vec<u8>,
+    parsed: ElfParsed,
+    bias: u64,
+    /// 0 — программа и её DT_NEEDED. 1 — интерпретатор и его DT_NEEDED.
+    group: u8,
+    path: Option<String>,
+}
+
+struct Linked {
+    objs: Vec<LinkObj>,
+    interp_index: Option<usize>,
+}
+
+/// Абсолютный DT_NEEDED берётся как есть. Имя без слэша — `/lib/<имя>`.
+/// Относительный путь со слэшем не ищем: RPATH и LD_LIBRARY_PATH нет.
+fn needed_path(spec: &str) -> Option<String> {
+    if spec.is_empty() || spec.len() > 200 || spec.as_bytes().contains(&0) {
+        return None;
+    }
+    if spec.starts_with('/') {
+        return crate::fs::resolve("/", spec);
+    }
+    if spec.starts_with('.') || spec.contains('/') {
+        return None;
+    }
+    let mut path = String::from("/lib/");
+    path.push_str(spec);
+    crate::fs::resolve("/", &path)
+}
+
+fn reserved_hit(segs: &[LoadSeg], bias: u64) -> bool {
+    if hits_stack(segs, bias) {
+        return true;
+    }
+    let thread_end = THREAD_STACK_BASE + THREAD_STACK_SIZE * MAX_THREADS_PER_PROC;
+    let regions = [
+        (BRK_BASE, BRK_MAX),
+        (MMAP_BASE, MMAP_TOP),
+        (THREAD_STACK_BASE, thread_end),
+    ];
+    for seg in segs {
+        let Some((a0, a1)) = seg_span(seg, bias) else {
+            continue;
+        };
+        for (b0, b1) in regions {
+            if a0 < b1 && b0 < a1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn overlaps_any(img: &ElfParsed, bias: u64, objs: &[LinkObj]) -> bool {
+    if reserved_hit(&img.segments, bias) {
+        return true;
+    }
+    objs.iter()
+        .any(|o| ranges_hit(&img.segments, bias, &o.parsed.segments, o.bias))
+}
+
+fn bias_at(img: &ElfParsed, base: u64) -> u64 {
+    let min_v = img.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    base.wrapping_sub(min_v & !0xFFF)
+}
+
+fn place(img: &ElfParsed, role: PlaceRole, objs: &[LinkObj]) -> Option<u64> {
+    match role {
+        PlaceRole::Main => {
+            let bias = load_bias(img, false);
+            if overlaps_any(img, bias, objs) {
+                None
+            } else {
+                Some(bias)
+            }
+        }
+        PlaceRole::Interp => {
+            let bias = load_bias(img, true);
+            if overlaps_any(img, bias, objs) {
+                None
+            } else {
+                Some(bias)
+            }
+        }
+        PlaceRole::Lib => {
+            if img.kind == ElfKind::Exec {
+                if overlaps_any(img, 0, objs) {
+                    return None;
+                }
+                return Some(0);
+            }
+            let mut base = LIB_BASE;
+            while base < BRK_BASE {
+                let bias = bias_at(img, base);
+                if !overlaps_any(img, bias, objs) {
+                    return Some(bias);
+                }
+                base = base.saturating_add(LIB_STEP);
+            }
+            None
+        }
+    }
+}
+
+fn load_needed<F>(objs: &mut Vec<LinkObj>, seen: &mut Vec<String>, start: usize, fetch: &mut F, group: u8) -> bool
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    let mut queue = alloc::vec![start];
+    let mut head = 0;
+    while head < queue.len() {
+        let index = queue[head];
+        head += 1;
+        let needed = objs[index].parsed.needed.clone();
+        for spec in needed {
+            let Some(path) = needed_path(&spec) else {
+                serial_println!("[task] DT_NEEDED path rejected: {}", spec);
+                return false;
+            };
+            if seen.iter().any(|have| have == &path) {
+                continue;
+            }
+            if objs.len() >= MAX_LINK {
+                serial_println!("[task] DT_NEEDED cap {}", MAX_LINK);
+                return false;
+            }
+            let Some(bytes) = fetch(&path) else {
+                serial_println!("[task] DT_NEEDED missing {}", path);
+                return false;
+            };
+            let Some(parsed) = parse_elf64(&bytes) else {
+                serial_println!("[task] DT_NEEDED bad ELF {}", path);
+                return false;
+            };
+            if parsed.interp.is_some() {
+                serial_println!("[task] DT_NEEDED has PT_INTERP {}", path);
+                return false;
+            }
+            let Some(bias) = place(&parsed, PlaceRole::Lib, objs) else {
+                serial_println!("[task] DT_NEEDED no room {}", path);
+                return false;
+            };
+            serial_println!("[task] DT_NEEDED {} bias {:#x}", path, bias);
+            seen.push(path.clone());
+            objs.push(LinkObj {
+                bytes,
+                parsed,
+                bias,
+                group,
+                path: Some(path),
+            });
+            queue.push(objs.len() - 1);
+        }
+    }
+    true
+}
+
+enum Hit {
+    Found { value: u64, bias: u64 },
+    Bad,
+}
+
+/// Определённый глобальный или слабый символ. Локальные пропускаются.
+/// SHN_COMMON и обрезанная таблица — ошибка, не «символа нет».
+fn defined(obj: &LinkObj, name: &[u8]) -> Result<Option<(u64, u64, u8)>, ()> {
+    let dynsym = &obj.parsed.dynsym;
+    let (Some(symtab), Some(strtab)) = (dynsym.symtab, dynsym.strtab) else {
+        return Ok(None);
+    };
+    if dynsym.nchain == 0 || dynsym.syment < 24 {
+        return Ok(None);
+    }
+    let elf = obj.bytes.as_slice();
+    let mut weak: Option<(u64, u64)> = None;
+    for i in 0..dynsym.nchain {
+        let step = (i as usize).checked_mul(dynsym.syment as usize).ok_or(())?;
+        let ent = symtab.checked_add(step).ok_or(())?;
+        if ent.checked_add(24).ok_or(())? > elf.len() {
+            return Err(());
+        }
+        let shndx = rd16(elf, ent + 6);
+        if shndx == 0 {
+            continue;
+        }
+        let bind = elf[ent + 4] >> 4;
+        if bind == 0 {
+            continue;
+        }
+        let other = match sym_name(elf, strtab, rd32(elf, ent) as usize) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(()) => return Err(()),
+        };
+        if other != name {
+            continue;
+        }
+        if shndx == 0xfff2 || shndx == 0xffff {
+            return Err(());
+        }
+        let value = rd64(elf, ent + 8);
+        let bias = if shndx == 0xfff1 { 0 } else { obj.bias };
+        if bind == 2 {
+            if weak.is_none() {
+                weak = Some((value, bias));
+            }
+            continue;
+        }
+        return Ok(Some((value, bias, bind)));
+    }
+    Ok(weak.map(|(value, bias)| (value, bias, 2)))
+}
+
+fn lookup(objs: &[LinkObj], group: u8, name: &[u8]) -> Option<Hit> {
+    let mut weak: Option<(u64, u64)> = None;
+    let passes: &[u8] = if group == 0 { &[0] } else { &[1, 0] };
+    for pass in passes {
+        for obj in objs.iter().filter(|obj| obj.group == *pass) {
+            match defined(obj, name) {
+                Ok(None) => {}
+                Ok(Some((value, bias, 2))) => {
+                    if weak.is_none() {
+                        weak = Some((value, bias));
+                    }
+                }
+                Ok(Some((value, bias, _))) => {
+                    return Some(Hit::Found { value, bias });
+                }
+                Err(()) => return Some(Hit::Bad),
+            }
+        }
+    }
+    weak.map(|(value, bias)| Hit::Found { value, bias })
+}
+
+fn bind_all(objs: &mut [LinkObj]) -> bool {
+    for i in 0..objs.len() {
+        for r in 0..objs[i].parsed.relative.len() {
+            let Some(ext) = objs[i].parsed.relative[r].ext.clone() else {
+                continue;
+            };
+            let group = objs[i].group;
+            let shown = core::str::from_utf8(&ext.name).unwrap_or("?");
+            match lookup(objs, group, &ext.name) {
+                Some(Hit::Found { value, bias }) => {
+                    let rel = &mut objs[i].parsed.relative[r];
+                    rel.sym = Some(value);
+                    rel.def_bias = Some(bias);
+                    rel.ext = None;
+                }
+                Some(Hit::Bad) => {
+                    serial_println!("[task] bad dynsym while resolving {}", shown);
+                    return false;
+                }
+                None => {
+                    if ext.weak {
+                        let rel = &mut objs[i].parsed.relative[r];
+                        rel.sym = Some(0);
+                        rel.def_bias = Some(0);
+                        rel.ext = None;
+                    } else {
+                        serial_println!("[task] undefined symbol {}", shown);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn link_with<F>(main_bytes: &[u8], mut fetch: F) -> Option<Linked>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    let parsed = match parse_elf64(main_bytes) {
+        Some(parsed) => parsed,
+        None => {
+            serial_println!("[task] bad ELF image (need ET_EXEC/ET_DYN x86_64)");
+            return None;
+        }
+    };
+    let Some(bias) = place(&parsed, PlaceRole::Main, &[]) else {
+        serial_println!("[task] ELF overlaps the stack or the heap");
+        return None;
+    };
+    let interp = parsed.interp.clone();
+    let mut objs = Vec::new();
+    objs.push(LinkObj {
+        bytes: Vec::from(main_bytes),
+        parsed,
+        bias,
+        group: 0,
+        path: None,
+    });
+    let mut seen = Vec::new();
+    if !load_needed(&mut objs, &mut seen, 0, &mut fetch, 0) {
+        return None;
+    }
+    let mut interp_index = None;
+    if let Some(path) = interp {
+        let Some(canon) = crate::fs::resolve("/", &path) else {
+            serial_println!("[task] PT_INTERP path too long: {}", path);
+            return None;
+        };
+        if seen.iter().any(|have| have == &canon) {
+            serial_println!("[task] PT_INTERP {} is already a DT_NEEDED", canon);
+            return None;
+        }
+        if objs.len() >= MAX_LINK {
+            serial_println!("[task] DT_NEEDED cap {}", MAX_LINK);
+            return None;
+        }
+        let Some(bytes) = fetch(&canon) else {
+            serial_println!("[task] PT_INTERP missing {}", canon);
+            return None;
+        };
+        let Some(parsed) = parse_elf64(&bytes) else {
+            serial_println!("[task] PT_INTERP bad ELF {}", canon);
+            return None;
+        };
+        if parsed.interp.is_some() {
+            serial_println!("[task] nested PT_INTERP refused");
+            return None;
+        }
+        let Some(ibias) = place(&parsed, PlaceRole::Interp, &objs) else {
+            serial_println!("[task] PT_INTERP overlaps the program or the stack");
+            return None;
+        };
+        seen.push(canon.clone());
+        objs.push(LinkObj {
+            bytes,
+            parsed,
+            bias: ibias,
+            group: 1,
+            path: Some(canon),
+        });
+        let index = objs.len() - 1;
+        interp_index = Some(index);
+        if !load_needed(&mut objs, &mut seen, index, &mut fetch, 1) {
+            return None;
+        }
+    }
+    if !bind_all(&mut objs) {
+        return None;
+    }
+    Some(Linked { objs, interp_index })
+}
+
+fn link_program(bytes: &[u8]) -> Option<Linked> {
+    link_with(bytes, |path| crate::fs::read_canon(path))
 }
 
 // ---- Адресное пространство ----
@@ -492,26 +1033,27 @@ fn free_user_space(l4: PhysFrame, fa: &mut BootInfoFrameAllocator) {
 }
 
 fn free_table(frame: PhysFrame, level: u8, fa: &mut BootInfoFrameAllocator) {
+    // По одному слоту, не массивом на 512. Массив не влезает в kernel-стек
+    // (64 КиБ): проба стека в free_table давала double fault.
+    // Куча тут тоже нельзя: аллокатор кадров уже занят.
     let ptr = (phys_offset() + frame.start_address().as_u64()).as_mut_ptr::<PageTable>();
-    let mut kids = [None; 512];
-    unsafe {
-        let table = &*ptr;
-        for i in 0..512 {
+    for i in 0..512 {
+        let child = unsafe {
+            let table = &*ptr;
             let entry = &table[i];
             // В PTE (level == 1) бит 7 — это PAT, не размер страницы.
             // PS (huge) стоит только в каталогах, level > 1.
             let huge = level > 1 && entry.flags().contains(PageTableFlags::HUGE_PAGE);
             if entry.flags().contains(PageTableFlags::PRESENT) && !huge {
-                kids[i] = PhysFrame::from_start_address(entry.addr()).ok();
+                PhysFrame::from_start_address(entry.addr()).ok()
+            } else {
+                None
             }
-        }
-    }
-    if level > 1 {
-        for kid in kids.into_iter().flatten() {
+        };
+        let Some(kid) = child else { continue };
+        if level > 1 {
             free_table(kid, level - 1, fa);
-        }
-    } else {
-        for kid in kids.into_iter().flatten() {
+        } else {
             fa.deallocate_frame(kid);
         }
     }
@@ -1167,15 +1709,22 @@ fn map_and_copy(
 
 fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapToError<Size4KiB>> {
     for rel in rels {
+        if rel.ext.is_some() {
+            return Err(MapToError::FrameAllocationFailed);
+        }
         let addr = rel
             .offset
             .checked_add(bias)
             .ok_or(MapToError::FrameAllocationFailed)?;
-        // RELATIVE: B + A. Символьные: S (+ A для R_X86_64_64) + B.
-        let val = rel
-            .addend
-            .wrapping_add(rel.sym.unwrap_or(0))
-            .wrapping_add(bias);
+        // RELATIVE: B + A, B — база этого объекта.
+        // Символ: S + A, S = st_value + база определившего объекта.
+        // У своего символа эта база совпадает с B. У чужого — нет.
+        let base = if rel.sym.is_none() {
+            bias
+        } else {
+            rel.def_bias.unwrap_or(bias)
+        };
+        let val = rel.addend.wrapping_add(rel.sym.unwrap_or(0)).wrapping_add(base);
         write_user(l4, addr, &val.to_le_bytes())?;
     }
     Ok(())
@@ -1193,56 +1742,32 @@ pub fn load_elf_image(
     frame_allocator: &mut BootInfoFrameAllocator,
     cred: Cred,
 ) -> Result<LoadedImage, MapToError<Size4KiB>> {
-    let main = match parse_elf64(elf_bytes) {
-        Some(p) => p,
-        None => {
-            serial_println!("[task] bad ELF image (need ET_EXEC/ET_DYN x86_64)");
-            return Err(MapToError::FrameAllocationFailed);
-        }
+    let linked = match link_program(elf_bytes) {
+        Some(linked) => linked,
+        None => return Err(MapToError::FrameAllocationFailed),
     };
-    let main_bias = load_bias(&main, false);
-    map_and_copy(l4, elf_bytes, &main.segments, main_bias, frame_allocator)?;
-    apply_relative(l4, &main.relative, main_bias)?;
-
-    let phdr_vaddr = main.phdr_vaddr.wrapping_add(main_bias);
-    let phnum = main.phnum;
-    let at_entry = main.entry.wrapping_add(main_bias);
-    let (entry, at_base) = if let Some(path) = main.interp.as_deref() {
-        let Some(canon) = crate::fs::resolve("/", path) else {
-            serial_println!("[task] PT_INTERP path too long: {}", path);
-            return Err(MapToError::FrameAllocationFailed);
+    for obj in &linked.objs {
+        map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, frame_allocator)?;
+        apply_relative(l4, &obj.parsed.relative, obj.bias)?;
+    }
+    let main = &linked.objs[0];
+    let phdr_vaddr = main.parsed.phdr_vaddr.wrapping_add(main.bias);
+    let phnum = main.parsed.phnum;
+    let at_entry = main.parsed.entry.wrapping_add(main.bias);
+    let (entry, at_base) = if let Some(index) = linked.interp_index {
+        let interp = &linked.objs[index];
+        let base = if interp.parsed.kind == ElfKind::Dyn {
+            interp.bias
+        } else {
+            0
         };
-        let Some(ibytes) = crate::fs::read_canon(&canon) else {
-            serial_println!("[task] PT_INTERP missing {}", canon);
-            return Err(MapToError::FrameAllocationFailed);
-        };
-        let interp = match parse_elf64(&ibytes) {
-            Some(p) => p,
-            None => {
-                serial_println!("[task] PT_INTERP bad ELF {}", canon);
-                return Err(MapToError::FrameAllocationFailed);
-            }
-        };
-        if interp.interp.is_some() {
-            serial_println!("[task] nested PT_INTERP refused");
-            return Err(MapToError::FrameAllocationFailed);
-        }
-        let ibias = load_bias(&interp, true);
-        if ranges_hit(&main.segments, main_bias, &interp.segments, ibias) || hits_stack(&interp.segments, ibias)
-        {
-            serial_println!("[task] PT_INTERP overlaps the program or the stack");
-            return Err(MapToError::FrameAllocationFailed);
-        }
-        map_and_copy(l4, &ibytes, &interp.segments, ibias, frame_allocator)?;
-        apply_relative(l4, &interp.relative, ibias)?;
-        let base = if interp.kind == ElfKind::Dyn { ibias } else { 0 };
         serial_println!(
             "[task] PT_INTERP {} entry {:#x} AT_BASE {:#x}",
-            canon,
-            interp.entry.wrapping_add(ibias),
+            interp.path.as_deref().unwrap_or("?"),
+            interp.parsed.entry.wrapping_add(interp.bias),
             base
         );
-        (interp.entry.wrapping_add(ibias), base)
+        (interp.parsed.entry.wrapping_add(interp.bias), base)
     } else {
         (at_entry, 0)
     };
@@ -3203,6 +3728,8 @@ mod tests {
         assert_eq!(r.offset, 0x210);
         assert_eq!(r.addend, 0x10);
         assert_eq!(r.sym, Some(0x1234));
+        assert!(r.def_bias.is_none());
+        assert!(r.ext.is_none());
         assert_eq!(load_bias(&img, false), 0x400000);
         serial_println!("[ok]");
     }
@@ -3348,6 +3875,281 @@ mod tests {
             assert_eq!(got.start_address(), frame.start_address());
             fa.deallocate_frame(got);
         });
+        serial_println!("[ok]");
+    }
+
+    /// Собрать ET_DYN: строки с 0x100, .dynsym с 0x200, .dynamic с 0x300,
+    /// .hash с 0x3C0, релокации с 0x440. `syms` — (имя, shndx, st_value, st_info).
+    /// Индекс символа в релокации — номер в этой таблице, с 1.
+    fn craft_dyn(
+        needed: &[&str],
+        syms: &[(&str, u16, u64, u8)],
+        rels: &[(u64, u64, u64, u64)],
+        jmprel: bool,
+        dt_rel: bool,
+        interp: Option<&str>,
+    ) -> Vec<u8> {
+        let mut strings = alloc::vec![0u8];
+        let mut needed_at = Vec::new();
+        for name in needed {
+            needed_at.push(strings.len() as u64);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let mut sym_at = Vec::new();
+        for (name, _, _, _) in syms {
+            sym_at.push(strings.len() as u32);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        assert!(strings.len() <= 0x100, "dynstr overlaps symtab");
+
+        let mut symtab = alloc::vec![0u8; 24];
+        for i in 0..syms.len() {
+            let (_, shndx, value, info) = syms[i];
+            symtab.extend_from_slice(&sym_at[i].to_le_bytes());
+            symtab.push(info);
+            symtab.push(0);
+            symtab.extend_from_slice(&shndx.to_le_bytes());
+            symtab.extend_from_slice(&value.to_le_bytes());
+            symtab.extend_from_slice(&0u64.to_le_bytes());
+        }
+        assert!(0x200 + symtab.len() <= 0x300, "dynsym overlaps dynamic");
+
+        let mut tags: Vec<(u64, u64)> = Vec::new();
+        for at in &needed_at {
+            tags.push((1, *at));
+        }
+        tags.push((5, 0x100));
+        tags.push((6, 0x200));
+        tags.push((11, 24));
+        if !syms.is_empty() || !rels.is_empty() {
+            tags.push((4, 0x3C0));
+        }
+        if !rels.is_empty() && !jmprel {
+            tags.push((7, 0x440));
+            tags.push((8, (rels.len() * 24) as u64));
+            tags.push((9, 24));
+        }
+        if !rels.is_empty() && jmprel {
+            tags.push((23, 0x440));
+            tags.push((2, (rels.len() * 24) as u64));
+            tags.push((20, 7));
+        }
+        if dt_rel {
+            tags.push((17, 1));
+            tags.push((18, 8));
+        }
+        tags.push((0, 0));
+        let mut dynamic = Vec::new();
+        for (tag, val) in tags {
+            dynamic.extend_from_slice(&tag.to_le_bytes());
+            dynamic.extend_from_slice(&val.to_le_bytes());
+        }
+        assert!(0x300 + dynamic.len() <= 0x3C0, "dynamic overlaps hash");
+
+        let nchain = 1 + syms.len();
+        let mut hash = Vec::new();
+        hash.extend_from_slice(&1u32.to_le_bytes());
+        hash.extend_from_slice(&(nchain as u32).to_le_bytes());
+        hash.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..nchain {
+            hash.extend_from_slice(&0u32.to_le_bytes());
+        }
+
+        let mut rela = Vec::new();
+        for (off, typ, idx, addend) in rels {
+            rela.extend_from_slice(&off.to_le_bytes());
+            rela.extend_from_slice(&((idx << 32) | typ).to_le_bytes());
+            rela.extend_from_slice(&addend.to_le_bytes());
+        }
+
+        let mut elf = alloc::vec![0u8; 0x100];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        let phnum: u16 = if interp.is_some() { 3 } else { 2 };
+        elf[56..58].copy_from_slice(&phnum.to_le_bytes());
+
+        let put_phdr = |elf: &mut Vec<u8>, at: usize, typ: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64| {
+            let p = &mut elf[at..at + 56];
+            p[0..4].copy_from_slice(&typ.to_le_bytes());
+            p[4..8].copy_from_slice(&flags.to_le_bytes());
+            p[8..16].copy_from_slice(&off.to_le_bytes());
+            p[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            p[24..32].copy_from_slice(&vaddr.to_le_bytes());
+            p[32..40].copy_from_slice(&filesz.to_le_bytes());
+            p[40..48].copy_from_slice(&memsz.to_le_bytes());
+            p[48..56].copy_from_slice(&align.to_le_bytes());
+        };
+        put_phdr(&mut elf, 0x40, 1, 7, 0, 0, 0, 0, 0x1000);
+        put_phdr(&mut elf, 0x78, 2, 6, 0x300, 0x300, dynamic.len() as u64, dynamic.len() as u64, 8);
+        if let Some(path) = interp {
+            let bytes = path.as_bytes();
+            assert!(bytes.len() < 120);
+            let mut raw = bytes.to_vec();
+            raw.push(0);
+            elf.resize(0xF0 + raw.len(), 0);
+            elf[0xF0..0xF0 + raw.len()].copy_from_slice(&raw);
+            put_phdr(&mut elf, 0xB0, 3, 4, 0xF0, 0xF0, raw.len() as u64, raw.len() as u64, 1);
+        }
+
+        let place = |elf: &mut Vec<u8>, at: usize, data: &[u8]| {
+            if elf.len() < at + data.len() {
+                elf.resize(at + data.len(), 0);
+            }
+            elf[at..at + data.len()].copy_from_slice(data);
+        };
+        place(&mut elf, 0x100, &strings);
+        place(&mut elf, 0x200, &symtab);
+        place(&mut elf, 0x300, &dynamic);
+        if !syms.is_empty() || !rels.is_empty() {
+            place(&mut elf, 0x3C0, &hash);
+        }
+        if !rela.is_empty() {
+            place(&mut elf, 0x440, &rela);
+        }
+        let len = elf.len() as u64;
+        elf[0x40 + 32..0x40 + 40].copy_from_slice(&len.to_le_bytes());
+        elf[0x40 + 40..0x40 + 48].copy_from_slice(&len.to_le_bytes());
+        elf
+    }
+
+    #[test_case]
+    fn dt_needed_binds_with_the_defining_bias() {
+        serial_print!("test dt_needed_binds_with_the_defining_bias... ");
+        let libapp = craft_dyn(&[/*no needed*/], &[("add", 1, 0x100, 0x12)], &[], false, false, None);
+        let libld = craft_dyn(&[], &[("add", 1, 0x999, 0x12)], &[], false, false, None);
+        // ld.so: свой UNDEF add должен найтись в libld, не в libapp.
+        let ld = craft_dyn(
+            &["libld.so"],
+            &[("add", 0, 0, 0x10)],
+            &[(0x480, 1, 1, 3)],
+            false,
+            false,
+            None,
+        );
+        let main = craft_dyn(
+            &["libapp.so"],
+            &[("add", 0, 0, 0x10)],
+            &[(0x480, 7, 1, 5)],
+            true,
+            false,
+            Some("/bin/ld.so"),
+        );
+        let linked = link_with(main.as_slice(), |path| match path {
+            "/lib/libapp.so" => Some(libapp.clone()),
+            "/lib/libld.so" => Some(libld.clone()),
+            "/bin/ld.so" => Some(ld.clone()),
+            _ => None,
+        })
+        .expect("link");
+        assert_eq!(linked.objs.len(), 4);
+        assert_eq!(linked.interp_index, Some(2));
+        assert_eq!(linked.objs[0].bias, 0x400000);
+        assert_eq!(linked.objs[1].path.as_deref(), Some("/lib/libapp.so"));
+        assert_eq!(linked.objs[1].bias, 0x0200_0000);
+        assert_eq!(linked.objs[2].bias, 0x800000);
+        assert_eq!(linked.objs[3].path.as_deref(), Some("/lib/libld.so"));
+        assert_eq!(linked.objs[3].bias, 0x0220_0000);
+        let app = &linked.objs[0].parsed.relative[0];
+        assert_eq!(app.addend, 0, "JUMP_SLOT drops the addend");
+        assert_eq!(app.sym, Some(0x100));
+        assert_eq!(app.def_bias, Some(0x0200_0000));
+        assert!(app.ext.is_none());
+        let loader = &linked.objs[2].parsed.relative[0];
+        assert_eq!(loader.addend, 3);
+        assert_eq!(loader.sym, Some(0x999));
+        assert_eq!(loader.def_bias, Some(0x0220_0000));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn weak_symbol_missing_is_zero_strong_refuses() {
+        serial_print!("test weak_symbol_missing_is_zero_strong_refuses... ");
+        let strong = craft_dyn(&[], &[("missing", 0, 0, 0x10)], &[(0x480, 1, 1, 0)], false, false, None);
+        assert!(link_with(strong.as_slice(), |_| None).is_none());
+        let weak = craft_dyn(&[], &[("missing", 0, 0, 0x20)], &[(0x480, 1, 1, 4)], false, false, None);
+        let linked = link_with(weak.as_slice(), |_| None).expect("weak");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0));
+        assert_eq!(rel.def_bias, Some(0));
+        assert_eq!(rel.addend, 4);
+        assert!(rel.ext.is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn dt_needed_cycle_loads_each_library_once() {
+        serial_print!("test dt_needed_cycle_loads_each_library_once... ");
+        let main = craft_dyn(&["liba.so"], &[], &[], false, false, None);
+        let linked = link_with(main.as_slice(), |path| match path {
+            "/lib/liba.so" => Some(craft_dyn(&["libb.so"], &[], &[], false, false, None)),
+            "/lib/libb.so" => Some(craft_dyn(&["liba.so"], &[], &[], false, false, None)),
+            _ => None,
+        })
+        .expect("cycle");
+        assert_eq!(linked.objs.len(), 3);
+        assert_eq!(linked.objs[1].path.as_deref(), Some("/lib/liba.so"));
+        assert_eq!(linked.objs[2].path.as_deref(), Some("/lib/libb.so"));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn dt_rel_is_refused() {
+        serial_print!("test dt_rel_is_refused... ");
+        let elf = craft_dyn(&[], &[], &[], false, true, None);
+        assert!(parse_elf64(&elf).is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn apply_relative_uses_the_defining_bias() {
+        serial_print!("test apply_relative_uses_the_defining_bias... ");
+        // AddressSpace::drop сам берёт аллокатор кадров. Внутри with_frame_allocator
+        // это повторный захват и зависание, поэтому таблицу освобождаем здесь.
+        let (sym, relative) = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x2000_0000));
+            map_zeroed(l4, page, fa, USER_FLAGS).expect("map");
+            let rels = alloc::vec![
+                RelaRel {
+                    offset: 0,
+                    addend: 0x20,
+                    sym: Some(0x100),
+                    def_bias: Some(0x400000),
+                    ext: None,
+                },
+                RelaRel {
+                    offset: 8,
+                    addend: 5,
+                    sym: None,
+                    def_bias: None,
+                    ext: None,
+                },
+            ];
+            apply_relative(l4, &rels, 0x2000_0000).expect("apply");
+            let mapper = unsafe { mapper_for(l4) };
+            let phys = mapper
+                .translate_addr(VirtAddr::new(0x2000_0000))
+                .expect("phys");
+            let ptr = (phys_offset().as_u64() + phys.as_u64()) as *const u8;
+            let mut buf = [0u8; 16];
+            unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16) };
+            free_user_space(l4, fa);
+            let sym = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let relative = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            (sym, relative)
+        });
+        assert_eq!(sym, 0x100 + 0x20 + 0x400000);
+        assert_eq!(relative, 5 + 0x2000_0000);
         serial_println!("[ok]");
     }
 }
