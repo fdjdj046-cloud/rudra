@@ -159,8 +159,9 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// `R_X86_64_JUMP_SLOT` (в `DT_RELA` и в `DT_JMPREL`, если `DT_PLTREL` —
 /// RELA). Символ, определённый в этом объекте, берётся сразу. `SHN_UNDEF`
 /// ищется здесь же по имени, иначе остаётся внешним до связи `DT_NEEDED`.
-/// Граница `.dynsym` — `nchain` из `DT_HASH`. Без хеша символьная релокация
-/// отвергается. `DT_REL` отвергается. Прочие типы — отказ.
+/// Граница `.dynsym` — `nchain` из `DT_HASH`, а если его нет — число символов
+/// из `DT_GNU_HASH`. Без обеих таблиц символьная релокация отвергается.
+/// `DT_REL` отвергается. Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -338,6 +339,73 @@ fn resolve_local(
     })
 }
 
+/// Сколько записей в `.dynsym` по `DT_GNU_HASH` (ELF64, bloom по 8 байт).
+/// Пустые bucket'ы дают границу `symoffset`. Цепочка идёт, пока младший бит
+/// слова хеша не равен 1. Старший bucket — не последний символ: цепочка,
+/// начавшаяся раньше, может быть длиннее. Обрезанная или зацикленная таблица
+/// — `None`, а не догадка.
+fn gnu_hash_nchain(elf: &[u8], off: usize) -> Option<u64> {
+    const CAP: u64 = 1 << 20;
+    if off.checked_add(16)? > elf.len() {
+        return None;
+    }
+    let nbuckets = rd32(elf, off);
+    let symoffset = rd32(elf, off + 4);
+    let bloom_size = rd32(elf, off + 8);
+    if nbuckets > CAP || symoffset > CAP || bloom_size > CAP {
+        return None;
+    }
+    let bloom_bytes = (bloom_size as usize).checked_mul(8)?;
+    let buckets_at = off.checked_add(16)?.checked_add(bloom_bytes)?;
+    let buckets_bytes = (nbuckets as usize).checked_mul(4)?;
+    let chain_at = buckets_at.checked_add(buckets_bytes)?;
+    if chain_at > elf.len() {
+        return None;
+    }
+    if nbuckets == 0 {
+        return Some(symoffset);
+    }
+    let mut last = symoffset;
+    let mut saw = false;
+    for i in 0..nbuckets as usize {
+        let bucket = rd32(elf, buckets_at + i * 4);
+        if bucket == 0 {
+            continue;
+        }
+        if bucket < symoffset || bucket > CAP {
+            return None;
+        }
+        saw = true;
+        let mut idx = bucket;
+        loop {
+            if idx > last {
+                last = idx;
+            }
+            let chain_index = (idx - symoffset) as usize;
+            let at = chain_at.checked_add(chain_index.checked_mul(4)?)?;
+            if at.checked_add(4)? > elf.len() {
+                return None;
+            }
+            if rd32(elf, at) & 1 != 0 {
+                break;
+            }
+            idx += 1;
+            if idx > CAP {
+                return None;
+            }
+        }
+    }
+    if !saw {
+        return Some(symoffset);
+    }
+    let count = last.checked_add(1)?;
+    if count > CAP {
+        None
+    } else {
+        Some(count)
+    }
+}
+
 fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<ParsedDyn> {
     const DT_NULL: u64 = 0;
     const DT_NEEDED: u64 = 1;
@@ -353,6 +421,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_RELSZ: u64 = 18;
     const DT_PLTREL: u64 = 20;
     const DT_JMPREL: u64 = 23;
+    const DT_GNU_HASH: u64 = 0x6fff_fef5;
     const R_X86_64_64: u64 = 1;
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
@@ -367,6 +436,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut saw_symtab = false;
     let mut syment = 24u64;
     let mut hash_addr = 0u64;
+    let mut gnu_addr = 0u64;
     let mut rel_addr = 0u64;
     let mut rel_sz = 0u64;
     let mut jmprel = 0u64;
@@ -404,6 +474,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             syment = val;
         } else if tag == DT_HASH {
             hash_addr = val;
+        } else if tag == DT_GNU_HASH {
+            gnu_addr = val;
         } else if tag == DT_REL {
             rel_addr = val;
         } else if tag == DT_RELSZ {
@@ -444,9 +516,10 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     } else {
         None
     };
-    // Граница .dynsym — nchain из DT_HASH. Без таблицы символьную релокацию
-    // не резолвим: обходить .dynsym без границы небезопасно. RELATIVE-only
-    // без DT_HASH по-прежнему принимается.
+    // Граница .dynsym. DT_HASH даёт nchain сразу. Иначе считаем символы по
+    // DT_GNU_HASH: обход всех цепочек, не «максимальный bucket». Без обеих
+    // таблиц символьную релокацию не резолвим. RELATIVE-only без хеша
+    // по-прежнему принимается. Кривой GNU hash отвергает образ.
     let nchain = if hash_addr != 0 {
         let hoff = vaddr_file_off(segs, hash_addr)? as usize;
         if hoff.checked_add(8)? > elf.len() {
@@ -457,6 +530,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             return None;
         }
         n
+    } else if gnu_addr != 0 {
+        let hoff = vaddr_file_off(segs, gnu_addr)? as usize;
+        gnu_hash_nchain(elf, hoff)?
     } else {
         0
     };
@@ -3889,6 +3965,22 @@ mod tests {
         dt_rel: bool,
         interp: Option<&str>,
     ) -> Vec<u8> {
+        craft_elf(needed, syms, rels, jmprel, dt_rel, interp, false, false)
+    }
+
+    /// `gnu_chain`: только `DT_GNU_HASH`, одна цепочка на все символы.
+    /// Первый символ не заканчивает цепочку, последний — заканчивает.
+    /// `gnu_empty`: bucket пустой, граница равна `symoffset` (1).
+    fn craft_elf(
+        needed: &[&str],
+        syms: &[(&str, u16, u64, u8)],
+        rels: &[(u64, u64, u64, u64)],
+        jmprel: bool,
+        dt_rel: bool,
+        interp: Option<&str>,
+        gnu_chain: bool,
+        gnu_empty: bool,
+    ) -> Vec<u8> {
         let mut strings = alloc::vec![0u8];
         let mut needed_at = Vec::new();
         for name in needed {
@@ -3923,8 +4015,10 @@ mod tests {
         tags.push((5, 0x100));
         tags.push((6, 0x200));
         tags.push((11, 24));
+        let gnu = gnu_chain || gnu_empty;
         if !syms.is_empty() || !rels.is_empty() {
-            tags.push((4, 0x3C0));
+            let tag = if gnu { 0x6fff_fef5 } else { 4 };
+            tags.push((tag, 0x3C0));
         }
         if !rels.is_empty() && !jmprel {
             tags.push((7, 0x440));
@@ -3948,14 +4042,33 @@ mod tests {
         }
         assert!(0x300 + dynamic.len() <= 0x3C0, "dynamic overlaps hash");
 
-        let nchain = 1 + syms.len();
         let mut hash = Vec::new();
-        hash.extend_from_slice(&1u32.to_le_bytes());
-        hash.extend_from_slice(&(nchain as u32).to_le_bytes());
-        hash.extend_from_slice(&1u32.to_le_bytes());
-        for _ in 0..nchain {
+        if gnu {
+            // nbuckets, symoffset, bloom_size, bloom_shift, один bloom u64, bucket.
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            hash.extend_from_slice(&1u32.to_le_bytes());
             hash.extend_from_slice(&0u32.to_le_bytes());
+            hash.extend_from_slice(&0u64.to_le_bytes());
+            if gnu_empty || syms.is_empty() {
+                hash.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                hash.extend_from_slice(&1u32.to_le_bytes());
+                for i in 0..syms.len() {
+                    let end: u32 = if i + 1 == syms.len() { 1 } else { 0 };
+                    hash.extend_from_slice(&end.to_le_bytes());
+                }
+            }
+        } else {
+            let nchain = 1 + syms.len();
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            hash.extend_from_slice(&(nchain as u32).to_le_bytes());
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            for _ in 0..nchain {
+                hash.extend_from_slice(&0u32.to_le_bytes());
+            }
         }
+        assert!(hash.len() <= 0x80, "hash overlaps rela");
 
         let mut rela = Vec::new();
         for (off, typ, idx, addend) in rels {
@@ -4150,6 +4263,99 @@ mod tests {
         });
         assert_eq!(sym, 0x100 + 0x20 + 0x400000);
         assert_eq!(relative, 5 + 0x2000_0000);
+        serial_println!("[ok]");
+    }
+
+    /// Цепочка из двух символов: первое слово без младшего бита, второе с ним.
+    /// Граница — 3, иначе `sub` не виден.
+    #[test_case]
+    fn gnu_hash_chain_binds_the_second_symbol() {
+        serial_print!("test gnu_hash_chain_binds_the_second_symbol... ");
+        let lib = craft_elf(
+            &[],
+            &[("add", 1, 0x111, 0x12), ("sub", 1, 0x222, 0x12)],
+            &[],
+            false,
+            false,
+            None,
+            true,
+            false,
+        );
+        let parsed = parse_elf64(&lib).expect("lib");
+        assert_eq!(parsed.dynsym.nchain, 3);
+        let main = craft_dyn(
+            &["libgnu.so"],
+            &[("sub", 0, 0, 0x10)],
+            &[(0x480, 1, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        let linked = link_with(main.as_slice(), |path| match path {
+            "/lib/libgnu.so" => Some(lib.clone()),
+            _ => None,
+        })
+        .expect("link");
+        assert_eq!(linked.objs.len(), 2);
+        assert_eq!(linked.objs[1].bias, 0x0200_0000);
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0x222));
+        assert_eq!(rel.def_bias, Some(0x0200_0000));
+        assert!(rel.ext.is_none());
+        serial_println!("[ok]");
+    }
+
+    /// Пустой bucket не дочитывает dynsym выше `symoffset`. Символ есть в
+    /// файле, связи нет.
+    #[test_case]
+    fn gnu_hash_empty_bucket_hides_the_symbol() {
+        serial_print!("test gnu_hash_empty_bucket_hides_the_symbol... ");
+        let lib = craft_elf(
+            &[],
+            &[("add", 1, 0x111, 0x12)],
+            &[],
+            false,
+            false,
+            None,
+            false,
+            true,
+        );
+        let parsed = parse_elf64(&lib).expect("lib");
+        assert_eq!(parsed.dynsym.nchain, 1);
+        let main = craft_dyn(
+            &["libempty.so"],
+            &[("add", 0, 0, 0x10)],
+            &[(0x480, 1, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        assert!(link_with(main.as_slice(), |path| match path {
+            "/lib/libempty.so" => Some(lib.clone()),
+            _ => None,
+        })
+        .is_none());
+        serial_println!("[ok]");
+    }
+
+    /// `filesz` PT_LOAD всё ещё покрывает слово цепочки, буфер — нет.
+    #[test_case]
+    fn gnu_hash_truncated_chain_is_refused() {
+        serial_print!("test gnu_hash_truncated_chain_is_refused... ");
+        let mut elf = craft_elf(
+            &[],
+            &[("add", 1, 0x111, 0x12)],
+            &[],
+            false,
+            false,
+            None,
+            true,
+            false,
+        );
+        let filesz = u64::from_le_bytes(elf[0x40 + 32..0x40 + 40].try_into().unwrap());
+        elf.truncate(0x3C0 + 16 + 8 + 4);
+        assert!(filesz > elf.len() as u64);
+        assert!(parse_elf64(&elf).is_none());
         serial_println!("[ok]");
     }
 }
