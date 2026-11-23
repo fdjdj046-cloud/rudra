@@ -12,6 +12,8 @@
 //!   0x800000        ELF интерпретатора, если у программы есть PT_INTERP
 //!   0x600000        резерв (раньше — страница аргумента)
 //!   0xA0000         страница ленивого PLT-резолвера
+//!   0xA1000         старт GNU IFUNC: резолверы, затем прыжок на вход
+//!   0xA2000         таблица этих вызовов (две страницы)
 //!   0x2000000       ET_DYN из DT_NEEDED, шаг 2 МиБ, ниже brk
 //!   0x40000000      main-стек (растёт вниз от USER_STACK_TOP)
 //!   0x10000000      brk-heap (растёт вверх до BRK_MAX)
@@ -98,8 +100,9 @@ enum ElfKind {
 struct RelaRel {
     offset: u64,
     addend: u64,
-    /// st_value до базы определившего объекта. None — это R_X86_64_RELATIVE
-    /// либо ещё не связанный внешний символ.
+    /// st_value до базы определившего объекта. None — `R_X86_64_RELATIVE`,
+    /// `R_X86_64_IRELATIVE` (резолвер — addend) или ещё не связанный
+    /// внешний символ.
     sym: Option<u64>,
     /// База объекта, который определил символ. None — применить базу того
     /// объекта, в котором лежит релокация (свой символ или RELATIVE).
@@ -112,6 +115,11 @@ struct RelaRel {
     defer: bool,
     /// Сильного символа нет. Загрузка жива, вызов убивает процесс.
     missing: bool,
+    /// Вызвать резолвер и записать возврат. IRELATIVE: резолвер — `addend`
+    /// плюс база этого объекта, к возврату ничего не прибавляется. Символ
+    /// `STT_GNU_IFUNC`: резолвер — `st_value` плюс база определения, к
+    /// возврату прибавляется `addend` (у `GLOB_DAT` и `JUMP_SLOT` он уже 0).
+    ifunc: bool,
 }
 
 #[derive(Clone)]
@@ -189,6 +197,10 @@ enum LocalSym {
     Own(u64),
     /// SHN_ABS: значение уже абсолютное, базу не прибавлять.
     Abs(u64),
+    /// `STT_GNU_IFUNC`. st_value — адрес резолвера, база этого объекта.
+    Ifunc(u64),
+    /// `STT_GNU_IFUNC` и `SHN_ABS`: адрес резолвера уже абсолютный.
+    IfuncAbs(u64),
     Ext {
         name: Vec<u8>,
         weak: bool,
@@ -196,6 +208,9 @@ enum LocalSym {
         file: Option<Vec<u8>>,
     },
 }
+
+/// Тип символа GNU IFUNC в младших четырёх битах `st_info`.
+const STT_GNU_IFUNC: u8 = 10;
 
 fn rd16(b: &[u8], off: usize) -> u64 {
     u16::from_le_bytes(b[off..off + 2].try_into().unwrap()) as u64
@@ -215,7 +230,10 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// Граница `.dynsym` — `nchain` из `DT_HASH`, а если его нет — число символов
 /// из `DT_GNU_HASH`. Без обеих таблиц символьная релокация отвергается.
 /// Версия символа — `DT_VERSYM` и имя из `DT_VERDEF` или `DT_VERNEED`.
-/// `DT_REL` отвергается. Прочие типы — отказ.
+/// `DT_REL` отвергается. `R_X86_64_IRELATIVE` и определённый
+/// `STT_GNU_IFUNC` (в `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`) не пишутся
+/// здесь: их резолвер вызовет стартовая страница до входа в программу.
+/// Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -344,6 +362,14 @@ fn local_defined(elf: &[u8], ent: usize, shndx: u64) -> Option<LocalSym> {
         return None;
     }
     let val = rd64(elf, ent + 8);
+    let ifunc = elf[ent + 4] & 0xf == STT_GNU_IFUNC;
+    if ifunc {
+        return if shndx == 0xfff1 {
+            Some(LocalSym::IfuncAbs(val))
+        } else {
+            Some(LocalSym::Ifunc(val))
+        };
+    }
     if shndx == 0xfff1 {
         Some(LocalSym::Abs(val))
     } else {
@@ -730,6 +756,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
     const R_RELATIVE: u64 = 8;
+    const R_IRELATIVE: u64 = 37;
     let mut rela_addr = 0u64;
     let mut rela_sz = 0u64;
     let mut rela_ent = 24u64;
@@ -954,6 +981,18 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     jmprel_off,
                     defer: false,
                     missing: false,
+                    ifunc: false,
+                },
+                R_IRELATIVE => RelaRel {
+                    offset,
+                    addend,
+                    sym: None,
+                    def_bias: None,
+                    ext: None,
+                    jmprel_off: None,
+                    defer: false,
+                    missing: false,
+                    ifunc: true,
                 },
                 R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
                     let local = resolve_local(
@@ -966,6 +1005,28 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                         info >> 32,
                     )?;
                     match local {
+                        LocalSym::Ifunc(v) => RelaRel {
+                            offset,
+                            addend,
+                            sym: Some(v),
+                            def_bias: None,
+                            ext: None,
+                            jmprel_off: None,
+                            defer: false,
+                            missing: false,
+                            ifunc: true,
+                        },
+                        LocalSym::IfuncAbs(v) => RelaRel {
+                            offset,
+                            addend,
+                            sym: Some(v),
+                            def_bias: Some(0),
+                            ext: None,
+                            jmprel_off: None,
+                            defer: false,
+                            missing: false,
+                            ifunc: true,
+                        },
                         LocalSym::Own(v) => RelaRel {
                             offset,
                             addend,
@@ -975,6 +1036,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             jmprel_off,
                             defer: false,
                             missing: false,
+                            ifunc: false,
                         },
                         LocalSym::Abs(v) => RelaRel {
                             offset,
@@ -985,6 +1047,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             jmprel_off,
                             defer: false,
                             missing: false,
+                            ifunc: false,
                         },
                         LocalSym::Ext { name, weak, ver, file } => RelaRel {
                             offset,
@@ -995,6 +1058,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             jmprel_off,
                             defer: false,
                             missing: false,
+                            ifunc: false,
                         },
                     }
                 }
@@ -1110,6 +1174,13 @@ const MAX_LINK: usize = 16;
 const LIB_BASE: u64 = 0x0200_0000;
 /// Одна страница кода ленивого резолвера. Её адрес пишется в GOT[2].
 const RESOLVE_PAGE: u64 = 0xA_0000;
+/// Стартовая страница GNU IFUNC. Процесс входит сюда, резолверы
+/// отрабатывают, затем прыжок на настоящий вход.
+const IFUNC_PAGE: u64 = 0xA_1000;
+/// Таблица вызовов: счётчик, настоящий вход, затем тройки
+/// (слот, резолвер, addend). Две страницы, не больше `IFUNC_MAX` записей.
+const IFUNC_TABLE: u64 = 0xA_2000;
+const IFUNC_MAX: usize = 256;
 /// Приватный номер: вход резолвера, не вызов Linux.
 pub const DL_FIXUP_NR: u64 = 1024;
 const LIB_STEP: u64 = 0x20_0000;
@@ -1361,6 +1432,8 @@ fn reserved_hit(segs: &[LoadSeg], bias: u64) -> bool {
         (MMAP_BASE, MMAP_TOP),
         (THREAD_STACK_BASE, thread_end),
         (RESOLVE_PAGE, RESOLVE_PAGE + 0x1000),
+        (IFUNC_PAGE, IFUNC_PAGE + 0x1000),
+        (IFUNC_TABLE, IFUNC_TABLE + 0x2000),
     ];
     for seg in segs {
         let Some((a0, a1)) = seg_span(seg, bias) else {
@@ -1501,7 +1574,7 @@ where
 }
 
 enum Hit {
-    Found { value: u64, bias: u64 },
+    Found { value: u64, bias: u64, ifunc: bool },
     Bad,
 }
 
@@ -1527,7 +1600,7 @@ fn defined(
     name: &[u8],
     ver: Option<&[u8]>,
     file: Option<&[u8]>,
-) -> Result<Option<(u64, u64, u8)>, ()> {
+) -> Result<Option<(u64, u64, u8, bool)>, ()> {
     if let Some(want_file) = file {
         match object_id(obj) {
             Some(got) if got == want_file => {}
@@ -1542,7 +1615,7 @@ fn defined(
         return Ok(None);
     }
     let elf = obj.bytes.as_slice();
-    let mut weak: Option<(u64, u64)> = None;
+    let mut weak: Option<(u64, u64, bool)> = None;
     for i in 0..dynsym.nchain {
         let step = (i as usize).checked_mul(dynsym.syment as usize).ok_or(())?;
         let ent = symtab.checked_add(step).ok_or(())?;
@@ -1570,15 +1643,16 @@ fn defined(
         }
         let value = rd64(elf, ent + 8);
         let bias = if shndx == 0xfff1 { 0 } else { obj.bias };
+        let ifunc = elf[ent + 4] & 0xf == STT_GNU_IFUNC;
         if bind == 2 {
             if weak.is_none() {
-                weak = Some((value, bias));
+                weak = Some((value, bias, ifunc));
             }
             continue;
         }
-        return Ok(Some((value, bias, bind)));
+        return Ok(Some((value, bias, bind, ifunc)));
     }
-    Ok(weak.map(|(value, bias)| (value, bias, 2)))
+    Ok(weak.map(|(value, bias, ifunc)| (value, bias, 2, ifunc)))
 }
 
 fn lookup(
@@ -1588,25 +1662,25 @@ fn lookup(
     ver: Option<&[u8]>,
     file: Option<&[u8]>,
 ) -> Option<Hit> {
-    let mut weak: Option<(u64, u64)> = None;
+    let mut weak: Option<(u64, u64, bool)> = None;
     let passes: &[u8] = if group == 0 { &[0] } else { &[1, 0] };
     for pass in passes {
         for obj in objs.iter().filter(|obj| obj.group == *pass) {
             match defined(obj, name, ver, file) {
                 Ok(None) => {}
-                Ok(Some((value, bias, 2))) => {
+                Ok(Some((value, bias, 2, ifunc))) => {
                     if weak.is_none() {
-                        weak = Some((value, bias));
+                        weak = Some((value, bias, ifunc));
                     }
                 }
-                Ok(Some((value, bias, _))) => {
-                    return Some(Hit::Found { value, bias });
+                Ok(Some((value, bias, _, ifunc))) => {
+                    return Some(Hit::Found { value, bias, ifunc });
                 }
                 Err(()) => return Some(Hit::Bad),
             }
         }
     }
-    weak.map(|(value, bias)| Hit::Found { value, bias })
+    weak.map(|(value, bias, ifunc)| Hit::Found { value, bias, ifunc })
 }
 
 /// `JUMP_SLOT` из `DT_JMPREL` остаётся на первый вызов, если у объекта есть
@@ -1636,11 +1710,18 @@ fn bind_all(objs: &mut [LinkObj], env_now: bool) -> bool {
             let group = objs[i].group;
             let shown = core::str::from_utf8(&ext.name).unwrap_or("?");
             match lookup(objs, group, &ext.name, ext.ver.as_deref(), ext.file.as_deref()) {
-                Some(Hit::Found { value, bias }) => {
+                Some(Hit::Found { value, bias, ifunc }) => {
                     let rel = &mut objs[i].parsed.relative[r];
                     rel.sym = Some(value);
                     rel.def_bias = Some(bias);
                     rel.ext = None;
+                    if ifunc {
+                        // Адрес — возврат резолвера. Ленивый PLT записал бы
+                        // st_value. Слот закроет стартовая страница.
+                        rel.ifunc = true;
+                        rel.defer = false;
+                        rel.jmprel_off = None;
+                    }
                 }
                 Some(Hit::Bad) => {
                     serial_println!("[task] bad dynsym while resolving {}", shown);
@@ -1773,6 +1854,11 @@ where
         }
     }
     if !bind_all(&mut objs, bind_now) {
+        return None;
+    }
+    // Резолвер по адресу 0 и слишком длинный список — отказ образа,
+    // а не тихий пропуск вызова.
+    if ifunc_calls(&objs).is_none() {
         return None;
     }
     Some(Linked { objs, interp_index })
@@ -2529,11 +2615,14 @@ fn map_and_copy(
 
 fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapToError<Size4KiB>> {
     for rel in rels {
-        if rel.defer {
-            continue;
-        }
         if rel.ext.is_some() {
             return Err(MapToError::FrameAllocationFailed);
+        }
+        // IFUNC закроет стартовая страница, когда все обычные релокации
+        // всех объектов уже записаны. Ранний вызов здесь был бы вызовом
+        // ещё не перемещённого кода.
+        if rel.defer || rel.ifunc {
+            continue;
         }
         let addr = rel
             .offset
@@ -2551,6 +2640,47 @@ fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapT
         write_user(l4, addr, &val.to_le_bytes())?;
     }
     Ok(())
+}
+
+struct IfuncCall {
+    slot: u64,
+    resolver: u64,
+    addend: u64,
+}
+
+/// Список резолверов. `None` — адрес 0 или больше `IFUNC_MAX`: образ
+/// отвергается. Пустой вектор — IFUNC нет, вход не подменяется.
+/// Объекты с конца: зависимости в этом списке идут после программы.
+fn ifunc_calls(objs: &[LinkObj]) -> Option<Vec<IfuncCall>> {
+    let mut out = Vec::new();
+    for obj in objs.iter().rev() {
+        for rel in &obj.parsed.relative {
+            if !rel.ifunc || rel.missing {
+                continue;
+            }
+            let slot = rel.offset.wrapping_add(obj.bias);
+            let (resolver, extra) = if rel.sym.is_none() {
+                (rel.addend.wrapping_add(obj.bias), 0)
+            } else {
+                let base = rel.def_bias.unwrap_or(obj.bias);
+                (rel.sym.unwrap_or(0).wrapping_add(base), rel.addend)
+            };
+            if resolver == 0 {
+                serial_println!("[task] IFUNC resolver at 0");
+                return None;
+            }
+            out.push(IfuncCall {
+                slot,
+                resolver,
+                addend: extra,
+            });
+            if out.len() > IFUNC_MAX {
+                serial_println!("[task] too many IFUNC relocations");
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn resolved_value(rel: &RelaRel, bias: u64) -> u64 {
@@ -2735,6 +2865,106 @@ resolve_stub_end:
     nr = const DL_FIXUP_NR,
 );
 
+fn ifunc_stub() -> &'static [u8] {
+    extern "C" {
+        static ifunc_stub_start: u8;
+        static ifunc_stub_end: u8;
+    }
+    unsafe {
+        let start = core::ptr::addr_of!(ifunc_stub_start);
+        let end = core::ptr::addr_of!(ifunc_stub_end);
+        let n = (end as usize).wrapping_sub(start as usize);
+        core::slice::from_raw_parts(start, n)
+    }
+}
+
+/// Поставить стартовую страницу и таблицу. `entry` — настоящий вход,
+/// куда страница прыгнет после резолверов. `Ok(false)` — вызовов нет.
+fn install_ifunc(
+    l4: PhysFrame,
+    objs: &[LinkObj],
+    entry: u64,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> Result<bool, MapToError<Size4KiB>> {
+    let Some(calls) = ifunc_calls(objs) else {
+        return Err(MapToError::FrameAllocationFailed);
+    };
+    if calls.is_empty() {
+        return Ok(false);
+    }
+    let bytes = ifunc_stub();
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(MapToError::FrameAllocationFailed);
+    }
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(IFUNC_PAGE));
+    map_zeroed(l4, page, frame_allocator, STUB_FLAGS)?;
+    write_user(l4, IFUNC_PAGE, bytes)?;
+
+    let nbytes = 16 + calls.len() * 24;
+    let pages = (nbytes + 4095) / 4096;
+    for i in 0..pages {
+        let addr = IFUNC_TABLE + (i as u64) * 4096;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+        map_zeroed(l4, page, frame_allocator, USER_FLAGS)?;
+    }
+    let mut raw = Vec::with_capacity(nbytes);
+    raw.extend_from_slice(&(calls.len() as u64).to_le_bytes());
+    raw.extend_from_slice(&entry.to_le_bytes());
+    for call in &calls {
+        raw.extend_from_slice(&call.slot.to_le_bytes());
+        raw.extend_from_slice(&call.resolver.to_le_bytes());
+        raw.extend_from_slice(&call.addend.to_le_bytes());
+    }
+    write_user(l4, IFUNC_TABLE, &raw)?;
+    Ok(true)
+}
+
+core::arch::global_asm!(
+    r#"
+    .text
+    .global ifunc_stub_start
+    .global ifunc_stub_end
+ifunc_stub_start:
+    # Вход процесса: rsp кратен 16, на стеке argc. Вызов из теста тоже
+    # годится: ниже выравниваем так, чтобы call вошёл в резолвер с
+    # rsp ≡ 8 (mod 16). Резолвер без аргументов, возврат в rax.
+    # Четыре push после выравнивания держат rsp кратным 16 перед call.
+    push rbp
+    mov rbp, rsp
+    and rsp, -16
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, {table}
+    mov r13, qword ptr [r12]
+    lea r12, [r12 + 16]
+    test r13, r13
+    jz .Lifunc_done
+.Lifunc_loop:
+    mov rax, qword ptr [r12 + 8]
+    call rax
+    add rax, qword ptr [r12 + 16]
+    mov rbx, qword ptr [r12]
+    mov qword ptr [rbx], rax
+    add r12, 24
+    dec r13
+    jnz .Lifunc_loop
+.Lifunc_done:
+    mov rax, {table}
+    mov rax, qword ptr [rax + 8]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov rsp, rbp
+    pop rbp
+    jmp rax
+ifunc_stub_end:
+    "#,
+    table = const IFUNC_TABLE,
+);
+
 /// Загрузить ELF в АП l4 и построить начальный стек (argc/argv/envp/auxv).
 /// Если есть `PT_INTERP`, вход — в интерпретатор, а `AT_ENTRY` остаётся
 /// входом основной программы. `lazy` — слоты, которые первый вызов дописывает.
@@ -2763,7 +2993,7 @@ pub fn load_elf_image(
     let phdr_vaddr = main.parsed.phdr_vaddr.wrapping_add(main.bias);
     let phnum = main.parsed.phnum;
     let at_entry = main.parsed.entry.wrapping_add(main.bias);
-    let (entry, at_base) = if let Some(index) = linked.interp_index {
+    let (mut entry, at_base) = if let Some(index) = linked.interp_index {
         let interp = &linked.objs[index];
         let base = if interp.parsed.kind == ElfKind::Dyn {
             interp.bias
@@ -2780,6 +3010,11 @@ pub fn load_elf_image(
     } else {
         (at_entry, 0)
     };
+    // Обычные релокации уже записаны. Резолвер IFUNC видит их, а не
+    // нули, и отрабатывает до интерпретатора и до ленивого PLT.
+    if install_ifunc(l4, &linked.objs, entry, frame_allocator)? {
+        entry = IFUNC_PAGE;
+    }
 
     // ---- Начальный стек ----
     // Все строки, потом (выравнивание 16) auxv, envp[], argv[], argc наверху.
@@ -4728,6 +4963,44 @@ pub fn lapic_timer_handler_addr() -> u64 {
     f as u64
 }
 
+/// Вызвать стартовую страницу IFUNC на АП `l4` и вернуться.
+/// Процесс входит в неё через iret в ring 3. Тест бежит не как задача,
+/// поэтому та же страница вызывается из ring 0: SMEP и SMAP на это время
+/// снимаются и возвращаются как были.
+#[cfg(test)]
+fn call_ifunc_stub(l4: PhysFrame) {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    let phys = l4.start_address().as_u64();
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let old = Cr4::read();
+        let mut cr4 = old;
+        cr4.remove(
+            Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION
+                | Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION,
+        );
+        Cr4::write(cr4);
+        core::arch::asm!(
+            "mov r15, cr3",
+            "mov cr3, {l4}",
+            "call {stub}",
+            "mov cr3, r15",
+            l4 = in(reg) phys,
+            stub = in(reg) IFUNC_PAGE,
+            out("r15") _,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
+            out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+        );
+        Cr4::write(old);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5196,6 +5469,7 @@ mod tests {
                     jmprel_off: None,
                     defer: false,
                     missing: false,
+                    ifunc: false,
                 },
                 RelaRel {
                     offset: 8,
@@ -5206,6 +5480,7 @@ mod tests {
                     jmprel_off: None,
                     defer: false,
                     missing: false,
+                    ifunc: false,
                 },
             ];
             apply_relative(l4, &rels, 0x2000_0000).expect("apply");
@@ -6313,6 +6588,209 @@ mod tests {
         assert_eq!(rel.def_bias, Some(0));
         let lazy = collect_lazy(&linked.objs).expect("weak table");
         assert_eq!(lazy.slots[0][0].value, Some(0));
+        serial_println!("[ok]");
+    }
+
+    fn plant(elf: &mut Vec<u8>, at: usize, bytes: &[u8]) {
+        if elf.len() < at + bytes.len() {
+            elf.resize(at + bytes.len(), 0);
+        }
+        elf[at..at + bytes.len()].copy_from_slice(bytes);
+        let n = elf.len() as u64;
+        elf[0x40 + 32..0x40 + 40].copy_from_slice(&n.to_le_bytes());
+        elf[0x40 + 40..0x40 + 48].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// Резолвер `mov eax, imm; ret` реально вызывается до входа.
+    /// IRELATIVE пишет возврат, `R_X86_64_64` прибавляет addend,
+    /// `GLOB_DAT` addend отбрасывает. Чужой IFUNC в `JUMP_SLOT` не
+    /// откладывается, соседний обычный слот остаётся ленивым.
+    #[test_case]
+    fn ifunc_resolver_runs_before_the_entry() {
+        serial_print!("test ifunc_resolver_runs_before_the_entry... ");
+        let mut rels = Vec::new();
+        for _ in 0..257 {
+            rels.push((0x100u64, 37u64, 0u64, 0x100u64));
+        }
+        let many = craft_elf(
+            &[],
+            &[],
+            &rels,
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+        );
+        assert!(link_with(many.as_slice(), |_| None).is_none());
+
+        let mut zero = craft_elf(
+            &[],
+            &[],
+            &[(0x100, 37, 0, 0)],
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+        );
+        zero[16] = 2;
+        assert!(link_with(zero.as_slice(), |_| None).is_none());
+
+        let weak = craft_dyn(
+            &[],
+            &[("missing", 0, 0, 0x20)],
+            &[(0x480, 1, 1, 4)],
+            false,
+            false,
+            None,
+        );
+        let linked = link_with(weak.as_slice(), |_| None).expect("weak");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert!(!rel.ifunc);
+        assert_eq!(rel.sym, Some(0));
+
+        // Резолвер 0x42 по 0x800, `ret` по 0x810, слоты с 0x820.
+        let mut main = craft_elf(
+            &[],
+            &[("pick", 1, 0x800, 0x1A)],
+            &[
+                (0x820, 37, 0, 0x800),
+                (0x828, 1, 1, 0x11),
+                (0x830, 6, 1, 0x99),
+                (0x838, 8, 0, 7),
+            ],
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+        );
+        plant(&mut main, 0x800, &[0xB8, 0x42, 0x00, 0x00, 0x00, 0xC3]);
+        plant(&mut main, 0x810, &[0xC3]);
+        main[24..32].copy_from_slice(&0x810u64.to_le_bytes());
+        let l4 = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(USER_STACK_TOP - USER_STACK_SIZE),
+                VirtAddr::new(USER_STACK_TOP - 1),
+                fa,
+                USER_FLAGS,
+            )
+            .expect("stack");
+            let img = load_elf_image(
+                l4,
+                &main,
+                &[String::from("t")],
+                &[],
+                USER_STACK_TOP,
+                fa,
+                Cred::root(),
+                "/bin/t.elf",
+                "/",
+            )
+            .expect("load");
+            assert_eq!(img.entry, IFUNC_PAGE);
+            assert_eq!(read_u64(l4, IFUNC_TABLE), 3);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 8), 0x400810);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 16), 0x400820);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 24), 0x400800);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 32), 0);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 56), 0x11);
+            assert_eq!(read_u64(l4, IFUNC_TABLE + 80), 0);
+            assert_eq!(read_u64(l4, 0x400820), 0);
+            assert_eq!(read_u64(l4, 0x400828), 0);
+            assert_eq!(read_u64(l4, 0x400830), 0);
+            assert_eq!(read_u64(l4, 0x400838), 0x400007);
+            l4
+        });
+        call_ifunc_stub(l4);
+        let (irel, abs, glob) = crate::memory::with_frame_allocator(|fa| {
+            let irel = read_u64(l4, 0x400820);
+            let abs = read_u64(l4, 0x400828);
+            let glob = read_u64(l4, 0x400830);
+            free_user_space(l4, fa);
+            (irel, abs, glob)
+        });
+        assert_eq!(irel, 0x42);
+        assert_eq!(abs, 0x53);
+        assert_eq!(glob, 0x42);
+
+        let mut lib = craft_dyn(
+            &[],
+            &[("foo", 1, 0x800, 0x1A), ("bar", 1, 0x100, 0x12)],
+            &[],
+            false,
+            false,
+            None,
+        );
+        plant(&mut lib, 0x800, &[0xB8, 0x77, 0x00, 0x00, 0x00, 0xC3]);
+        let mut host = craft_elf(
+            &["libfoo.so"],
+            &[("foo", 0, 0, 0x10), ("bar", 0, 0, 0x10)],
+            &[(0x480, 7, 1, 99), (0x488, 7, 2, 5)],
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(0x500),
+            false,
+        );
+        plant(&mut host, 0x810, &[0xC3]);
+        host[24..32].copy_from_slice(&0x810u64.to_le_bytes());
+        let marker = 0x1111_1111_1111_1111u64;
+        let other = 0x2222_2222_2222_2222u64;
+        host[0x480..0x488].copy_from_slice(&marker.to_le_bytes());
+        host[0x488..0x490].copy_from_slice(&other.to_le_bytes());
+        let linked = link_with(host.as_slice(), |path| {
+            if path == "/lib/libfoo.so" {
+                Some(lib.clone())
+            } else {
+                None
+            }
+        })
+        .expect("ext ifunc");
+        let foo = &linked.objs[0].parsed.relative[0];
+        assert!(foo.ifunc && !foo.defer && foo.jmprel_off.is_none());
+        assert_eq!(foo.addend, 0);
+        assert_eq!(foo.sym, Some(0x800));
+        assert_eq!(foo.def_bias, Some(0x0200_0000));
+        let bar = &linked.objs[0].parsed.relative[1];
+        assert!(!bar.ifunc && bar.defer && bar.jmprel_off == Some(24));
+        let lazy = collect_lazy(&linked.objs).expect("lazy");
+        assert_eq!(lazy.slots[0].len(), 1);
+        assert_eq!(lazy.slots[0][0].got, 0x400488);
+        assert_eq!(lazy.slots[0][0].value, Some(0x0200_0100));
+        let l4 = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            for obj in &linked.objs {
+                map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+                apply_relative(l4, &obj.parsed.relative, obj.bias).expect("apply");
+            }
+            arm_plt(l4, &linked.objs, fa).expect("arm");
+            assert!(install_ifunc(l4, &linked.objs, 0x400810, fa).expect("ifunc"));
+            assert_eq!(read_u64(l4, 0x400480), marker);
+            assert_eq!(read_u64(l4, 0x400488), other);
+            assert_eq!(read_u64(l4, 0x400510), RESOLVE_PAGE);
+            l4
+        });
+        call_ifunc_stub(l4);
+        let (foo_slot, bar_slot) = crate::memory::with_frame_allocator(|fa| {
+            let foo_slot = read_u64(l4, 0x400480);
+            let bar_slot = read_u64(l4, 0x400488);
+            free_user_space(l4, fa);
+            (foo_slot, bar_slot)
+        });
+        assert_eq!(foo_slot, 0x77);
+        assert_eq!(bar_slot, other);
         serial_println!("[ok]");
     }
 }
