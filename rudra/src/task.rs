@@ -98,6 +98,17 @@ struct RelaRel {
 struct ExtSym {
     name: Vec<u8>,
     weak: bool,
+    /// Имя версии из `DT_VERNEED`. None — ссылка без версии.
+    ver: Option<Vec<u8>>,
+    /// Файл из той же записи: сверяется с `DT_SONAME` или именем файла.
+    file: Option<Vec<u8>>,
+}
+
+struct SymVer {
+    name: Option<Vec<u8>>,
+    hidden: bool,
+    file: Option<Vec<u8>>,
+    ver_weak: bool,
 }
 
 struct DynSym {
@@ -105,6 +116,9 @@ struct DynSym {
     syment: u64,
     strtab: Option<usize>,
     nchain: u64,
+    /// Параллельно `.dynsym`. Пусто — версий нет, поиск прежний.
+    vers: Vec<SymVer>,
+    soname: Option<Vec<u8>>,
 }
 
 impl DynSym {
@@ -114,6 +128,8 @@ impl DynSym {
             syment: 24,
             strtab: None,
             nchain: 0,
+            vers: Vec::new(),
+            soname: None,
         }
     }
 }
@@ -141,7 +157,12 @@ enum LocalSym {
     Own(u64),
     /// SHN_ABS: значение уже абсолютное, базу не прибавлять.
     Abs(u64),
-    Ext { name: Vec<u8>, weak: bool },
+    Ext {
+        name: Vec<u8>,
+        weak: bool,
+        ver: Option<Vec<u8>>,
+        file: Option<Vec<u8>>,
+    },
 }
 
 fn rd16(b: &[u8], off: usize) -> u64 {
@@ -161,6 +182,7 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// ищется здесь же по имени, иначе остаётся внешним до связи `DT_NEEDED`.
 /// Граница `.dynsym` — `nchain` из `DT_HASH`, а если его нет — число символов
 /// из `DT_GNU_HASH`. Без обеих таблиц символьная релокация отвергается.
+/// Версия символа — `DT_VERSYM` и имя из `DT_VERDEF` или `DT_VERNEED`.
 /// `DT_REL` отвергается. Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
@@ -294,6 +316,7 @@ fn resolve_local(
     syment: u64,
     strtab: usize,
     nchain: u64,
+    vers: &[SymVer],
     idx: u64,
 ) -> Option<LocalSym> {
     if syment < 24 || idx >= nchain {
@@ -312,6 +335,11 @@ fn resolve_local(
         Ok(Some(n)) => n,
         _ => return None,
     };
+    let want_name = if vers.is_empty() {
+        None
+    } else {
+        vers.get(idx as usize)?.name.as_deref()
+    };
     for i in 0..nchain {
         let e = symtab.checked_add((i as usize).checked_mul(syment as usize)?)?;
         if e + 24 > elf.len() {
@@ -326,17 +354,38 @@ fn resolve_local(
             Ok(None) => continue,
             Err(()) => return None,
         };
-        if other == name {
+        if other == name && ver_accepts(vers, i, want_name) {
             return local_defined(elf, e, sx);
         }
     }
     if name.len() > 256 {
         return None;
     }
+    let (ver, file, ver_weak) = if vers.is_empty() {
+        (None, None, false)
+    } else {
+        let v = vers.get(idx as usize)?;
+        (v.name.clone(), v.file.clone(), v.ver_weak)
+    };
     Some(LocalSym::Ext {
         name: name.to_vec(),
-        weak: bind == 2,
+        weak: bind == 2 || ver_weak,
+        ver,
+        file,
     })
+}
+
+fn ver_accepts(vers: &[SymVer], idx: u64, want: Option<&[u8]>) -> bool {
+    if vers.is_empty() {
+        return want.is_none();
+    }
+    match vers.get(idx as usize) {
+        Some(def) => match want {
+            None => !def.hidden,
+            Some(name) => def.name.as_deref() == Some(name),
+        },
+        None => false,
+    }
 }
 
 /// Сколько записей в `.dynsym` по `DT_GNU_HASH` (ELF64, bloom по 8 байт).
@@ -406,6 +455,204 @@ fn gnu_hash_nchain(elf: &[u8], off: usize) -> Option<u64> {
     }
 }
 
+struct VerDefEnt {
+    ndx: u16,
+    name: Vec<u8>,
+}
+
+struct VerNeedEnt {
+    ndx: u16,
+    name: Vec<u8>,
+    file: Vec<u8>,
+    weak: bool,
+}
+
+fn cstr_vec(elf: &[u8], strtab: usize, off: usize) -> Option<Vec<u8>> {
+    match sym_name(elf, strtab, off) {
+        Ok(Some(n)) if !n.is_empty() && n.len() <= 256 => Some(n.to_vec()),
+        _ => None,
+    }
+}
+
+/// `DT_VERSYM` плюс имена из `DT_VERDEF` (определённый) и `DT_VERNEED`
+/// (неопределённый). Кривая таблица — `None`, а не «версий нет».
+fn parse_symvers(
+    elf: &[u8],
+    segs: &[LoadSeg],
+    symtab: Option<usize>,
+    syment: u64,
+    strtab: Option<usize>,
+    nchain: u64,
+    versym_addr: u64,
+    verdef_addr: u64,
+    verdefnum: u64,
+    verneed_addr: u64,
+    verneednum: u64,
+) -> Option<Vec<SymVer>> {
+    let any = versym_addr != 0
+        || verdef_addr != 0
+        || verneed_addr != 0
+        || verdefnum != 0
+        || verneednum != 0;
+    if !any {
+        return Some(Vec::new());
+    }
+    if versym_addr == 0 || nchain == 0 || syment < 24 {
+        return None;
+    }
+    if verdefnum > 64 || verneednum > 64 {
+        return None;
+    }
+    if (verdef_addr == 0) != (verdefnum == 0) || (verneed_addr == 0) != (verneednum == 0) {
+        return None;
+    }
+    let symtab = symtab?;
+    let strtab = strtab?;
+    let mut defs: Vec<VerDefEnt> = Vec::new();
+    if verdefnum != 0 {
+        let mut at = vaddr_file_off(segs, verdef_addr)? as usize;
+        for n in 0..verdefnum {
+            if at.checked_add(20)? > elf.len() {
+                return None;
+            }
+            let version = rd16(elf, at);
+            let ndx = rd16(elf, at + 4) as u16;
+            let cnt = rd16(elf, at + 6);
+            let aux = rd32(elf, at + 12) as usize;
+            let next = rd32(elf, at + 16) as usize;
+            if version != 1 || cnt == 0 || aux < 20 {
+                return None;
+            }
+            let aux_at = at.checked_add(aux)?;
+            if aux_at.checked_add(8)? > elf.len() {
+                return None;
+            }
+            if ndx >= 2 {
+                if defs.iter().any(|d| d.ndx == ndx) {
+                    return None;
+                }
+                let name = cstr_vec(elf, strtab, rd32(elf, aux_at) as usize)?;
+                defs.push(VerDefEnt { ndx, name });
+            }
+            if n + 1 == verdefnum {
+                break;
+            }
+            if next == 0 {
+                return None;
+            }
+            let next_at = at.checked_add(next)?;
+            if next_at <= at {
+                return None;
+            }
+            at = next_at;
+        }
+    }
+    let mut needs: Vec<VerNeedEnt> = Vec::new();
+    if verneednum != 0 {
+        let mut at = vaddr_file_off(segs, verneed_addr)? as usize;
+        for n in 0..verneednum {
+            if at.checked_add(16)? > elf.len() {
+                return None;
+            }
+            let version = rd16(elf, at);
+            let cnt = rd16(elf, at + 2);
+            let file_off = rd32(elf, at + 4) as usize;
+            let aux = rd32(elf, at + 8) as usize;
+            let next = rd32(elf, at + 12) as usize;
+            if version != 1 || cnt == 0 || cnt > 64 || aux < 16 {
+                return None;
+            }
+            let file = cstr_vec(elf, strtab, file_off)?;
+            let mut aux_at = at.checked_add(aux)?;
+            for k in 0..cnt {
+                if aux_at.checked_add(16)? > elf.len() {
+                    return None;
+                }
+                let flags = rd16(elf, aux_at + 4);
+                let other = rd16(elf, aux_at + 6) as u16;
+                let name_off = rd32(elf, aux_at + 8) as usize;
+                let vnext = rd32(elf, aux_at + 12) as usize;
+                if other < 2 || needs.iter().any(|v| v.ndx == other) {
+                    return None;
+                }
+                let name = cstr_vec(elf, strtab, name_off)?;
+                needs.push(VerNeedEnt {
+                    ndx: other,
+                    name,
+                    file: file.clone(),
+                    weak: flags & 2 != 0,
+                });
+                if k + 1 == cnt {
+                    break;
+                }
+                if vnext == 0 {
+                    return None;
+                }
+                let next_aux = aux_at.checked_add(vnext)?;
+                if next_aux <= aux_at {
+                    return None;
+                }
+                aux_at = next_aux;
+            }
+            if n + 1 == verneednum {
+                break;
+            }
+            if next == 0 {
+                return None;
+            }
+            let next_at = at.checked_add(next)?;
+            if next_at <= at {
+                return None;
+            }
+            at = next_at;
+        }
+    }
+    let vs = vaddr_file_off(segs, versym_addr)? as usize;
+    let nbytes = (nchain as usize).checked_mul(2)?;
+    if vs.checked_add(nbytes)? > elf.len() {
+        return None;
+    }
+    let mut vers = Vec::new();
+    for i in 0..nchain as usize {
+        let raw = rd16(elf, vs + i * 2) as u16;
+        let hidden = raw & 0x8000 != 0;
+        let ndx = raw & 0x7fff;
+        let step = i.checked_mul(syment as usize)?;
+        let ent = symtab.checked_add(step)?;
+        if ent.checked_add(8)? > elf.len() {
+            return None;
+        }
+        let shndx = rd16(elf, ent + 6);
+        if ndx < 2 {
+            vers.push(SymVer {
+                name: None,
+                hidden,
+                file: None,
+                ver_weak: false,
+            });
+            continue;
+        }
+        if shndx == 0 {
+            let need = needs.iter().find(|v| v.ndx == ndx)?;
+            vers.push(SymVer {
+                name: Some(need.name.clone()),
+                hidden,
+                file: Some(need.file.clone()),
+                ver_weak: need.weak,
+            });
+        } else {
+            let def = defs.iter().find(|d| d.ndx == ndx)?;
+            vers.push(SymVer {
+                name: Some(def.name.clone()),
+                hidden,
+                file: None,
+                ver_weak: false,
+            });
+        }
+    }
+    Some(vers)
+}
+
 fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<ParsedDyn> {
     const DT_NULL: u64 = 0;
     const DT_NEEDED: u64 = 1;
@@ -421,7 +668,13 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_RELSZ: u64 = 18;
     const DT_PLTREL: u64 = 20;
     const DT_JMPREL: u64 = 23;
+    const DT_SONAME: u64 = 14;
     const DT_GNU_HASH: u64 = 0x6fff_fef5;
+    const DT_VERSYM: u64 = 0x6fff_fff0;
+    const DT_VERDEF: u64 = 0x6fff_fffc;
+    const DT_VERDEFNUM: u64 = 0x6fff_fffd;
+    const DT_VERNEED: u64 = 0x6fff_fffe;
+    const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
     const R_X86_64_64: u64 = 1;
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
@@ -437,6 +690,12 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut syment = 24u64;
     let mut hash_addr = 0u64;
     let mut gnu_addr = 0u64;
+    let mut versym_addr = 0u64;
+    let mut verdef_addr = 0u64;
+    let mut verdefnum = 0u64;
+    let mut verneed_addr = 0u64;
+    let mut verneednum = 0u64;
+    let mut soname_off: Option<u64> = None;
     let mut rel_addr = 0u64;
     let mut rel_sz = 0u64;
     let mut jmprel = 0u64;
@@ -476,6 +735,18 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             hash_addr = val;
         } else if tag == DT_GNU_HASH {
             gnu_addr = val;
+        } else if tag == DT_SONAME {
+            soname_off = Some(val);
+        } else if tag == DT_VERSYM {
+            versym_addr = val;
+        } else if tag == DT_VERDEF {
+            verdef_addr = val;
+        } else if tag == DT_VERDEFNUM {
+            verdefnum = val;
+        } else if tag == DT_VERNEED {
+            verneed_addr = val;
+        } else if tag == DT_VERNEEDNUM {
+            verneednum = val;
         } else if tag == DT_REL {
             rel_addr = val;
         } else if tag == DT_RELSZ {
@@ -536,12 +807,26 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     } else {
         0
     };
-    let dynsym = DynSym {
-        symtab: symtab_off,
-        syment,
-        strtab: strtab_off,
-        nchain,
+    let soname = match soname_off {
+        Some(off) => {
+            let base = strtab_off?;
+            Some(cstr_vec(elf, base, off as usize)?)
+        }
+        None => None,
     };
+    let vers = parse_symvers(
+        elf,
+        segs,
+        symtab_off,
+        syment,
+        strtab_off,
+        nchain,
+        versym_addr,
+        verdef_addr,
+        verdefnum,
+        verneed_addr,
+        verneednum,
+    )?;
     let mut tables: Vec<(u64, u64)> = Vec::new();
     if saw_rela && rela_sz != 0 {
         if rela_ent != 24 || rela_sz % 24 != 0 {
@@ -595,6 +880,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                         syment,
                         strtab_off?,
                         nchain,
+                        &vers,
                         info >> 32,
                     )?;
                     match local {
@@ -612,12 +898,12 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             def_bias: Some(0),
                             ext: None,
                         },
-                        LocalSym::Ext { name, weak } => RelaRel {
+                        LocalSym::Ext { name, weak, ver, file } => RelaRel {
                             offset,
                             addend,
                             sym: None,
                             def_bias: None,
-                            ext: Some(ExtSym { name, weak }),
+                            ext: Some(ExtSym { name, weak, ver, file }),
                         },
                     }
                 }
@@ -629,7 +915,14 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     Some(ParsedDyn {
         rels: out,
         needed,
-        dynsym,
+        dynsym: DynSym {
+            symtab: symtab_off,
+            syment,
+            strtab: strtab_off,
+            nchain,
+            vers,
+            soname,
+        },
     })
 }
 
@@ -859,9 +1152,35 @@ enum Hit {
     Bad,
 }
 
+/// `DT_SONAME`, иначе последний компонент пути.
+fn object_id(obj: &LinkObj) -> Option<&[u8]> {
+    if let Some(soname) = obj.parsed.dynsym.soname.as_deref() {
+        return Some(soname);
+    }
+    let path = obj.path.as_deref()?;
+    let bytes = path.as_bytes();
+    let tail = match bytes.iter().rposition(|b| *b == b'/') {
+        Some(i) => &bytes[i + 1..],
+        None => bytes,
+    };
+    if tail.is_empty() { None } else { Some(tail) }
+}
+
 /// Определённый глобальный или слабый символ. Локальные пропускаются.
-/// SHN_COMMON и обрезанная таблица — ошибка, не «символа нет».
-fn defined(obj: &LinkObj, name: &[u8]) -> Result<Option<(u64, u64, u8)>, ()> {
+/// Скрытая версия не годится ссылке без версии. Имя версии и файл должны
+/// совпасть. SHN_COMMON и обрезанная таблица — ошибка, не «символа нет».
+fn defined(
+    obj: &LinkObj,
+    name: &[u8],
+    ver: Option<&[u8]>,
+    file: Option<&[u8]>,
+) -> Result<Option<(u64, u64, u8)>, ()> {
+    if let Some(want_file) = file {
+        match object_id(obj) {
+            Some(got) if got == want_file => {}
+            _ => return Ok(None),
+        }
+    }
     let dynsym = &obj.parsed.dynsym;
     let (Some(symtab), Some(strtab)) = (dynsym.symtab, dynsym.strtab) else {
         return Ok(None);
@@ -890,7 +1209,7 @@ fn defined(obj: &LinkObj, name: &[u8]) -> Result<Option<(u64, u64, u8)>, ()> {
             Ok(None) => continue,
             Err(()) => return Err(()),
         };
-        if other != name {
+        if other != name || !ver_accepts(&dynsym.vers, i, ver) {
             continue;
         }
         if shndx == 0xfff2 || shndx == 0xffff {
@@ -909,12 +1228,18 @@ fn defined(obj: &LinkObj, name: &[u8]) -> Result<Option<(u64, u64, u8)>, ()> {
     Ok(weak.map(|(value, bias)| (value, bias, 2)))
 }
 
-fn lookup(objs: &[LinkObj], group: u8, name: &[u8]) -> Option<Hit> {
+fn lookup(
+    objs: &[LinkObj],
+    group: u8,
+    name: &[u8],
+    ver: Option<&[u8]>,
+    file: Option<&[u8]>,
+) -> Option<Hit> {
     let mut weak: Option<(u64, u64)> = None;
     let passes: &[u8] = if group == 0 { &[0] } else { &[1, 0] };
     for pass in passes {
         for obj in objs.iter().filter(|obj| obj.group == *pass) {
-            match defined(obj, name) {
+            match defined(obj, name, ver, file) {
                 Ok(None) => {}
                 Ok(Some((value, bias, 2))) => {
                     if weak.is_none() {
@@ -939,7 +1264,7 @@ fn bind_all(objs: &mut [LinkObj]) -> bool {
             };
             let group = objs[i].group;
             let shown = core::str::from_utf8(&ext.name).unwrap_or("?");
-            match lookup(objs, group, &ext.name) {
+            match lookup(objs, group, &ext.name, ext.ver.as_deref(), ext.file.as_deref()) {
                 Some(Hit::Found { value, bias }) => {
                     let rel = &mut objs[i].parsed.relative[r];
                     rel.sym = Some(value);
@@ -4356,6 +4681,428 @@ mod tests {
         elf.truncate(0x3C0 + 16 + 8 + 4);
         assert!(filesz > elf.len() as u64);
         assert!(parse_elf64(&elf).is_none());
+        serial_println!("[ok]");
+    }
+
+    struct CraftSym {
+        name: &'static str,
+        shndx: u16,
+        value: u64,
+        info: u8,
+        /// Имя версии и скрытность. None — `VER_NDX_GLOBAL`.
+        ver: Option<(&'static str, bool)>,
+    }
+
+    /// Как `craft_dyn`, плюс `DT_VERSYM` / `DT_VERDEF` / `DT_VERNEED`.
+    /// `need` — (файл, имя версии, слабая) для неопределённых символов с версией.
+    /// Версии лежат с 0x800, `DT_VERSYM` — с 0x900.
+    fn craft_ver(
+        needed: &[&str],
+        soname: Option<&str>,
+        syms: &[CraftSym],
+        rels: &[(u64, u64, u64, u64)],
+        need: Option<(&str, &str, bool)>,
+    ) -> Vec<u8> {
+        let mut ndx_of = Vec::new();
+        let mut def_vers: Vec<(&str, u16, bool)> = Vec::new();
+        let mut next: u16 = 2;
+        let mut need_ndx: Option<u16> = None;
+        for s in syms {
+            if s.shndx != 0 {
+                if let Some((vn, hidden)) = s.ver {
+                    def_vers.push((vn, next, hidden));
+                    ndx_of.push(next);
+                    next += 1;
+                } else {
+                    ndx_of.push(1);
+                }
+            } else if let Some((vn, _)) = s.ver {
+                let (_, vname, _) = need.expect("versioned undef needs VERNEED");
+                assert_eq!(vn, vname);
+                let ndx = *need_ndx.get_or_insert(next);
+                ndx_of.push(ndx);
+            } else {
+                ndx_of.push(1);
+            }
+        }
+        if need.is_some() {
+            assert!(need_ndx.is_some(), "VERNEED without a versioned undef");
+        }
+
+        let mut strings = alloc::vec![0u8];
+        let mut needed_at = Vec::new();
+        for name in needed {
+            needed_at.push(strings.len() as u64);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let soname_at = soname.map(|s| {
+            let at = strings.len() as u64;
+            strings.extend_from_slice(s.as_bytes());
+            strings.push(0);
+            at
+        });
+        let mut sym_at = Vec::new();
+        for s in syms {
+            sym_at.push(strings.len() as u32);
+            strings.extend_from_slice(s.name.as_bytes());
+            strings.push(0);
+        }
+        let mut def_name_at = Vec::new();
+        for (vn, _, _) in &def_vers {
+            def_name_at.push(strings.len() as u32);
+            strings.extend_from_slice(vn.as_bytes());
+            strings.push(0);
+        }
+        let need_at = need.map(|(file, vname, _)| {
+            let file_at = strings.len() as u32;
+            strings.extend_from_slice(file.as_bytes());
+            strings.push(0);
+            let name_at = strings.len() as u32;
+            strings.extend_from_slice(vname.as_bytes());
+            strings.push(0);
+            (file_at, name_at)
+        });
+        assert!(strings.len() <= 0x100, "dynstr overlaps symtab");
+
+        let mut symtab = alloc::vec![0u8; 24];
+        for i in 0..syms.len() {
+            let s = &syms[i];
+            symtab.extend_from_slice(&sym_at[i].to_le_bytes());
+            symtab.push(s.info);
+            symtab.push(0);
+            symtab.extend_from_slice(&s.shndx.to_le_bytes());
+            symtab.extend_from_slice(&s.value.to_le_bytes());
+            symtab.extend_from_slice(&0u64.to_le_bytes());
+        }
+        assert!(0x200 + symtab.len() <= 0x300, "dynsym overlaps dynamic");
+
+        let mut verdef = Vec::new();
+        for (i, (_, ndx, _)) in def_vers.iter().enumerate() {
+            let last = i + 1 == def_vers.len();
+            verdef.extend_from_slice(&1u16.to_le_bytes());
+            verdef.extend_from_slice(&0u16.to_le_bytes());
+            verdef.extend_from_slice(&ndx.to_le_bytes());
+            verdef.extend_from_slice(&1u16.to_le_bytes());
+            verdef.extend_from_slice(&0u32.to_le_bytes());
+            verdef.extend_from_slice(&20u32.to_le_bytes());
+            let step: u32 = if last { 0 } else { 28 };
+            verdef.extend_from_slice(&step.to_le_bytes());
+            verdef.extend_from_slice(&def_name_at[i].to_le_bytes());
+            verdef.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut verneed = Vec::new();
+        if let Some((file_at, name_at)) = need_at {
+            let weak = need.unwrap().2;
+            let ndx = need_ndx.unwrap();
+            verneed.extend_from_slice(&1u16.to_le_bytes());
+            verneed.extend_from_slice(&1u16.to_le_bytes());
+            verneed.extend_from_slice(&file_at.to_le_bytes());
+            verneed.extend_from_slice(&16u32.to_le_bytes());
+            verneed.extend_from_slice(&0u32.to_le_bytes());
+            verneed.extend_from_slice(&0u32.to_le_bytes());
+            let flags: u16 = if weak { 2 } else { 0 };
+            verneed.extend_from_slice(&flags.to_le_bytes());
+            verneed.extend_from_slice(&ndx.to_le_bytes());
+            verneed.extend_from_slice(&name_at.to_le_bytes());
+            verneed.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut versym = Vec::new();
+        if !verdef.is_empty() || !verneed.is_empty() {
+            versym.extend_from_slice(&0u16.to_le_bytes());
+            for (i, s) in syms.iter().enumerate() {
+                let mut ndx = ndx_of[i];
+                if s.shndx != 0 {
+                    if let Some((_, hidden)) = s.ver {
+                        if hidden {
+                            ndx |= 0x8000;
+                        }
+                    }
+                }
+                versym.extend_from_slice(&ndx.to_le_bytes());
+            }
+        }
+
+        let mut tags: Vec<(u64, u64)> = Vec::new();
+        for at in &needed_at {
+            tags.push((1, *at));
+        }
+        if let Some(at) = soname_at {
+            tags.push((14, at));
+        }
+        tags.push((5, 0x100));
+        tags.push((6, 0x200));
+        tags.push((11, 24));
+        if !syms.is_empty() || !rels.is_empty() {
+            tags.push((4, 0x3C0));
+        }
+        if !rels.is_empty() {
+            tags.push((7, 0x440));
+            tags.push((8, (rels.len() * 24) as u64));
+            tags.push((9, 24));
+        }
+        if !versym.is_empty() {
+            tags.push((0x6fff_fff0, 0x900));
+        }
+        if !verdef.is_empty() {
+            tags.push((0x6fff_fffc, 0x800));
+            tags.push((0x6fff_fffd, def_vers.len() as u64));
+        }
+        if !verneed.is_empty() {
+            tags.push((0x6fff_fffe, 0x880));
+            tags.push((0x6fff_ffff, 1));
+        }
+        tags.push((0, 0));
+        let mut dynamic = Vec::new();
+        for (tag, val) in tags {
+            dynamic.extend_from_slice(&tag.to_le_bytes());
+            dynamic.extend_from_slice(&val.to_le_bytes());
+        }
+        assert!(0x300 + dynamic.len() <= 0x3C0, "dynamic overlaps hash");
+
+        let nchain = 1 + syms.len();
+        let mut hash = Vec::new();
+        hash.extend_from_slice(&1u32.to_le_bytes());
+        hash.extend_from_slice(&(nchain as u32).to_le_bytes());
+        hash.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..nchain {
+            hash.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(hash.len() <= 0x80, "hash overlaps rela");
+
+        let mut rela = Vec::new();
+        for (off, typ, idx, addend) in rels {
+            rela.extend_from_slice(&off.to_le_bytes());
+            rela.extend_from_slice(&((idx << 32) | typ).to_le_bytes());
+            rela.extend_from_slice(&addend.to_le_bytes());
+        }
+
+        let mut elf = alloc::vec![0u8; 0x100];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let put_phdr = |elf: &mut Vec<u8>, at: usize, typ: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64| {
+            let p = &mut elf[at..at + 56];
+            p[0..4].copy_from_slice(&typ.to_le_bytes());
+            p[4..8].copy_from_slice(&flags.to_le_bytes());
+            p[8..16].copy_from_slice(&off.to_le_bytes());
+            p[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            p[24..32].copy_from_slice(&vaddr.to_le_bytes());
+            p[32..40].copy_from_slice(&filesz.to_le_bytes());
+            p[40..48].copy_from_slice(&memsz.to_le_bytes());
+            p[48..56].copy_from_slice(&align.to_le_bytes());
+        };
+        put_phdr(&mut elf, 0x40, 1, 7, 0, 0, 0, 0, 0x1000);
+        put_phdr(&mut elf, 0x78, 2, 6, 0x300, 0x300, dynamic.len() as u64, dynamic.len() as u64, 8);
+        let place = |elf: &mut Vec<u8>, at: usize, data: &[u8]| {
+            if data.is_empty() {
+                return;
+            }
+            if elf.len() < at + data.len() {
+                elf.resize(at + data.len(), 0);
+            }
+            elf[at..at + data.len()].copy_from_slice(data);
+        };
+        place(&mut elf, 0x100, &strings);
+        place(&mut elf, 0x200, &symtab);
+        place(&mut elf, 0x300, &dynamic);
+        if !syms.is_empty() || !rels.is_empty() {
+            place(&mut elf, 0x3C0, &hash);
+        }
+        if !rela.is_empty() {
+            place(&mut elf, 0x440, &rela);
+        }
+        place(&mut elf, 0x800, &verdef);
+        place(&mut elf, 0x880, &verneed);
+        place(&mut elf, 0x900, &versym);
+        let len = elf.len() as u64;
+        elf[0x40 + 32..0x40 + 40].copy_from_slice(&len.to_le_bytes());
+        elf[0x40 + 40..0x40 + 48].copy_from_slice(&len.to_le_bytes());
+        elf
+    }
+
+    #[test_case]
+    fn symbol_version_same_object_skips_the_hidden_one() {
+        serial_print!("test symbol_version_same_object_skips_the_hidden_one... ");
+        let elf = craft_ver(
+            &[],
+            None,
+            &[
+                CraftSym { name: "foo", shndx: 1, value: 0x111, info: 0x12, ver: Some(("VER_1", true)) },
+                CraftSym { name: "foo", shndx: 1, value: 0x222, info: 0x12, ver: Some(("VER_2", false)) },
+                CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: None },
+            ],
+            &[(0x480, 1, 3, 0)],
+            None,
+        );
+        let linked = link_with(elf.as_slice(), |_| None).expect("link");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0x222));
+        assert!(rel.def_bias.is_none());
+        assert!(rel.ext.is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn symbol_version_needed_binds_the_named_one() {
+        serial_print!("test symbol_version_needed_binds_the_named_one... ");
+        let lib = craft_ver(
+            &[],
+            Some("libver.so"),
+            &[
+                CraftSym { name: "foo", shndx: 1, value: 0x111, info: 0x12, ver: Some(("VER_1", true)) },
+                CraftSym { name: "foo", shndx: 1, value: 0x222, info: 0x12, ver: Some(("VER_2", false)) },
+            ],
+            &[],
+            None,
+        );
+        let bare = craft_ver(
+            &[],
+            None,
+            &[CraftSym { name: "foo", shndx: 1, value: 0x55, info: 0x12, ver: Some(("VER_1", false)) }],
+            &[],
+            None,
+        );
+        let named = craft_ver(
+            &["libver.so"],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libver.so", "VER_1", false)),
+        );
+        let linked = link_with(named.as_slice(), |path| match path {
+            "/lib/libver.so" => Some(lib.clone()),
+            _ => None,
+        })
+        .expect("named");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0x111));
+        assert_eq!(rel.def_bias, Some(0x0200_0000));
+        let unvers = craft_dyn(
+            &["libver.so"],
+            &[("foo", 0, 0, 0x10)],
+            &[(0x480, 1, 1, 0)],
+            false,
+            false,
+            None,
+        );
+        let linked = link_with(unvers.as_slice(), |path| match path {
+            "/lib/libver.so" => Some(lib.clone()),
+            _ => None,
+        })
+        .expect("default");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0x222));
+        assert_eq!(rel.def_bias, Some(0x0200_0000));
+        let by_file = craft_ver(
+            &["libbare.so"],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libbare.so", "VER_1", false)),
+        );
+        let linked = link_with(by_file.as_slice(), |path| match path {
+            "/lib/libbare.so" => Some(bare.clone()),
+            _ => None,
+        })
+        .expect("basename");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0x55));
+        assert_eq!(rel.def_bias, Some(0x0200_0000));
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn symbol_version_wrong_file_or_plain_def_refuses() {
+        serial_print!("test symbol_version_wrong_file_or_plain_def_refuses... ");
+        let lib = craft_ver(
+            &[],
+            Some("libver.so"),
+            &[CraftSym { name: "foo", shndx: 1, value: 0x111, info: 0x12, ver: Some(("VER_1", false)) }],
+            &[],
+            None,
+        );
+        let wrong = craft_ver(
+            &["libver.so"],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libother.so", "VER_1", false)),
+        );
+        assert!(link_with(wrong.as_slice(), |path| match path {
+            "/lib/libver.so" => Some(lib.clone()),
+            _ => None,
+        })
+        .is_none());
+        let plain = craft_dyn(&[], &[("foo", 1, 0x55, 0x12)], &[], false, false, None);
+        let main = craft_ver(
+            &["libplain.so"],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libplain.so", "VER_1", false)),
+        );
+        assert!(link_with(main.as_slice(), |path| match path {
+            "/lib/libplain.so" => Some(plain.clone()),
+            _ => None,
+        })
+        .is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn symbol_version_weak_requirement_is_zero() {
+        serial_print!("test symbol_version_weak_requirement_is_zero... ");
+        let weak = craft_ver(
+            &[],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libmissing.so", "VER_1", true)),
+        );
+        let linked = link_with(weak.as_slice(), |_| None).expect("weak ver");
+        let rel = &linked.objs[0].parsed.relative[0];
+        assert_eq!(rel.sym, Some(0));
+        assert_eq!(rel.def_bias, Some(0));
+        let strong = craft_ver(
+            &[],
+            None,
+            &[CraftSym { name: "foo", shndx: 0, value: 0, info: 0x10, ver: Some(("VER_1", false)) }],
+            &[(0x480, 1, 1, 0)],
+            Some(("libmissing.so", "VER_1", false)),
+        );
+        assert!(link_with(strong.as_slice(), |_| None).is_none());
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn symbol_version_bad_table_is_refused() {
+        serial_print!("test symbol_version_bad_table_is_refused... ");
+        let elf = craft_ver(
+            &[],
+            None,
+            &[CraftSym { name: "foo", shndx: 1, value: 0x111, info: 0x12, ver: Some(("VER_1", false)) }],
+            &[],
+            None,
+        );
+        assert!(parse_elf64(&elf).is_some());
+        let filesz = u64::from_le_bytes(elf[0x40 + 32..0x40 + 40].try_into().unwrap());
+        let mut cut = elf.clone();
+        cut.truncate(0x902);
+        assert!(filesz > cut.len() as u64);
+        assert!(parse_elf64(&cut).is_none());
+        let mut bad = elf;
+        bad[0x902] = 5;
+        bad[0x903] = 0;
+        assert!(parse_elf64(&bad).is_none());
         serial_println!("[ok]");
     }
 }
