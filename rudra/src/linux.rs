@@ -20,6 +20,9 @@
 //! epoll — level и edge по номеру fd. poll и select видят готовый epoll-fd.
 //! `FD_CLOEXEC` хранится на номере: `O_CLOEXEC`, `SOCK_CLOEXEC`, `EPOLL_CLOEXEC`,
 //! `pipe2` и `fcntl(F_SETFD)`. `execve` такие номера закрывает.
+//! `accept` (43) отдаёт блокирующий сокет без этого бита. `accept4` (288)
+//! принимает только `SOCK_NONBLOCK` и `SOCK_CLOEXEC`; другой бит — `EINVAL`
+//! до поиска fd.
 //! Файловый mmap возвращает ENODEV. `munmap` отдаёт кадр после сброса TLB.
 //! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
 //! `futex WAIT/WAKE` будит ждущих.
@@ -570,7 +573,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         39 => task::current_tid(),
         41 => sys_socket(a1, a2, a3),
         42 => sys_connect(a1, a2, a3),
-        43 => sys_accept(a1, a2, a3),
+        43 => sys_accept(a1, a2, a3, 0),
+        288 => sys_accept(a1, a2, a3, a4),
         44 => sys_sendto(a1, a2, a3, a4, a5, a6),
         45 => sys_recvfrom(a1, a2, a3, a4, a5, a6),
         49 => sys_bind(a1, a2, a3),
@@ -1091,7 +1095,13 @@ fn sys_listen(fd: u64, backlog: u64) -> u64 {
     }
 }
 
-fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
+fn sys_accept(fd: u64, addr: u64, len: u64, flags: u64) -> u64 {
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    // Linux смотрит флаги раньше fd: чужой бит не снимает соединение с очереди.
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return EINVAL;
+    }
     let kind = match sock_kind(fd) {
         Ok(k) => k,
         Err(e) => return e,
@@ -1099,12 +1109,21 @@ fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
     let SockKind::Tcp(id) = kind else {
         return EOPNOTSUPP;
     };
+    // Блокирует ли сам accept — флаг слушателя. Ребёнок его не наследует.
     let nonblock = crate::net::tcp_nonblock(id);
+    let child_nonblock = flags & SOCK_NONBLOCK != 0;
+    let cloexec = flags & SOCK_CLOEXEC != 0;
     loop {
         match crate::net::tcp_accept(id) {
             Ok((child, ip, port)) => {
+                if child_nonblock {
+                    if let Err(e) = crate::net::tcp_set_nonblock(child, true) {
+                        crate::net::tcp_close(child);
+                        return neg_err(e);
+                    }
+                }
                 let mut slot = Some(Fd::Tcp { id: child });
-                match with_current_fds(|fds| alloc_fd(&mut slot, fds, false)) {
+                match with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)) {
                     Ok(nfd) if nfd == EMFILE => {
                         crate::net::tcp_close(child);
                         return EMFILE;
@@ -1114,6 +1133,7 @@ fn sys_accept(fd: u64, addr: u64, len: u64) -> u64 {
                             crate::net::tcp_close(child);
                             let _ = with_current_fds(|fds| {
                                 if (nfd as usize) < fds.len() {
+                                    fds.set_cloexec(nfd, false);
                                     fds[nfd as usize] = None;
                                 }
                             });
@@ -3169,6 +3189,20 @@ mod tests {
         assert!(!marked[0]);
         assert!(!marked[2]);
         assert!(!marked[3]);
+        crate::serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn accept4_rejects_unknown_flags_before_the_fd() {
+        crate::serial_print!("test accept4_rejects_unknown_flags_before_the_fd... ");
+        // Чужой бит — EINVAL до поиска fd. Раннер — не задача.
+        assert_eq!(sys_accept(0, 0, 0, 1), EINVAL);
+        assert_eq!(sys_accept(0, 0, 0, 0x800 | 0x80000 | 1), EINVAL);
+        // Верные флаги доходят до таблицы. Без задачи это EPERM, не разбор fd.
+        assert_eq!(sys_accept(0, 0, 0, 0), EPERM);
+        assert_eq!(sys_accept(0, 0, 0, 0x800), EPERM);
+        assert_eq!(sys_accept(0, 0, 0, 0x80000), EPERM);
+        assert_eq!(sys_accept(0, 0, 0, 0x800 | 0x80000), EPERM);
         crate::serial_println!("[ok]");
     }
 }

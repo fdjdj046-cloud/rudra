@@ -857,6 +857,7 @@ fn handle_tcp(frame: &[u8], ihl: usize) {
                 backlog: Vec::new(),
                 rx: Vec::new(),
                 eof: false,
+                // Рождается блокирующим. SOCK_NONBLOCK ставит accept4, не слушатель.
                 nonblock: false,
                 unacked: Vec::new(),
                 win: TCP_RX as u32,
@@ -1409,6 +1410,17 @@ pub fn tcp_nonblock(id: usize) -> bool {
     })
 }
 
+/// `accept4` ставит `SOCK_NONBLOCK` уже принятому сокету. Слушатель не копируется.
+pub fn tcp_set_nonblock(id: usize, on: bool) -> Result<(), i32> {
+    with_tcp(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        s.nonblock = on;
+        Ok(())
+    })
+}
+
 pub fn tcp_pending(id: usize) -> bool {
     with_tcp(|tab| {
         tab.get(id)
@@ -1683,7 +1695,7 @@ pub fn tcp_connect(id: usize, dst_ip: u32, dst_port: u16) -> Result<(), i32> {
             refs: 1,
             listen: false,
             bound: true,
-            // Принятый сокет блокирующий. Флага accept4 нет.
+            // Рождается блокирующим. SOCK_NONBLOCK ставит accept4, не слушатель.
             nonblock: false,
             wire: false,
             estab: true,
@@ -1963,6 +1975,29 @@ mod tests {
         let (rn, _, _) = tcp_recv(accepted, &mut buf).expect("eof");
         assert_eq!(rn, 0);
         tcp_close(accepted);
+        tcp_close(listener);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn accepted_tcp_starts_blocking_until_the_flag_is_set() {
+        serial_print!("test accepted_tcp_starts_blocking_until_the_flag_is_set... ");
+        let listener = tcp_open(true).expect("listen");
+        tcp_bind(listener, 0x7f00_0001, 19002).expect("bind");
+        tcp_listen(listener, 1).expect("listen");
+        let client = tcp_open(true).expect("client");
+        tcp_connect(client, 0x7f00_0001, 19002).expect("connect");
+        let (child, _, _) = tcp_accept(listener).expect("accept");
+        // Слушатель неблокирующий, ребёнок всё равно рождается блокирующим.
+        assert!(tcp_nonblock(listener));
+        assert!(!tcp_nonblock(child));
+        tcp_set_nonblock(child, true).expect("set");
+        assert!(tcp_nonblock(child));
+        tcp_set_nonblock(child, false).expect("clear");
+        assert!(!tcp_nonblock(child));
+        assert_eq!(tcp_set_nonblock(TCP_N, true).expect_err("missing"), EFAULT);
+        tcp_close(child);
+        tcp_close(client);
         tcp_close(listener);
         serial_println!("[ok]");
     }
