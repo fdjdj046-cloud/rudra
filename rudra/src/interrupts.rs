@@ -132,7 +132,7 @@ pub fn mask_irq(irq: u8) {
 extern "x86-interrupt" fn spurious_apic_handler(_stack_frame: InterruptStackFrame) {}
 
 extern "x86-interrupt" fn apic_ipi_handler(_stack_frame: InterruptStackFrame) {
-    crate::smp::record_ipi();
+    crate::smp::on_ipi();
     crate::apic::eoi();
 }
 

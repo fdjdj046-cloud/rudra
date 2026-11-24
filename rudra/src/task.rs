@@ -2492,6 +2492,445 @@ const USER_FLAGS: PageTableFlags = PageTableFlags::from_bits_truncate(
     PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits() | PageTableFlags::USER_ACCESSIBLE.bits(),
 );
 
+/// EFER без NXE: бит NX в PTE — reserved fault. `mprotect` его не ставит.
+fn prot_flags(prot: u64) -> PageTableFlags {
+    if prot == 0 {
+        PageTableFlags::PRESENT
+    } else if prot & 2 != 0 {
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+    } else {
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
+    }
+}
+
+fn align_up_page(x: u64) -> u64 {
+    x.saturating_add(0xFFF) & !0xFFF
+}
+
+/// Страницы, которые сжатый brk больше не занимает: `[align_up(new), align_up(old))`.
+fn brk_free_span(old: u64, new: u64) -> Option<(u64, u64)> {
+    if new >= old {
+        return None;
+    }
+    let start = align_up_page(new);
+    let end = align_up_page(old);
+    if end > start {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn pt_ptr(phys: u64) -> *mut PageTable {
+    let off = crate::PHYS_OFFSET.load(Ordering::Relaxed);
+    off.wrapping_add(phys) as *mut PageTable
+}
+
+fn read_pte(table: u64, index: usize) -> (u64, PageTableFlags) {
+    let ptr = pt_ptr(table);
+    let table = unsafe { &*ptr };
+    let entry = &table[index];
+    (entry.addr().as_u64(), entry.flags())
+}
+
+fn clear_pte(table: u64, index: usize) {
+    let ptr = pt_ptr(table);
+    unsafe {
+        (&mut *ptr)[index].set_unused();
+    }
+}
+
+fn set_pte_flags(table: u64, index: usize, flags: PageTableFlags) {
+    let ptr = pt_ptr(table);
+    unsafe {
+        (&mut *ptr)[index].set_flags(flags);
+    }
+}
+
+fn table_any_present(phys: u64) -> bool {
+    let table = unsafe { &*pt_ptr(phys) };
+    for i in 0..512 {
+        if table[i].flags().contains(PageTableFlags::PRESENT) {
+            return true;
+        }
+    }
+    false
+}
+
+enum Spot {
+    Missing { skip: u64 },
+    Huge,
+    Leaf { table: u64, index: usize, phys: u64 },
+}
+
+fn region_skip(va: u64, align: u64) -> u64 {
+    let base = va & !(align - 1);
+    let next = base.saturating_add(align);
+    next.saturating_sub(va).max(0x1000)
+}
+
+fn spot(l4: u64, va: u64) -> Spot {
+    let i4 = ((va >> 39) & 0x1ff) as usize;
+    let i3 = ((va >> 30) & 0x1ff) as usize;
+    let i2 = ((va >> 21) & 0x1ff) as usize;
+    let i1 = ((va >> 12) & 0x1ff) as usize;
+    let (l3, f4) = read_pte(l4, i4);
+    if !f4.contains(PageTableFlags::PRESENT) {
+        return Spot::Missing {
+            skip: region_skip(va, 1 << 39),
+        };
+    }
+    let (l2, f3) = read_pte(l3, i3);
+    if f3.contains(PageTableFlags::PRESENT) && f3.contains(PageTableFlags::HUGE_PAGE) {
+        return Spot::Huge;
+    }
+    if !f3.contains(PageTableFlags::PRESENT) {
+        return Spot::Missing {
+            skip: region_skip(va, 1 << 30),
+        };
+    }
+    let (l1, f2) = read_pte(l2, i2);
+    if f2.contains(PageTableFlags::PRESENT) && f2.contains(PageTableFlags::HUGE_PAGE) {
+        return Spot::Huge;
+    }
+    if !f2.contains(PageTableFlags::PRESENT) {
+        return Spot::Missing {
+            skip: region_skip(va, 1 << 21),
+        };
+    }
+    let (phys, f1) = read_pte(l1, i1);
+    if !f1.contains(PageTableFlags::PRESENT) {
+        return Spot::Missing { skip: 0x1000 };
+    }
+    Spot::Leaf {
+        table: l1,
+        index: i1,
+        phys,
+    }
+}
+
+fn range_has_huge(l4: u64, start: u64, end: u64) -> bool {
+    let mut va = start;
+    while va < end {
+        match spot(l4, va) {
+            Spot::Huge => return true,
+            Spot::Missing { skip } => {
+                let step = skip.min(end - va).max(0x1000);
+                let next = va.saturating_add(step);
+                if next <= va {
+                    return false;
+                }
+                va = next;
+            }
+            Spot::Leaf { .. } => va = va.saturating_add(0x1000),
+        }
+    }
+    false
+}
+
+fn aligned_user_span(start: u64, end: u64) -> Result<(), u64> {
+    if start > end || end > USER_TOP || (start & 0xFFF) != 0 || (end & 0xFFF) != 0 {
+        Err(crate::linux::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+/// `len == 0` — пустой диапазон. Иначе страницы `[addr, addr+len)` внутри 4 ГиБ.
+fn page_span(addr: u64, len: u64) -> Result<Option<(u64, u64)>, u64> {
+    if len == 0 {
+        return Ok(None);
+    }
+    if addr & 0xFFF != 0 {
+        return Err(crate::linux::EINVAL);
+    }
+    let rounded = len
+        .checked_add(0xFFF)
+        .ok_or(crate::linux::EINVAL)?
+        & !0xFFF;
+    if rounded == 0 {
+        return Ok(None);
+    }
+    let end = addr.checked_add(rounded).ok_or(crate::linux::EINVAL)?;
+    if end > USER_TOP {
+        return Err(crate::linux::EINVAL);
+    }
+    Ok(Some((addr, end)))
+}
+
+/// Снять лист и пустые таблицы над ним. L4 не трогает. Кадры только в список.
+fn clear_leaf(l4: u64, va: u64, freed: &mut Vec<u64>) {
+    let Spot::Leaf {
+        table: l1,
+        index: i1,
+        phys,
+    } = spot(l4, va)
+    else {
+        return;
+    };
+    clear_pte(l1, i1);
+    freed.push(phys);
+    let i4 = ((va >> 39) & 0x1ff) as usize;
+    let i3 = ((va >> 30) & 0x1ff) as usize;
+    let i2 = ((va >> 21) & 0x1ff) as usize;
+    let (l3, f4) = read_pte(l4, i4);
+    if !f4.contains(PageTableFlags::PRESENT) {
+        return;
+    }
+    let (l2, f3) = read_pte(l3, i3);
+    if !f3.contains(PageTableFlags::PRESENT) || f3.contains(PageTableFlags::HUGE_PAGE) {
+        return;
+    }
+    if table_any_present(l1) {
+        return;
+    }
+    let (still, f2) = read_pte(l2, i2);
+    if !f2.contains(PageTableFlags::PRESENT) || still != l1 || f2.contains(PageTableFlags::HUGE_PAGE)
+    {
+        return;
+    }
+    clear_pte(l2, i2);
+    freed.push(l1);
+    if table_any_present(l2) {
+        return;
+    }
+    let (still3, f3b) = read_pte(l3, i3);
+    if !f3b.contains(PageTableFlags::PRESENT)
+        || still3 != l2
+        || f3b.contains(PageTableFlags::HUGE_PAGE)
+    {
+        return;
+    }
+    clear_pte(l3, i3);
+    freed.push(l2);
+    if table_any_present(l3) {
+        return;
+    }
+    let (still4, f4b) = read_pte(l4, i4);
+    if !f4b.contains(PageTableFlags::PRESENT) || still4 != l3 {
+        return;
+    }
+    clear_pte(l4, i4);
+    freed.push(l3);
+}
+
+/// Правка таблиц без отдачи кадров. Вызывающий держит лок АП, если оно общее.
+fn unmap_edit(l4: PhysFrame, start: u64, end: u64, freed: &mut Vec<u64>) -> Result<(), u64> {
+    aligned_user_span(start, end)?;
+    if start == end {
+        return Ok(());
+    }
+    let l4p = l4.start_address().as_u64();
+    if range_has_huge(l4p, start, end) {
+        return Err(crate::linux::EINVAL);
+    }
+    let mut va = start;
+    while va < end {
+        let step = match spot(l4p, va) {
+            Spot::Huge => 0x1000,
+            Spot::Missing { skip } => skip.min(end - va).max(0x1000),
+            Spot::Leaf { .. } => {
+                clear_leaf(l4p, va, freed);
+                0x1000
+            }
+        };
+        let next = va.saturating_add(step);
+        if next <= va {
+            break;
+        }
+        va = next;
+    }
+    Ok(())
+}
+
+fn commit_free(l4: PhysFrame, freed: Vec<u64>) -> Result<(), u64> {
+    if freed.is_empty() {
+        return Ok(());
+    }
+    let cr3 = l4.start_address().as_u64();
+    if !crate::smp::shootdown(cr3) {
+        serial_println!(
+            "[mm] tlb shootdown timed out, leaking {} frames",
+            freed.len()
+        );
+        return Ok(());
+    }
+    crate::memory::with_frame_allocator(|fa| {
+        for phys in freed {
+            if let Ok(frame) = PhysFrame::from_start_address(PhysAddr::new(phys)) {
+                fa.deallocate_frame(frame);
+            }
+        }
+    });
+    Ok(())
+}
+
+fn unmap_with(
+    start: u64,
+    end: u64,
+    edit: impl FnOnce(&mut Vec<u64>) -> Result<PhysFrame, u64>,
+) -> Result<(), u64> {
+    aligned_user_span(start, end)?;
+    if start == end {
+        return Ok(());
+    }
+    let pages = ((end - start) / 4096) as usize;
+    let mut freed = Vec::new();
+    let need = pages.saturating_add(pages / 512).saturating_add(16);
+    if freed.try_reserve(need).is_err() {
+        return Err(crate::linux::ENOMEM);
+    }
+    let l4 = edit(&mut freed)?;
+    commit_free(l4, freed)
+}
+
+#[cfg(test)]
+fn unmap_user(l4: PhysFrame, start: u64, end: u64) -> Result<(), u64> {
+    unmap_with(start, end, |freed| {
+        unmap_edit(l4, start, end, freed)?;
+        Ok(l4)
+    })
+}
+
+fn unmap_aspace(aspace: &Mutex<AddressSpace>, start: u64, end: u64) -> Result<(), u64> {
+    unmap_with(start, end, |freed| {
+        let g = aspace.lock();
+        unmap_edit(g.l4, start, end, freed)?;
+        Ok(g.l4)
+    })
+}
+
+fn protect_edit(l4: PhysFrame, start: u64, end: u64, flags: PageTableFlags) -> Result<(), u64> {
+    aligned_user_span(start, end)?;
+    if start == end {
+        return Ok(());
+    }
+    let l4p = l4.start_address().as_u64();
+    let mut va = start;
+    while va < end {
+        match spot(l4p, va) {
+            Spot::Huge => return Err(crate::linux::EINVAL),
+            Spot::Missing { .. } => return Err(crate::linux::ENOMEM),
+            Spot::Leaf { .. } => va = va.saturating_add(0x1000),
+        }
+    }
+    va = start;
+    while va < end {
+        if let Spot::Leaf { table, index, .. } = spot(l4p, va) {
+            set_pte_flags(table, index, flags);
+        }
+        va = va.saturating_add(0x1000);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn leaf_of(l4: PhysFrame, va: u64) -> Option<(u64, PageTableFlags)> {
+    match spot(l4.start_address().as_u64(), va) {
+        Spot::Leaf { table, index, phys } => {
+            let (_, flags) = read_pte(table, index);
+            Some((phys, flags))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn plant_huge_pde(l4: PhysFrame, va: u64) {
+    let l4p = l4.start_address().as_u64();
+    let i4 = ((va >> 39) & 0x1ff) as usize;
+    let i3 = ((va >> 30) & 0x1ff) as usize;
+    let i2 = ((va >> 21) & 0x1ff) as usize;
+    let (l3, _) = read_pte(l4p, i4);
+    let (l2, _) = read_pte(l3, i3);
+    let flags =
+        PageTableFlags::PRESENT | PageTableFlags::HUGE_PAGE | PageTableFlags::USER_ACCESSIBLE;
+    unsafe {
+        (&mut *pt_ptr(l2))[i2].set_addr(PhysAddr::new(0x200000), flags);
+    }
+}
+
+#[cfg(test)]
+fn protect_user(l4: PhysFrame, start: u64, end: u64, prot: u64) -> Result<(), u64> {
+    if prot & !7 != 0 {
+        return Err(crate::linux::EINVAL);
+    }
+    aligned_user_span(start, end)?;
+    if start == end {
+        return Ok(());
+    }
+    let flags = prot_flags(prot);
+    protect_edit(l4, start, end, flags)?;
+    if !crate::smp::shootdown(l4.start_address().as_u64()) {
+        serial_println!("[mm] tlb shootdown timed out after mprotect");
+    }
+    Ok(())
+}
+
+fn protect_aspace(aspace: &Mutex<AddressSpace>, start: u64, end: u64, prot: u64) -> Result<(), u64> {
+    if prot & !7 != 0 {
+        return Err(crate::linux::EINVAL);
+    }
+    aligned_user_span(start, end)?;
+    if start == end {
+        return Ok(());
+    }
+    let flags = prot_flags(prot);
+    let l4 = {
+        let g = aspace.lock();
+        protect_edit(g.l4, start, end, flags)?;
+        g.l4
+    };
+    if !crate::smp::shootdown(l4.start_address().as_u64()) {
+        serial_println!("[mm] tlb shootdown timed out after mprotect");
+    }
+    Ok(())
+}
+
+fn current_aspace() -> Option<Arc<Mutex<AddressSpace>>> {
+    let cur = current_slot();
+    if cur < 0 {
+        return None;
+    }
+    with_tasks(|tasks| tasks[cur as usize].as_ref().map(|t| t.aspace.clone()))
+}
+
+/// `mprotect`. Дыра в диапазоне — `ENOMEM`, правка не начинается.
+/// Огромная страница — `EINVAL`. `PROT_EXEC` принимается, NX не ставится.
+pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    if prot & !7 != 0 {
+        return crate::linux::EINVAL;
+    }
+    let (start, end) = match page_span(addr, len) {
+        Ok(Some(span)) => span,
+        Ok(None) => return 0,
+        Err(e) => return e,
+    };
+    let Some(aspace) = current_aspace() else {
+        return crate::linux::EINVAL;
+    };
+    match protect_aspace(&aspace, start, end, prot) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// `munmap`. Дыры внутри диапазона — успех. Кадр уходит после сброса TLB.
+pub fn sys_munmap(addr: u64, len: u64) -> u64 {
+    let (start, end) = match page_span(addr, len) {
+        Ok(Some(span)) => span,
+        Ok(None) => return 0,
+        Err(e) => return e,
+    };
+    let Some(aspace) = current_aspace() else {
+        return crate::linux::EINVAL;
+    };
+    match unmap_aspace(&aspace, start, end) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
 /// Глубокая копия userspace-части АП (L4[0] целиком): все таблицы и страницы.
 /// Только 4K-страницы (huge pages мы никогда не создаём).
 fn copy_user_space(
@@ -4510,27 +4949,38 @@ pub fn sys_brk(addr: u64) -> u64 {
         }
         a.brk = addr;
     }
-    // Маппим недостающие страницы (сжатие не демаппим — фреймы текут).
+    // Рост маппит недостающие страницы. Сжатие снимает целые страницы ниже нового brk.
     if addr > old_brk {
         let grow_start = (old_brk + 0xFFF) & !0xFFF;
         let grow_end = addr & !0xFFF;
         if grow_end >= grow_start {
-            let r = crate::memory::with_frame_allocator(|fa| {
-                map_range_zeroed(
-                    l4,
-                    VirtAddr::new(grow_start),
-                    VirtAddr::new(grow_end),
-                    fa,
-                    USER_FLAGS,
-                )
-            });
+            let r = {
+                let _guard = aspace.lock();
+                crate::memory::with_frame_allocator(|fa| {
+                    map_range_zeroed(
+                        l4,
+                        VirtAddr::new(grow_start),
+                        VirtAddr::new(grow_end),
+                        fa,
+                        USER_FLAGS,
+                    )
+                })
+            };
             if r.is_err() {
                 let mut a = aspace.lock();
                 a.brk = old_brk;
                 return old_brk;
             }
         }
+        return addr;
     }
+    if let Some((start, end)) = brk_free_span(old_brk, addr) {
+        if unmap_aspace(&aspace, start, end).is_err() {
+            aspace.lock().brk = old_brk;
+            return old_brk;
+        }
+    }
+    aspace.lock().brk = addr;
     addr
 }
 
@@ -4569,16 +5019,26 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
     if base + pages * 0x1000 > MMAP_TOP {
         return ENOMEM;
     }
-    let l4 = aspace.lock().l4;
-    let r = crate::memory::with_frame_allocator(|fa| {
-        map_range_zeroed(
-            l4,
-            VirtAddr::new(base),
-            VirtAddr::new(base + pages * 0x1000 - 1),
-            fa,
-            USER_FLAGS,
-        )
-    });
+    let fixed = addr != 0 && (flags & MAP_FIXED) != 0;
+    if fixed {
+        let end = base + pages * 0x1000;
+        if let Err(e) = unmap_aspace(&aspace, base, end) {
+            return e;
+        }
+    }
+    let r = {
+        let guard = aspace.lock();
+        let l4 = guard.l4;
+        crate::memory::with_frame_allocator(|fa| {
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(base),
+                VirtAddr::new(base + pages * 0x1000 - 1),
+                fa,
+                USER_FLAGS,
+            )
+        })
+    };
     match r {
         Ok(()) => base,
         Err(_) => ENOMEM,
@@ -4727,15 +5187,18 @@ pub fn alloc_thread_stack() -> Option<u64> {
     };
     let top = THREAD_STACK_BASE + idx * THREAD_STACK_SIZE + THREAD_STACK_SIZE / 2;
     let base = top - THREAD_STACK_SIZE / 2;
-    let r = crate::memory::with_frame_allocator(|fa| {
-        map_range_zeroed(
-            l4,
-            VirtAddr::new(base),
-            VirtAddr::new(top - 1),
-            fa,
-            USER_FLAGS,
-        )
-    });
+    let r = {
+        let _guard = aspace.lock();
+        crate::memory::with_frame_allocator(|fa| {
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(base),
+                VirtAddr::new(top - 1),
+                fa,
+                USER_FLAGS,
+            )
+        })
+    };
     r.ok().map(|_| top)
 }
 
@@ -7596,6 +8059,124 @@ mod tests {
         assert_eq!(got[4], 0x66);
         assert_eq!(got[5], 0x55 + bias);
         assert_eq!(got[6], 7 + bias);
+        serial_println!("[ok]");
+    }
+
+    /// Средняя страница уходит в список кадров, соседи остаются.
+    /// `mprotect` меняет биты и не ставит NX. Огромная страница — отказ до правки.
+    #[test_case]
+    fn munmap_returns_the_frame_and_mprotect_changes_bits() {
+        serial_print!("test munmap_returns_the_frame_and_mprotect_changes_bits... ");
+        assert_eq!(
+            brk_free_span(0x1000_1000, 0x1000_0000),
+            Some((0x1000_0000, 0x1000_1000))
+        );
+        assert_eq!(
+            brk_free_span(0x1000_0100, 0x1000_0000),
+            Some((0x1000_0000, 0x1000_1000))
+        );
+        assert_eq!(brk_free_span(0x1001, 0x1000), Some((0x1000, 0x2000)));
+        assert_eq!(brk_free_span(0x2000, 0x1800), None);
+        assert_eq!(brk_free_span(0x2800, 0x1800), Some((0x2000, 0x3000)));
+        assert_eq!(sys_munmap(0, 0), 0);
+        assert_eq!(sys_munmap(0x1001, 0x1000), crate::linux::EINVAL);
+        assert_eq!(sys_mprotect(0x1000, 0x1000, 8), crate::linux::EINVAL);
+        assert_eq!(sys_munmap(0x1000, 0x1000), crate::linux::EINVAL);
+
+        const BASE: u64 = 0x5000_0000;
+        let (l4, phys) = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let mut phys = [0u64; 3];
+            for i in 0..3u64 {
+                let va = BASE + i * 0x1000;
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+                map_zeroed(l4, page, fa, USER_FLAGS).expect("map");
+                phys[i as usize] = leaf_of(l4, va).expect("leaf").0;
+            }
+            (l4, phys)
+        });
+
+        assert_eq!(
+            protect_user(l4, BASE + 0x2000, BASE + 0x4000, 1),
+            Err(crate::linux::ENOMEM)
+        );
+        assert!(leaf_of(l4, BASE + 0x2000)
+            .unwrap()
+            .1
+            .contains(PageTableFlags::WRITABLE));
+
+        assert!(protect_user(l4, BASE + 0x1000, BASE + 0x2000, 1).is_ok());
+        let (_, f) = leaf_of(l4, BASE + 0x1000).unwrap();
+        assert!(f.contains(PageTableFlags::PRESENT));
+        assert!(f.contains(PageTableFlags::USER_ACCESSIBLE));
+        assert!(!f.contains(PageTableFlags::WRITABLE));
+        assert!(!f.contains(PageTableFlags::NO_EXECUTE));
+
+        assert!(protect_user(l4, BASE + 0x1000, BASE + 0x2000, 0).is_ok());
+        let (_, f) = leaf_of(l4, BASE + 0x1000).unwrap();
+        assert!(f.contains(PageTableFlags::PRESENT));
+        assert!(!f.contains(PageTableFlags::USER_ACCESSIBLE));
+
+        assert!(protect_user(l4, BASE + 0x1000, BASE + 0x2000, 3).is_ok());
+        let (_, f) = leaf_of(l4, BASE + 0x1000).unwrap();
+        assert!(f.contains(PageTableFlags::WRITABLE) && f.contains(PageTableFlags::USER_ACCESSIBLE));
+
+        assert!(protect_user(l4, BASE + 0x1000, BASE + 0x2000, 4).is_ok());
+        let (_, f) = leaf_of(l4, BASE + 0x1000).unwrap();
+        assert!(f.contains(PageTableFlags::USER_ACCESSIBLE));
+        assert!(!f.contains(PageTableFlags::WRITABLE));
+        assert!(!f.contains(PageTableFlags::NO_EXECUTE));
+        assert!(protect_user(l4, BASE + 0x1000, BASE + 0x2000, 3).is_ok());
+
+        assert_eq!(
+            unmap_user(l4, BASE + 0x1001, BASE + 0x2000),
+            Err(crate::linux::EINVAL)
+        );
+        assert!(leaf_of(l4, BASE + 0x1000).is_some());
+        assert!(unmap_user(l4, BASE + 0x3000, BASE + 0x4000).is_ok());
+
+        plant_huge_pde(l4, 0x5020_0000);
+        assert_eq!(
+            unmap_user(l4, 0x5020_0000, 0x5020_1000),
+            Err(crate::linux::EINVAL)
+        );
+        assert_eq!(leaf_of(l4, BASE).unwrap().0, phys[0]);
+        assert_eq!(leaf_of(l4, BASE + 0x1000).unwrap().0, phys[1]);
+        assert_eq!(leaf_of(l4, BASE + 0x2000).unwrap().0, phys[2]);
+
+        x86_64::instructions::interrupts::disable();
+        assert!(unmap_user(l4, BASE + 0x1000, BASE + 0x2000).is_ok());
+        assert!(leaf_of(l4, BASE + 0x1000).is_none());
+        assert_eq!(leaf_of(l4, BASE).unwrap().0, phys[0]);
+        assert_eq!(leaf_of(l4, BASE + 0x2000).unwrap().0, phys[2]);
+        let got = crate::memory::with_frame_allocator(|fa| {
+            fa.allocate_frame()
+                .expect("reuse")
+                .start_address()
+                .as_u64()
+        });
+        assert!(unmap_user(l4, BASE, BASE + 0x1000).is_ok());
+        assert!(unmap_user(l4, BASE + 0x2000, BASE + 0x3000).is_ok());
+        let uniq = crate::memory::with_frame_allocator(|fa| {
+            free_user_space(l4, fa);
+            let mut out = [0u64; 8];
+            for slot in &mut out {
+                *slot = fa
+                    .allocate_frame()
+                    .expect("frame")
+                    .start_address()
+                    .as_u64();
+            }
+            out
+        });
+        x86_64::instructions::interrupts::enable();
+        assert_eq!(got, phys[1]);
+        for i in 0..uniq.len() {
+            assert_ne!(uniq[i], phys[1]);
+            for j in 0..i {
+                assert_ne!(uniq[i], uniq[j]);
+            }
+        }
         serial_println!("[ok]");
     }
 }

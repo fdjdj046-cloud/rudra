@@ -3,10 +3,12 @@
 //! AP поднимается SIPI в длинный режим, получает свой TSS и тик LAPIC
 //! и исполняет задачи, у которых `Task::cpu` равен его индексу.
 //! Кадр, застигнутый в ядре, на другой CPU не переносится.
-//! IPI с вектором [`IPI_VECTOR`] только считает попадания.
+//! IPI с вектором [`IPI_VECTOR`] считает попадания. Тот же вектор
+//! сбрасывает TLB, если ядро попросило shootdown этого CR3.
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{FrameAllocator, PageTable, PageTableFlags, PhysFrame};
 use x86_64::PhysAddr;
@@ -101,6 +103,95 @@ pub fn ipi_seen() -> u64 {
 
 pub fn record_ipi() {
     IPI_COUNT.fetch_add(1, Ordering::Release);
+}
+
+/// Поколение shootdown. 0 — запроса ещё не было, обработчик только считает IPI.
+static SHOOT_GEN: AtomicU64 = AtomicU64::new(0);
+static SHOOT_CR3: AtomicU64 = AtomicU64::new(0);
+static SHOOT_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Ждёт ответа. Обработчик IPI его не берёт: иначе два CPU взаимно не ответят.
+static SHOOT_LOCK: Mutex<()> = Mutex::new(());
+
+fn cpu_registered(cpu: usize) -> bool {
+    if cpu == 0 {
+        return true;
+    }
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    let id = APIC_IDS[cpu].load(Ordering::Relaxed);
+    if id > 255 {
+        return false;
+    }
+    APIC_INDEX[id as usize].load(Ordering::Acquire) == cpu as u8
+}
+
+fn flush_if_cr3(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let (frame, _) = Cr3::read();
+    if frame.start_address().as_u64() == cr3 {
+        x86_64::instructions::tlb::flush_all();
+    }
+}
+
+/// IPI: счётчик для `ping_aps` и ответ на текущий shootdown.
+/// Лок shootdown и аллокатор кадров здесь не берутся.
+pub fn on_ipi() {
+    record_ipi();
+    let gen = SHOOT_GEN.load(Ordering::Acquire);
+    if gen == 0 {
+        return;
+    }
+    flush_if_cr3(SHOOT_CR3.load(Ordering::Acquire));
+    let cpu = this_cpu();
+    if cpu < MAX_CPUS {
+        SHOOT_ACK[cpu].store(gen, Ordering::Release);
+    }
+}
+
+/// Сбросить TLB `cr3` на каждом CPU, который его сейчас держит.
+/// `false` — кто-то не ответил. Кадр после этого отдавать нельзя.
+/// Ждущий не держит аллокатор кадров. Чужой IPI он принимает, если IF включён.
+pub fn shootdown(cr3: u64) -> bool {
+    let _guard = SHOOT_LOCK.lock();
+    SHOOT_CR3.store(cr3, Ordering::Relaxed);
+    let gen = SHOOT_GEN.fetch_add(1, Ordering::Release).wrapping_add(1);
+    let me = this_cpu().min(MAX_CPUS - 1);
+    let n = (cpu_count() as usize).min(MAX_CPUS);
+    let mut wait = [false; MAX_CPUS];
+    for cpu in 0..n {
+        if cpu == me || !cpu_registered(cpu) {
+            continue;
+        }
+        let id = APIC_IDS[cpu].load(Ordering::Relaxed);
+        if !crate::apic::send_fixed(id, IPI_VECTOR) {
+            crate::serial_println!("[smp] tlb ipi to {} failed", id);
+            flush_if_cr3(cr3);
+            return false;
+        }
+        wait[cpu] = true;
+    }
+    flush_if_cr3(cr3);
+    let deadline = crate::time::monotonic_ns().saturating_add(50_000_000);
+    loop {
+        let mut done = true;
+        for cpu in 0..n {
+            if wait[cpu] && SHOOT_ACK[cpu].load(Ordering::Acquire) < gen {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            return true;
+        }
+        if crate::time::monotonic_ns() > deadline {
+            crate::serial_println!("[smp] tlb shootdown timeout gen {}", gen);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// CPU, на котором выполняется этот код. До карты APIC и до регистрации — 0.

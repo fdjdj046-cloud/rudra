@@ -4,7 +4,7 @@
 //! Реализовано подмножество syscall'ов x86_64: файловый ввод-вывод поверх
 //! ext2 (если смонтирован) или RFS2 (open/openat/read/write/close/lseek/
 //! dup2/fcntl), каталоги (getdents64/stat/newfstatat/statx/mkdir/rmdir/
-//! unlink/rename/chdir/getcwd), память (brk/mmap/munmap/mprotect), процессы
+//! unlink/rename/chdir/getcwd), память (brk/mmap, munmap отдаёт кадры, mprotect меняет PTE), процессы
 //! (clone/fork/execve/wait4/exit) и pthreads (clone с CLONE_VM, futex,
 //! arch_prctl, set_tid_address/robust_list), pipe/pipe2, poll, время,
 //! uname, reboot, getrandom и мелочь.
@@ -20,7 +20,9 @@
 //! epoll — level и edge по номеру fd. poll и select видят готовый epoll-fd.
 //! `FD_CLOEXEC` хранится на номере: `O_CLOEXEC`, `SOCK_CLOEXEC`, `EPOLL_CLOEXEC`,
 //! `pipe2` и `fcntl(F_SETFD)`. `execve` такие номера закрывает.
-//! Файловый mmap возвращает ENODEV. `futex WAIT/WAKE` будит ждущих.
+//! Файловый mmap возвращает ENODEV. `munmap` отдаёт кадр после сброса TLB.
+//! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
+//! `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
 
@@ -531,7 +533,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         291 => sys_epoll_create(a1),
         8 => sys_lseek(a1, a2 as i64, a3),
         9 => task::sys_mmap(a1, a2, a3, a4, a5, a6),
-        10 | 11 => 0, // mprotect / munmap: без noop (память текёт, ох)
+        10 => task::sys_mprotect(a1, a2, a3),
+        11 => task::sys_munmap(a1, a2),
         12 => task::sys_brk(a1),
         13 => crate::signal::sys_rt_sigaction(a1, a2, a3, a4),
         14 => crate::signal::sys_rt_sigprocmask(a1, a2, a3, a4),
@@ -555,7 +558,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         293 => sys_pipe(a1, a2),
         23 => sys_select(a1, a2, a3, a4, a5),
         24 => 0, // sched_yield: PIT и так вытесняет
-        28 => 0, // madvise
+        28 => 0, // madvise: страницы не отдаются
         32 => sys_dup(a1),
         33 => sys_dup2(a1, a2),
         35 => sleep_timespec(a1, a2, false),
