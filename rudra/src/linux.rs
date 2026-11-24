@@ -23,6 +23,9 @@
 //! `accept` (43) отдаёт блокирующий сокет без этого бита. `accept4` (288)
 //! принимает только `SOCK_NONBLOCK` и `SOCK_CLOEXEC`; другой бит — `EINVAL`
 //! до поиска fd.
+//! `dup3` (292) — это `dup2` плюс флаг: только `O_CLOEXEC`, иначе `EINVAL`
+//! до поиска fd. `old == new` у `dup3` — `EINVAL`. Вытесненный номер
+//! закрывается как `close`, включая сброс буфера файла.
 //! Файловый mmap возвращает ENODEV. `munmap` отдаёт кадр после сброса TLB.
 //! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
 //! `futex WAIT/WAKE` будит ждущих.
@@ -564,6 +567,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         28 => 0, // madvise: страницы не отдаются
         32 => sys_dup(a1),
         33 => sys_dup2(a1, a2),
+        292 => sys_dup3(a1, a2, a3),
         35 => sleep_timespec(a1, a2, false),
         230 => {
             // clock_nanosleep(clockid, flags, req, rem). TIMER_ABSTIME = 1.
@@ -1615,11 +1619,15 @@ fn sys_close(fd: u64) -> u64 {
         fds.set_cloexec(fd, false);
         fds[fd as usize].take()
     });
-    let obj = match taken {
-        Ok(Some(obj)) => obj,
-        Ok(None) => return EBADF,
-        Err(e) => return e,
-    };
+    match taken {
+        Ok(Some(obj)) => finish_close(obj, fd),
+        Ok(None) => EBADF,
+        Err(e) => e,
+    }
+}
+
+/// Закрыть описание, уже снятое с номера: сброс dirty, концы pipe, сокет, epoll.
+fn finish_close(obj: Fd, fd: u64) -> u64 {
     let (ep_id, flushed) = match &obj {
         Fd::File { name, dirty: Some(data), .. } => {
             (None, crate::fs::write_canon(name, data).map(|_| ()))
@@ -2096,44 +2104,69 @@ fn sys_dup(fd: u64) -> u64 {
 }
 
 fn sys_dup2(old: u64, new: u64) -> u64 {
+    // Совпадение номеров не трогает FD_CLOEXEC. У dup3 это EINVAL.
     if old == new {
         return match with_fd(old, |_| ()) {
             Ok(()) => old,
             Err(e) => e,
         };
     }
+    sys_dup3(old, new, 0)
+}
+
+fn sys_dup3(old: u64, new: u64, flags: u64) -> u64 {
+    const O_CLOEXEC: u64 = 0x80000;
+    // Linux смотрит флаги и совпадение номеров раньше fd.
+    if flags & !O_CLOEXEC != 0 {
+        return EINVAL;
+    }
+    if old == new {
+        return EINVAL;
+    }
     if new >= 64 {
         return EMFILE;
     }
+    let cloexec = flags & O_CLOEXEC != 0;
     match with_fd(old, |f| f.clone_fd()) {
         Ok(clone) => {
-            with_current_fds(|fds| {
-                let i = new as usize;
-                if i >= fds.len() {
-                    fds.resize(i + 1, None);
-                }
-                if let Some(prev) = fds[i].take() {
-                    match &prev {
-                        Fd::Pipe { id, writable } => pipe_close_end(*id, *writable),
-                        Fd::Udp { id } => crate::net::udp_close(*id),
-                        Fd::Tcp { id } => crate::net::tcp_close(*id),
-                        _ => {}
+            // Замыкание забирает копию только если таблица есть. Иначе ссылку
+            // надо отпустить: Drop у Fd этого не делает.
+            let mut slot = Some(clone);
+            let placed = with_current_fds(|fds| {
+                let clone = slot.take().expect("dup clone");
+                place_dup(fds, new, clone, cloexec)
+            });
+            match placed {
+                Ok(prev) => {
+                    // Ошибка сброса не отменяет уже выданный номер.
+                    if let Some(prev) = prev {
+                        let _ = finish_close(prev, new);
                     }
-                    let ep = match prev {
-                        Fd::Epoll { id } => Some(id),
-                        _ => None,
-                    };
-                    epoll_on_close(ep, new);
+                    new
                 }
-                fds[i] = Some(clone);
-                // dup2 сбрасывает FD_CLOEXEC у нового номера. old == new сюда не входит.
-                fds.set_cloexec(new, false);
-                new
-            })
-            .unwrap_or(EMFILE)
+                Err(e) => {
+                    if let Some(left) = slot.take() {
+                        release_clone(left);
+                    }
+                    e
+                }
+            }
         }
         Err(e) => e,
     }
+}
+
+/// Поставить копию на номер `new`. Прежний описатель возвращается вызывающему,
+/// чтобы закрыть его уже без лока таблицы.
+fn place_dup(fds: &mut Fds, new: u64, clone: Fd, cloexec: bool) -> Option<Fd> {
+    let i = new as usize;
+    if i >= fds.len() {
+        fds.resize(i + 1, None);
+    }
+    let prev = fds[i].take();
+    fds[i] = Some(clone);
+    fds.set_cloexec(new, cloexec);
+    prev
 }
 
 /// Снять лишнюю ссылку, если копия дескриптора так и не встала в таблицу.
@@ -3189,6 +3222,69 @@ mod tests {
         assert!(!marked[0]);
         assert!(!marked[2]);
         assert!(!marked[3]);
+        crate::serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn dup3_sets_cloexec_and_rejects_before_the_fd() {
+        crate::serial_print!("test dup3_sets_cloexec_and_rejects_before_the_fd... ");
+        // Чужой бит и old == new — EINVAL до поиска fd. Раннер — не задача.
+        assert_eq!(sys_dup3(0, 1, 1), EINVAL);
+        assert_eq!(sys_dup3(0, 1, 0x800), EINVAL);
+        assert_eq!(sys_dup3(0, 0, 0), EINVAL);
+        assert_eq!(sys_dup3(4, 4, 0x80000), EINVAL);
+        assert_eq!(sys_dup3(99, 64, 1), EINVAL);
+        assert_eq!(sys_dup3(99, 64, 0), EMFILE);
+        assert_eq!(sys_dup3(99, 64, 0x80000), EMFILE);
+        // Верные флаги доходят до таблицы. Без задачи это EPERM.
+        assert_eq!(sys_dup3(0, 1, 0), EPERM);
+        assert_eq!(sys_dup3(0, 1, 0x80000), EPERM);
+
+        let mut fds = Fds::new(alloc::vec![
+            Some(Fd::console(false)),
+            Some(Fd::console(true)),
+        ]);
+        fds.set_cloexec(0, true);
+        fds.set_cloexec(1, true);
+        let prev = place_dup(&mut fds, 1, Fd::console(false), true);
+        assert!(matches!(prev, Some(Fd::Console { writable: true })));
+        assert!(fds.is_cloexec(0));
+        assert!(fds.is_cloexec(1));
+        // Флаги 0 сбрасывают бит нового номера. Бит источника остаётся.
+        let prev = place_dup(&mut fds, 1, Fd::console(false), false);
+        assert!(prev.is_some());
+        assert!(fds.is_cloexec(0));
+        assert!(!fds.is_cloexec(1));
+        let prev = place_dup(&mut fds, 3, Fd::console(true), true);
+        assert!(prev.is_none());
+        assert!(fds[2].is_none());
+        assert!(!fds.is_cloexec(2));
+        assert!(fds.is_cloexec(3));
+
+        // Вытесненный конец канала закрывается так же, как close.
+        let id = {
+            let mut pipes = PIPES.lock();
+            pipes.push(Some(PipeChan {
+                ring: Box::new([0u8; PIPE_CAP]),
+                head: 0,
+                len: 0,
+                readers: 1,
+                writers: 1,
+            }));
+            pipes.len() - 1
+        };
+        let prev = place_dup(&mut fds, 1, Fd::Pipe { id, writable: false }, false);
+        assert!(matches!(prev, Some(Fd::Console { .. })));
+        let prev = place_dup(&mut fds, 1, Fd::console(false), false).expect("pipe");
+        assert_eq!(finish_close(prev, 63), 0);
+        {
+            let pipes = PIPES.lock();
+            let p = pipes[id].as_ref().expect("chan");
+            assert_eq!(p.readers, 0);
+            assert_eq!(p.writers, 1);
+        }
+        assert_eq!(finish_close(Fd::Pipe { id, writable: true }, 63), 0);
+        assert!(PIPES.lock()[id].is_none());
         crate::serial_println!("[ok]");
     }
 
