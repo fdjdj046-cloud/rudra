@@ -39,6 +39,9 @@
 //! epoll — `EINVAL`. Канал с `O_NONBLOCK` отдаёт `EAGAIN`, когда читать нечего
 //! или писать некуда. `pipe2` принимает `O_NONBLOCK` и `O_CLOEXEC`. Пустая
 //! консоль с этим флагом — `EAGAIN`. `epoll_wait` ждёт по своему таймауту.
+//! `membarrier` `QUERY` возвращает только `GLOBAL`. `GLOBAL` барьером IPI
+//! проходит каждый другой поднятый CPU. Другая команда и ненулевые флаги —
+//! `EINVAL`. Молчание IPI — `EAGAIN`, не успех.
 //! `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
@@ -542,6 +545,28 @@ fn write_console_stat(buf: u64) {
     );
 }
 
+/// `membarrier`. `QUERY` (0) отдаёт бит `GLOBAL` (1). Ускоренные, частные
+/// и rseq-команды не обещаны. `cpu_id` не читается: флаг `MEMBARRIER_CMD_FLAG_CPU`
+/// тоже `EINVAL`.
+fn sys_membarrier(cmd: u64, flags: u64, _cpu: u64) -> u64 {
+    const QUERY: u64 = 0;
+    const GLOBAL: u64 = 1;
+    if flags != 0 {
+        return EINVAL;
+    }
+    match cmd {
+        QUERY => GLOBAL,
+        GLOBAL => {
+            if crate::smp::membarrier_global() {
+                0
+            } else {
+                EAGAIN
+            }
+        }
+        _ => EINVAL,
+    }
+}
+
 // ---- Диспетчер ----
 
 static SEEN_UNKNOWN: Mutex<[u64; 16]> = Mutex::new([u64::MAX; 16]);
@@ -923,7 +948,7 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
             }
             a2
         }
-        324 => 0, // membarrier
+        324 => sys_membarrier(a1, a2, a3),
         332 => sys_statx(a1, a2, a3, a4, a5),
         334 => task::sys_rseq(a1, a2, a3, a4),
         1000 => {
@@ -4354,6 +4379,26 @@ mod tests {
         assert_eq!(fd_status_flags(&ep), 2);
         epoll_decref(eid);
 
+        crate::serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn membarrier_global_barriers_other_cpus() {
+        crate::serial_print!("test membarrier_global_barriers_other_cpus... ");
+        // Ускоренные и частные команды не обещаны. Флаги — до работы.
+        assert_eq!(sys_membarrier(0, 1, 0), EINVAL);
+        assert_eq!(sys_membarrier(1, 1, 0), EINVAL);
+        assert_eq!(sys_membarrier(2, 0, 0), EINVAL);
+        assert_eq!(sys_membarrier(8, 0, 0), EINVAL);
+        assert_eq!(sys_membarrier(0, 0, 0), 1);
+        assert!(crate::smp::aps_online() >= 1, "no other cpu");
+        let before = crate::smp::membarrier_hits();
+        assert_eq!(sys_membarrier(1, 0, u64::MAX), 0);
+        let n = u64::from(crate::smp::aps_online());
+        assert_eq!(crate::smp::membarrier_hits().wrapping_sub(before), n);
+        let mid = crate::smp::membarrier_hits();
+        assert_eq!(sys_membarrier(1, 0, 0), 0);
+        assert_eq!(crate::smp::membarrier_hits().wrapping_sub(mid), n);
         crate::serial_println!("[ok]");
     }
 }

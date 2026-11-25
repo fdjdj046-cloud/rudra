@@ -75,6 +75,7 @@ lazy_static! {
         }
         idt[0xFFu8].set_handler_fn(spurious_apic_handler);
         idt[crate::smp::IPI_VECTOR].set_handler_fn(apic_ipi_handler);
+        idt[crate::smp::MB_VECTOR].set_handler_fn(membarrier_ipi_handler);
         idt
     };
 }
@@ -133,6 +134,11 @@ extern "x86-interrupt" fn spurious_apic_handler(_stack_frame: InterruptStackFram
 
 extern "x86-interrupt" fn apic_ipi_handler(_stack_frame: InterruptStackFrame) {
     crate::smp::on_ipi();
+    crate::apic::eoi();
+}
+
+extern "x86-interrupt" fn membarrier_ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::smp::on_membarrier_ipi();
     crate::apic::eoi();
 }
 

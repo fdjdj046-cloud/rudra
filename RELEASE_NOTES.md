@@ -143,7 +143,7 @@ GitHub Actions после тестов ядра собирает образ и �
 | 218 | set_tid_address |
 | 273, 274 | robust_list: успех |
 | 318 | getrandom: не криптостойкий xorshift от RDTSC |
-| 324 | membarrier: успех |
+| 324 | membarrier. `QUERY` — только `GLOBAL`. `GLOBAL` — барьер IPI на каждом другом CPU. Другая команда и ненулевые флаги — `EINVAL`. Молчание — `EAGAIN` |
 | 334 | rseq: **ENOSYS** специально |
 | 1000 | свой `ps` |
 

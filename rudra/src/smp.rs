@@ -5,6 +5,8 @@
 //! Кадр, застигнутый в ядре, на другой CPU не переносится.
 //! IPI с вектором [`IPI_VECTOR`] считает попадания. Тот же вектор
 //! сбрасывает TLB, если ядро попросило shootdown этого CR3.
+//! Вектор [`MB_VECTOR`] — `membarrier GLOBAL`: барьер на каждом другом CPU.
+//! TLB он не трогает и счётчик shootdown не двигает.
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -83,6 +85,8 @@ static APIC_IDS: [AtomicU32; MAX_CPUS] = [
 
 /// Вектор fixed-IPI. 48 занят таймером LAPIC, 32..=47 — PIC.
 pub const IPI_VECTOR: u8 = 49;
+/// `membarrier GLOBAL`. Отдельный вектор, чтобы не спутать с TLB.
+pub const MB_VECTOR: u8 = 50;
 
 pub fn cpu_count() -> u32 {
     let n = CPU_COUNT.load(Ordering::Relaxed);
@@ -192,6 +196,93 @@ pub fn shootdown(cr3: u64) -> bool {
         }
         core::hint::spin_loop();
     }
+}
+
+/// Поколение `membarrier`. 0 — запроса ещё не было.
+static MB_GEN: AtomicU64 = AtomicU64::new(0);
+static MB_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Кого ждём в текущем поколении. Пишет только держатель `MB_LOCK`.
+static MB_NEED: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+static MB_LOCK: Mutex<()> = Mutex::new(());
+static MB_HITS: AtomicU64 = AtomicU64::new(0);
+
+fn mb_done(gen: u64, n: usize) -> bool {
+    for cpu in 0..n {
+        if MB_NEED[cpu].load(Ordering::Relaxed) != 0
+            && MB_ACK[cpu].load(Ordering::Acquire) < gen
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn mb_wait(gen: u64, n: usize) -> bool {
+    let deadline = crate::time::monotonic_ns().saturating_add(50_000_000);
+    loop {
+        if mb_done(gen, n) {
+            return true;
+        }
+        if crate::time::monotonic_ns() > deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// IPI `GLOBAL`: барьер, затем ответ на текущее поколение.
+/// Лок `membarrier` здесь не берётся.
+pub fn on_membarrier_ipi() {
+    core::sync::atomic::fence(Ordering::SeqCst);
+    MB_HITS.fetch_add(1, Ordering::Release);
+    let gen = MB_GEN.load(Ordering::Acquire);
+    if gen == 0 {
+        return;
+    }
+    let cpu = this_cpu();
+    if cpu < MAX_CPUS {
+        MB_ACK[cpu].store(gen, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub fn membarrier_hits() -> u64 {
+    MB_HITS.load(Ordering::Acquire)
+}
+
+/// Барьер на этом CPU и на каждом другом поднятом. `false` — кто-то не ответил:
+/// успехом это не считается. Новое поколение не начинается, пока предыдущие
+/// IPI не доехали, иначе поздний ответ закрыл бы чужой барьер.
+pub fn membarrier_global() -> bool {
+    let _guard = MB_LOCK.lock();
+    let n = (cpu_count() as usize).min(MAX_CPUS);
+    let gen_now = MB_GEN.load(Ordering::Acquire);
+    if gen_now != 0 && !mb_done(gen_now, n) && !mb_wait(gen_now, n) {
+        return false;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let gen = MB_GEN.fetch_add(1, Ordering::Release).wrapping_add(1);
+    for cpu in 0..n {
+        MB_NEED[cpu].store(0, Ordering::Relaxed);
+    }
+    let me = this_cpu().min(MAX_CPUS - 1);
+    for cpu in 0..n {
+        if cpu == me || !cpu_registered(cpu) {
+            continue;
+        }
+        let id = APIC_IDS[cpu].load(Ordering::Relaxed);
+        if !crate::apic::send_fixed(id, MB_VECTOR) {
+            crate::serial_println!("[smp] membarrier ipi to {} failed", id);
+            return false;
+        }
+        MB_NEED[cpu].store(1, Ordering::Relaxed);
+    }
+    if !mb_wait(gen, n) {
+        crate::serial_println!("[smp] membarrier timeout gen {}", gen);
+        return false;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    true
 }
 
 /// CPU, на котором выполняется этот код. До карты APIC и до регистрации — 0.
