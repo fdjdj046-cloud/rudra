@@ -2,8 +2,9 @@
 //!
 //! `::1` копирует байты в памяти и кадр не строит. `fe80::/10` — адрес EUI-64
 //! MAC virtio, сосед находится NDP (NS/NA), кэш на восемь записей. UDP и TCP
-//! уходят только такому соседу. Глобальный адрес, SLAAC, DHCPv6, маршрутизатор
-//! и netlink отсутствуют. IPv4-mapped (`::ffff:0:0/96`) — `EAFNOSUPPORT`.
+//! уходят только такому соседу. Глобальный адрес, SLAAC, DHCPv6 и
+//! маршрутизатор отсутствуют. Netlink этот модуль не обслуживает.
+//! IPv4-mapped (`::ffff:0:0/96`) — `EAFNOSUPPORT`.
 //!
 //! Сумма верхнего уровня считается по RFC 8200. На петле она в кадр не
 //! вкладывается. Ноль у UDP — не «суммы нет», в отличие от IPv4. NDP требует
@@ -224,6 +225,22 @@ pub fn attach(mac: [u8; 6]) {
 
 fn our_ll() -> [u8; 16] {
     with_link(|link| if link.up { link.ll } else { UNSPEC })
+}
+
+/// Снимок link-local для дампа netlink. Выключенная карта — нулевой адрес.
+#[derive(Clone, Copy)]
+pub struct LlSnap {
+    pub up: bool,
+    pub mac: [u8; 6],
+    pub ll: [u8; 16],
+}
+
+pub fn ll_snap() -> LlSnap {
+    with_link(|link| LlSnap {
+        up: link.up,
+        mac: link.mac,
+        ll: if link.up { link.ll } else { UNSPEC },
+    })
 }
 
 fn identity() -> Result<([u8; 6], [u8; 16]), i32> {
@@ -2300,12 +2317,14 @@ mod tests {
         assert_eq!(&data[0][74..], b"xy");
         assert_eq!(data[0][67] & TH_PSH, TH_PSH);
         assert!(sum_ok(&data[0], 6));
+        // Захват раньше нулевого штампа: тик другого CPU тоже зовёт retransmit
+        // и иначе уносит повтор в карту до начала захвата.
+        super::capture_begin();
         super::with_tcp(|tab| {
             let s = tab[cli].as_mut().unwrap();
             assert_eq!(s.unacked.len(), 1);
             s.unacked[0].2 = 0;
         });
-        super::capture_begin();
         super::retransmit();
         let again = super::capture_take();
         assert_eq!(again.len(), 1, "rto resends");

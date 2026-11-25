@@ -4,7 +4,7 @@
 //! и принимается: так QEMU отдаёт DHCP.
 //! Датаграмма длиннее 4096 байт — `EMSGSIZE`. В провод уходит не больше
 //! 1472. `SO_REUSEADDR` и `SO_BROADCAST` хранятся на сокете.
-//! IPv6 — `net6`: петля `::1` и link-local с NDP. Netlink нет.
+//! IPv6 — `net6`: петля `::1` и link-local с NDP. Netlink — `netlink`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -370,6 +370,24 @@ fn tcp_retransmit() {
 
 pub fn our_ip() -> u32 {
     with_iface(|iface| iface.ip)
+}
+
+/// Снимок карты для дампа netlink. Шлюз сюда не входит: маршрута в дампе нет.
+#[derive(Clone, Copy)]
+pub struct IfaceSnap {
+    pub up: bool,
+    pub mac: [u8; 6],
+    pub ip: u32,
+    pub mask: u32,
+}
+
+pub fn iface_snap() -> IfaceSnap {
+    with_iface(|iface| IfaceSnap {
+        up: iface.up,
+        mac: iface.mac,
+        ip: iface.ip,
+        mask: iface.mask,
+    })
 }
 
 pub fn gateway() -> u32 {
