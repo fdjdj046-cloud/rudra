@@ -9,8 +9,9 @@
 //! arch_prctl, set_tid_address/robust_list), pipe/pipe2, poll, время,
 //! uname, reboot, getrandom и мелочь.
 //!
-//! UDP/`AF_INET` и TCP есть (петля и провод). IPv6 — петля `::1`
-//! (`AF_INET6`), другой адрес `ENETUNREACH`. Netlink нет.
+//! UDP/`AF_INET` и TCP есть (петля и провод). IPv6 — петля `::1` и
+//! link-local `fe80::/10` с NDP (`AF_INET6`). Глобальный адрес —
+//! `ENETUNREACH`. Netlink нет.
 //! Сигналы 1–31 доставляются на возврате из syscall и с тика в ring 3, если
 //! задан `SA_RESTORER`. Смерть по сигналу — `WIFSIGNALED`. Блокирующий сон,
 //! futex, pipe, poll и recvfrom возвращают `EINTR`. Чтение консоли — нет.
@@ -1640,6 +1641,8 @@ fn tcp6_read(id: usize, buf: u64, len: u64, src: u64, srclen: u64) -> u64 {
                 if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                     return EINTR;
                 }
+                // Блокирующий читатель сам качает кадры, как у IPv4.
+                crate::net::pump();
                 x86_64::instructions::hlt();
             }
             Err(e) => return neg_err(e),

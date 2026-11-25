@@ -4,7 +4,7 @@
 //! и принимается: так QEMU отдаёт DHCP.
 //! Датаграмма длиннее 4096 байт — `EMSGSIZE`. В провод уходит не больше
 //! 1472. `SO_REUSEADDR` и `SO_BROADCAST` хранятся на сокете.
-//! IPv6 — `net6`, только петля `::1`. Netlink нет.
+//! IPv6 — `net6`: петля `::1` и link-local с NDP. Netlink нет.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -89,9 +89,12 @@ static NEXT_PORT: Mutex<u16> = Mutex::new(49152);
 pub fn init() {
     match crate::virtio_net::init() {
         Ok(mac) => {
-            let mut iface = IFACE.lock();
-            iface.mac = mac;
-            iface.up = true;
+            {
+                let mut iface = IFACE.lock();
+                iface.mac = mac;
+                iface.up = true;
+            }
+            crate::net6::attach(mac);
         }
         Err(e) => {
             crate::serial_println!("[virtio-net] no device ({})", e);
@@ -311,6 +314,13 @@ pub fn pump() {
         handle_frame(&buf[..n]);
     }
     tcp_retransmit();
+    crate::net6::retransmit();
+}
+
+/// Один кадр с карты: ARP, IPv4 или IPv6. NDP ждёт ответ здесь, не через `pump`,
+/// чтобы повтор TCP не шёл из середины разрешения соседа.
+pub fn ingest_frame(frame: &[u8]) {
+    handle_frame(frame);
 }
 
 /// Повтор неподтверждённого: головной сегмент каждого сокета, у которого
@@ -623,6 +633,8 @@ fn handle_frame(frame: &[u8]) {
         handle_arp(frame);
     } else if et == 0x0800 {
         handle_ipv4(frame);
+    } else if et == 0x86DD {
+        crate::net6::ingest(frame);
     }
 }
 
