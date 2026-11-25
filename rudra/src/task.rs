@@ -14,6 +14,7 @@
 //!   0xA0000         страница ленивого PLT-резолвера
 //!   0xA1000         старт GNU IFUNC: резолверы, затем прыжок на вход
 //!   0xA2000         таблица этих вызовов (две страницы)
+//!   0xB0000         TLS начального потока: образ PT_TLS, сразу за ним TCB
 //!   0x2000000       ET_DYN из DT_NEEDED, шаг 2 МиБ, ниже brk
 //!   0x40000000      main-стек (растёт вниз от USER_STACK_TOP)
 //!   0x10000000      brk-heap (растёт вверх до BRK_MAX)
@@ -68,6 +69,8 @@ pub struct LoadedImage {
     pub entry: u64,
     pub user_rsp: u64,
     pub lazy: Option<LazyBind>,
+    /// База `FS` начального потока. Ноль — у программы нет `PT_TLS`.
+    pub fs_base: u64,
 }
 
 /// Слоты, которые первый вызов дописывает сам. Таблица общая у потоков
@@ -89,6 +92,18 @@ struct LoadSeg {
     vaddr: u64,
     file_size: u64,
     mem_size: u64,
+}
+
+/// Образ `PT_TLS` программы. Живой блок — отдельная копия перед TCB,
+/// не этот виртуальный адрес.
+struct TlsSeg {
+    offset: u64,
+    vaddr: u64,
+    file_size: u64,
+    mem_size: u64,
+    /// Степень двойки, от 8 до размера страницы.
+    align: u64,
+    writable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,6 +146,10 @@ struct RelaRel {
     /// перехватывает более ранний объект. Локальный, скрытый и защищённый —
     /// None, они остаются в этом объекте.
     preempt: Option<ExtSym>,
+    /// 8 — `R_X86_64_TPOFF64`, 4 — `R_X86_64_TPOFF32`. Ноль — не TLS.
+    /// В слот пишется `st_value + addend −` выровненный `p_memsz`, без базы
+    /// загрузки. `sym` здесь — смещение в образе `PT_TLS`, не адрес.
+    tpoff: u8,
 }
 
 #[derive(Clone)]
@@ -193,6 +212,8 @@ struct ElfParsed {
     bind_now: bool,
     /// Слова `DT_RELR`. Пусто — тега нет.
     relr: Vec<u64>,
+    /// `PT_TLS` этого файла. У библиотеки и интерпретатора загрузка отвергается.
+    tls: Option<TlsSeg>,
 }
 
 struct ParsedDyn {
@@ -225,6 +246,8 @@ enum LocalSym {
 
 /// Тип символа GNU IFUNC в младших четырёх битах `st_info`.
 const STT_GNU_IFUNC: u8 = 10;
+/// Символ thread-local. `st_value` — смещение в `PT_TLS`, не виртуальный адрес.
+const STT_TLS: u8 = 6;
 
 fn rd16(b: &[u8], off: usize) -> u64 {
     u16::from_le_bytes(b[off..off + 2].try_into().unwrap()) as u64
@@ -253,7 +276,11 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// здесь: их резолвер вызовет стартовая страница до входа в программу.
 /// `R_X86_64_COPY` копирует байты после обычных релокаций и до IFUNC.
 /// `DT_RELR`: к уже лежащему слову прибавляется база. Чётная запись — адрес,
-/// нечётная — битовая карта следующих 63 слотов. Прочие типы — отказ.
+/// нечётная — битовая карта следующих 63 слотов.
+/// `PT_TLS` программы копируется перед TCB начального потока.
+/// `R_X86_64_TPOFF64` и `TPOFF32` пишут `st_value + addend −` выровненный
+/// `p_memsz`. `TLSGD`, `TLSLD`, `DTPMOD`, `DTPOFF`, `GOTTPOFF`, `TLSDESC`
+/// и `PT_TLS` не у самой программы — отказ. Прочие типы — отказ.
 fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
         return None;
@@ -279,16 +306,19 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
     let mut phdr_vaddr = 0u64;
     let mut interp: Option<String> = None;
     let mut dyn_span: Option<(usize, usize)> = None;
+    let mut tls: Option<TlsSeg> = None;
     for i in 0..phnum {
         let base = (phoff as usize).checked_add(i.checked_mul(phentsize)?)?;
         if base + 56 > elf.len() {
             return None;
         }
         let p_type = rd32(elf, base);
+        let p_flags = rd32(elf, base + 4);
         let off = rd64(elf, base + 8);
         let vaddr = rd64(elf, base + 16);
         let file_size = rd64(elf, base + 32);
         let mem_size = rd64(elf, base + 40);
+        let p_align = rd64(elf, base + 48);
         if p_type == 3 {
             if interp.is_some() || file_size == 0 || file_size > 128 {
                 return None;
@@ -323,6 +353,37 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
                 phdr_vaddr = seg.vaddr + (phoff - seg.offset);
             }
             segs.push(seg);
+        } else if p_type == 7 {
+            // Пустой заголовок — не блок. Второй образ и кривой размер — отказ.
+            if mem_size == 0 {
+                if file_size != 0 {
+                    return None;
+                }
+                continue;
+            }
+            if tls.is_some() || file_size > mem_size || mem_size > TLS_MAX {
+                return None;
+            }
+            vaddr.checked_add(mem_size)?;
+            if file_size > 0 {
+                let start = usize::try_from(off).ok()?;
+                let end = start.checked_add(usize::try_from(file_size).ok()?)?;
+                if end > elf.len() {
+                    return None;
+                }
+            }
+            let align = if p_align == 0 { 8 } else { p_align };
+            if align > 4096 || !align.is_power_of_two() {
+                return None;
+            }
+            tls = Some(TlsSeg {
+                offset: off,
+                vaddr,
+                file_size,
+                mem_size,
+                align: align.max(8),
+                writable: p_flags & 2 != 0,
+            });
         }
     }
     if segs.is_empty() {
@@ -359,6 +420,7 @@ fn parse_elf64(elf: &[u8]) -> Option<ElfParsed> {
         pltgot,
         bind_now,
         relr,
+        tls,
     })
 }
 
@@ -381,6 +443,11 @@ fn sym_name(elf: &[u8], strtab: usize, name_off: usize) -> Result<Option<&[u8]>,
 
 fn local_defined(elf: &[u8], ent: usize, shndx: u64) -> Option<LocalSym> {
     if shndx == 0xfff2 || shndx == 0xffff {
+        return None;
+    }
+    // `st_value` TLS — смещение в образе, не адрес. Обычная релокация
+    // прибавила бы базу и записала мусор.
+    if elf[ent + 4] & 0xf == STT_TLS {
         return None;
     }
     let val = rd64(elf, ent + 8);
@@ -826,6 +893,15 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const R_GLOB_DAT: u64 = 6;
     const R_JUMP_SLOT: u64 = 7;
     const R_RELATIVE: u64 = 8;
+    const R_DTPMOD64: u64 = 16;
+    const R_DTPOFF64: u64 = 17;
+    const R_TPOFF64: u64 = 18;
+    const R_TLSGD: u64 = 19;
+    const R_TLSLD: u64 = 20;
+    const R_DTPOFF32: u64 = 21;
+    const R_GOTTPOFF: u64 = 22;
+    const R_TPOFF32: u64 = 23;
+    const R_TLSDESC: u64 = 36;
     const R_IRELATIVE: u64 = 37;
     let mut rela_addr = 0u64;
     let mut rela_sz = 0u64;
@@ -1084,6 +1160,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     ref_size: 0,
                     src_size: 0,
                     preempt: None,
+                    tpoff: 0,
                 },
                 R_IRELATIVE => RelaRel {
                     offset,
@@ -1099,6 +1176,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                     ref_size: 0,
                     src_size: 0,
                     preempt: None,
+                    tpoff: 0,
                 },
                 R_COPY => {
                     // Источник ищется в других объектах. Своё определение
@@ -1143,6 +1221,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                         ref_size: rd64(elf, ent + 16),
                         src_size: 0,
                         preempt: None,
+                    tpoff: 0,
                     }
                 }
                 R_X86_64_64 | R_GLOB_DAT | R_JUMP_SLOT => {
@@ -1170,6 +1249,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             ref_size: 0,
                             src_size: 0,
                             preempt,
+                            tpoff: 0,
                         },
                         LocalSym::IfuncAbs(v) => RelaRel {
                             offset,
@@ -1185,6 +1265,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             ref_size: 0,
                             src_size: 0,
                             preempt,
+                            tpoff: 0,
                         },
                         LocalSym::Own(v) => RelaRel {
                             offset,
@@ -1200,6 +1281,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             ref_size: 0,
                             src_size: 0,
                             preempt,
+                            tpoff: 0,
                         },
                         LocalSym::Abs(v) => RelaRel {
                             offset,
@@ -1215,6 +1297,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             ref_size: 0,
                             src_size: 0,
                             preempt: None,
+                    tpoff: 0,
                         },
                         LocalSym::Ext { name, weak, ver, file } => RelaRel {
                             offset,
@@ -1230,9 +1313,39 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
                             ref_size: 0,
                             src_size: 0,
                             preempt: None,
+                    tpoff: 0,
                         },
                     }
                 }
+                R_TPOFF64 | R_TPOFF32 => {
+                    // Addend `DT_REL` у TPOFF32 — четыре байта слота, не восемь.
+                    let addend = if typ == R_TPOFF32 && stride != 24 {
+                        rel_place_i32(elf, segs, offset)?
+                    } else {
+                        addend
+                    };
+                    let value = tls_value(elf, symtab_off?, syment, nchain, info >> 32)?;
+                    RelaRel {
+                        offset,
+                        addend,
+                        sym: Some(value),
+                        def_bias: None,
+                        ext: None,
+                        jmprel_off: None,
+                        defer: false,
+                        missing: false,
+                        ifunc: false,
+                        copy: false,
+                        ref_size: 0,
+                        src_size: 0,
+                        preempt: None,
+                        tpoff: if typ == R_TPOFF64 { 8 } else { 4 },
+                    }
+                }
+                // Модель GD/LD, смещение внутри модуля и дескриптор. Формула
+                // GOTTPOFF сюда не входит: без неё слот не пишем.
+                R_DTPMOD64 | R_DTPOFF64 | R_TLSGD | R_TLSLD | R_DTPOFF32 | R_GOTTPOFF
+                | R_TLSDESC => return None,
                 _ => return None,
             };
             out.push(rel);
@@ -1422,6 +1535,50 @@ fn rel_place_addend(elf: &[u8], segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
     Some(0)
 }
 
+/// Addend `TPOFF32` в `DT_REL`: знаковые четыре байта слота.
+/// Адреса в файле нет — ноль. Четыре байта не влезают в файл — отказ.
+fn rel_place_i32(elf: &[u8], segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
+    for seg in segs {
+        if vaddr < seg.vaddr || seg.file_size == 0 {
+            continue;
+        }
+        let delta = vaddr - seg.vaddr;
+        if delta >= seg.file_size {
+            continue;
+        }
+        if delta.checked_add(4)? > seg.file_size {
+            return None;
+        }
+        let off = (seg.offset.checked_add(delta)?) as usize;
+        if off.checked_add(4)? > elf.len() {
+            return None;
+        }
+        let bits = rd32(elf, off) as u32;
+        return Some(bits as i32 as i64 as u64);
+    }
+    Some(0)
+}
+
+/// `st_value` определённого `STT_TLS` в этом объекте. Внешний, абсолютный
+/// и обычный символ сюда не годятся: смещение другого модуля не считаем.
+fn tls_value(elf: &[u8], symtab: usize, syment: u64, nchain: u64, idx: u64) -> Option<u64> {
+    if syment < 24 || idx == 0 || idx >= nchain {
+        return None;
+    }
+    let ent = symtab.checked_add((idx as usize).checked_mul(syment as usize)?)?;
+    if ent.checked_add(24)? > elf.len() {
+        return None;
+    }
+    if elf[ent + 4] & 0xf != STT_TLS {
+        return None;
+    }
+    let shndx = rd16(elf, ent + 6);
+    if shndx == 0 || shndx >= 0xff00 {
+        return None;
+    }
+    Some(rd64(elf, ent + 8))
+}
+
 fn load_bias(img: &ElfParsed, interpreter: bool) -> u64 {
     if img.kind == ElfKind::Exec {
         return 0;
@@ -1479,6 +1636,11 @@ const IFUNC_TABLE: u64 = 0xA_2000;
 const IFUNC_MAX: usize = 256;
 /// Потолок `min(st_size)` у `R_X86_64_COPY`. Больший из двух размеров не важен.
 const COPY_MAX: u64 = 64 * 1024;
+/// Живой TLS начального потока. Образ с `TLS_BASE`, TCB сразу за ним.
+/// Библиотека сюда не ставится: её `PT_TLS` отвергает загрузку.
+const TLS_BASE: u64 = 0xB_0000;
+const TLS_MAX: u64 = 1 << 20;
+const TLS_END: u64 = TLS_BASE + TLS_MAX + 0x1000;
 /// Потолок таблицы `DT_RELR` в байтах. Тот же, что у суммы `DT_RELA`.
 const RELR_MAX: u64 = 8192 * 24;
 /// Приватный номер: вход резолвера, не вызов Linux.
@@ -1734,6 +1896,7 @@ fn reserved_hit(segs: &[LoadSeg], bias: u64) -> bool {
         (RESOLVE_PAGE, RESOLVE_PAGE + 0x1000),
         (IFUNC_PAGE, IFUNC_PAGE + 0x1000),
         (IFUNC_TABLE, IFUNC_TABLE + 0x2000),
+        (TLS_BASE, TLS_END),
     ];
     for seg in segs {
         let Some((a0, a1)) = seg_span(seg, bias) else {
@@ -1929,6 +2092,9 @@ fn defined(
         }
         let shndx = rd16(elf, ent + 6);
         if shndx == 0 {
+            continue;
+        }
+        if elf[ent + 4] & 0xf == STT_TLS {
             continue;
         }
         let bind = elf[ent + 4] >> 4;
@@ -2132,7 +2298,7 @@ fn bind_all(objs: &mut [LinkObj], env_now: bool) -> bool {
         let group = objs[i].group;
         let own_bias = objs[i].bias;
         for r in 0..objs[i].parsed.relative.len() {
-            if objs[i].parsed.relative[r].copy {
+            if objs[i].parsed.relative[r].copy || objs[i].parsed.relative[r].tpoff != 0 {
                 continue;
             }
             let Some(pre) = objs[i].parsed.relative[r].preempt.clone() else {
@@ -2295,7 +2461,64 @@ where
     if ifunc_calls(&objs).is_none() {
         return None;
     }
+    if !initial_tls_ok(&objs) {
+        return None;
+    }
     Some(Linked { objs, interp_index })
+}
+
+/// TLS только у главной программы, и только если релокация не целится
+/// в сам образ: живая копия — байты файла, не перемещённый сегмент.
+fn initial_tls_ok(objs: &[LinkObj]) -> bool {
+    for (i, obj) in objs.iter().enumerate() {
+        if i != 0 && obj.parsed.tls.is_some() {
+            serial_println!("[task] PT_TLS is only the main executable");
+            return false;
+        }
+        let Some(tls) = &obj.parsed.tls else {
+            if obj.parsed.relative.iter().any(|rel| rel.tpoff != 0) {
+                serial_println!("[task] TLS relocation without PT_TLS");
+                return false;
+            }
+            continue;
+        };
+        let Some(end) = tls.vaddr.checked_add(tls.mem_size) else {
+            return false;
+        };
+        for rel in &obj.parsed.relative {
+            if rel.tpoff != 0 {
+                let Some(off) = rel.sym else {
+                    return false;
+                };
+                if off >= tls.mem_size {
+                    serial_println!("[task] TLS symbol outside PT_TLS");
+                    return false;
+                }
+            }
+            if rel.offset >= tls.vaddr && rel.offset < end {
+                serial_println!("[task] relocation inside PT_TLS");
+                return false;
+            }
+        }
+        if !obj.parsed.relr.is_empty() {
+            let mut inside = false;
+            let walked = walk_relr(&obj.parsed.relr, |place| {
+                if place >= tls.vaddr && place < end {
+                    inside = true;
+                }
+                true
+            });
+            if !walked || inside {
+                serial_println!("[task] DT_RELR inside PT_TLS");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn align_up_u64(val: u64, align: u64) -> Option<u64> {
+    val.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
 fn link_program(bytes: &[u8], origin: &str, cwd: &str, envp: &[String]) -> Option<Linked> {
@@ -3580,6 +3803,96 @@ fn map_and_copy(
     Ok(())
 }
 
+/// `st_value + addend −` выровненный размер образа. База загрузки не входит.
+fn tpoff_value(sym: u64, addend: u64, aligned: u64) -> Option<i64> {
+    let sym = i64::try_from(sym).ok()?;
+    let aligned = i64::try_from(aligned).ok()?;
+    sym.checked_add(addend as i64)?.checked_sub(aligned)
+}
+
+fn apply_tpoff(
+    l4: PhysFrame,
+    rels: &[RelaRel],
+    bias: u64,
+    tls: Option<&TlsSeg>,
+) -> Result<(), MapToError<Size4KiB>> {
+    let Some(tls) = tls else {
+        if rels.iter().any(|rel| rel.tpoff != 0) {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+        return Ok(());
+    };
+    let aligned = align_up_u64(tls.mem_size, tls.align).ok_or(MapToError::FrameAllocationFailed)?;
+    for rel in rels {
+        if rel.tpoff == 0 {
+            continue;
+        }
+        let sym = rel.sym.ok_or(MapToError::FrameAllocationFailed)?;
+        let value = tpoff_value(sym, rel.addend, aligned).ok_or(MapToError::FrameAllocationFailed)?;
+        let addr = rel
+            .offset
+            .checked_add(bias)
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        if rel.tpoff == 8 {
+            write_user(l4, addr, &value.to_le_bytes())?;
+        } else if rel.tpoff == 4 {
+            let narrow = i32::try_from(value).map_err(|_| MapToError::FrameAllocationFailed)?;
+            write_user(l4, addr, &narrow.to_le_bytes())?;
+        } else {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+    }
+    Ok(())
+}
+
+/// Копия `PT_TLS` сразу перед TCB. Первое слово TCB — его собственный адрес.
+/// Нет сегмента — `FS` остаётся 0. Возвращает адрес TCB.
+fn install_tls_image(
+    l4: PhysFrame,
+    obj: &LinkObj,
+    frame_allocator: &mut BootInfoFrameAllocator,
+) -> Result<u64, MapToError<Size4KiB>> {
+    let Some(tls) = &obj.parsed.tls else {
+        return Ok(0);
+    };
+    let aligned = align_up_u64(tls.mem_size, tls.align).ok_or(MapToError::FrameAllocationFailed)?;
+    if aligned == 0 || aligned > TLS_MAX {
+        return Err(MapToError::FrameAllocationFailed);
+    }
+    let image = TLS_BASE;
+    let tp = image
+        .checked_add(aligned)
+        .ok_or(MapToError::FrameAllocationFailed)?;
+    let end = tp.checked_add(8).ok_or(MapToError::FrameAllocationFailed)?;
+    if end > TLS_END {
+        return Err(MapToError::FrameAllocationFailed);
+    }
+    let flags = if tls.writable {
+        USER_FLAGS
+    } else {
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
+    };
+    map_range_zeroed(
+        l4,
+        VirtAddr::new(image),
+        VirtAddr::new(end - 1),
+        frame_allocator,
+        flags,
+    )?;
+    if tls.file_size > 0 {
+        let start = usize::try_from(tls.offset).map_err(|_| MapToError::FrameAllocationFailed)?;
+        let n = usize::try_from(tls.file_size).map_err(|_| MapToError::FrameAllocationFailed)?;
+        let last = start.checked_add(n).ok_or(MapToError::FrameAllocationFailed)?;
+        if last > obj.bytes.len() {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+        write_user(l4, image, &obj.bytes[start..last])?;
+    }
+    write_user(l4, tp, &tp.to_le_bytes())?;
+    serial_println!("[task] TLS image {:#x} fs {:#x}", image, tp);
+    Ok(tp)
+}
+
 fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapToError<Size4KiB>> {
     for rel in rels {
         if rel.ext.is_some() {
@@ -3589,7 +3902,7 @@ fn apply_relative(l4: PhysFrame, rels: &[RelaRel], bias: u64) -> Result<(), MapT
         // всех объектов уже записаны. Ранний вызов здесь был бы вызовом
         // ещё не перемещённого кода. COPY тоже ждёт: в источнике могут
         // лежать указатели, которые эта же петля ещё пишет.
-        if rel.defer || rel.ifunc || rel.copy {
+        if rel.defer || rel.ifunc || rel.copy || rel.tpoff != 0 {
             continue;
         }
         let addr = rel
@@ -3951,12 +4264,15 @@ pub fn load_elf_image(
         Some(linked) => linked,
         None => return Err(MapToError::FrameAllocationFailed),
     };
+    // Образ TLS до релокаций: TPOFF от него не зависит, но вход уже видит байты.
+    let fs_base = install_tls_image(l4, &linked.objs[0], frame_allocator)?;
     for obj in &linked.objs {
         map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, frame_allocator)?;
         // Сначала RELR, потом RELA: как glibc. Оба — обычные релокации,
         // до COPY и до резолверов IFUNC.
         apply_relr(l4, &obj.parsed.relr, obj.bias)?;
         apply_relative(l4, &obj.parsed.relative, obj.bias)?;
+        apply_tpoff(l4, &obj.parsed.relative, obj.bias, obj.parsed.tls.as_ref())?;
     }
     // Слот программы заполняется из уже перемещённого источника.
     // Возвраты IFUNC в эти байты не входят: резолверы бегут позже.
@@ -4109,7 +4425,12 @@ pub fn load_elf_image(
     sp -= 8;
     write_user(l4, sp, &argv.len().to_le_bytes())?;
 
-    Ok(LoadedImage { entry, user_rsp: sp, lazy })
+    Ok(LoadedImage {
+        entry,
+        user_rsp: sp,
+        lazy,
+        fs_base,
+    })
 }
 
 /// Kernel-стек в куче. База запоминается в задаче и освобождается в Drop.
@@ -4215,7 +4536,12 @@ fn finish_task(
     img: LoadedImage,
     name: &str,
 ) -> Result<Task, MapToError<Size4KiB>> {
-    let LoadedImage { entry, user_rsp, lazy } = img;
+    let LoadedImage {
+        entry,
+        user_rsp,
+        lazy,
+        fs_base,
+    } = img;
     if let Some(lazy) = lazy {
         aspace.lock().lazy = Some(Arc::new(lazy));
     }
@@ -4259,7 +4585,7 @@ fn finish_task(
         term_sig: 0,
         parent: -1,
         thread: false,
-        fs_base: 0,
+        fs_base,
         gs_base: 0,
         cpu: pick_cpu(),
         cpu_mask: 0,
@@ -4869,7 +5195,12 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
         Ok(v) => v,
         Err(_) => return ENOEXEC,
     };
-    let LoadedImage { entry, user_rsp, lazy } = img;
+    let LoadedImage {
+        entry,
+        user_rsp,
+        lazy,
+        fs_base,
+    } = img;
     if let Some(lazy) = lazy {
         aspace.lock().lazy = Some(Arc::new(lazy));
     }
@@ -4882,7 +5213,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
     let Some(old) = with_current_task(|t| {
         let old = core::mem::replace(&mut t.aspace, aspace);
         t.cr3 = l4;
-        t.fs_base = 0;
+        t.fs_base = fs_base;
         t.rseq = 0;
         t.rseq_sig = 0;
         t.signals = crate::signal::Signals::new();
@@ -4896,6 +5227,9 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, frame: *mut u64) 
     }) else {
         return ENOEXEC;
     };
+    // sysret не проходит планировщик, поэтому базу пишем сразу.
+    // Ноль тоже: новый образ не наследует чужой TCB.
+    unsafe { Msr::new(0xC000_0100).write(fs_base) };
     crate::fpu::reset_cpu();
     unsafe {
         Cr3::write(l4, Cr3Flags::empty());
@@ -6001,6 +6335,48 @@ fn call_ifunc_stub(l4: PhysFrame) {
     });
 }
 
+/// Вход программы на АП `l4` с базой `FS`, которую получит планировщик.
+/// Тест — не задача: SMEP и SMAP снимаются на время вызова и возвращаются.
+#[cfg(test)]
+fn call_tls_entry(l4: PhysFrame, entry: u64, fs: u64) {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    let phys = l4.start_address().as_u64();
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let old_cr4 = Cr4::read();
+        let mut cr4 = old_cr4;
+        cr4.remove(
+            Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION
+                | Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION,
+        );
+        Cr4::write(cr4);
+        let mut msr = Msr::new(0xC000_0100);
+        let old_fs = msr.read();
+        msr.write(fs);
+        core::arch::asm!(
+            "push rbx",
+            "mov r15, cr3",
+            "mov cr3, {l4}",
+            "call {entry}",
+            "mov cr3, r15",
+            "pop rbx",
+            l4 = in(reg) phys,
+            entry = in(reg) entry,
+            out("r15") _,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
+            out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+        );
+        msr.write(old_fs);
+        Cr4::write(old_cr4);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6537,6 +6913,7 @@ mod tests {
                     ref_size: 0,
                     src_size: 0,
                     preempt: None,
+                    tpoff: 0,
                 },
                 RelaRel {
                     offset: 8,
@@ -6552,6 +6929,7 @@ mod tests {
                     ref_size: 0,
                     src_size: 0,
                     preempt: None,
+                    tpoff: 0,
                 },
             ];
             apply_relative(l4, &rels, 0x2000_0000).expect("apply");
@@ -8312,6 +8690,346 @@ mod tests {
                 assert_ne!(uniq[i], uniq[j]);
             }
         }
+        serial_println!("[ok]");
+    }
+
+    /// ET_DYN с необязательным `PT_TLS` на 0xC00 и одной релокацией в `slot`.
+    /// `reloc` — (тип, addend, st_value). `stub` читает байт по `%fs:(tpoff)`.
+    fn craft_tls(
+        memsz: u64,
+        align: u64,
+        init: &[u8],
+        reloc: Option<(u64, u64, u64)>,
+        needed: &[&str],
+        with_tls: bool,
+        stub: bool,
+        slot: u64,
+    ) -> Vec<u8> {
+        let mut strings = alloc::vec![0u8];
+        let mut needed_at = Vec::new();
+        for name in needed {
+            needed_at.push(strings.len() as u64);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let sym_at = if reloc.is_some() {
+            let at = strings.len() as u32;
+            strings.extend_from_slice(b"v\0");
+            Some(at)
+        } else {
+            None
+        };
+        assert!(strings.len() <= 0x100, "dynstr overlaps symtab");
+
+        let mut elf = alloc::vec![0u8; 0x100];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        if stub {
+            elf[24..32].copy_from_slice(&0x500u64.to_le_bytes());
+        }
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        let has_dyn = !needed.is_empty() || reloc.is_some();
+        let phnum = 1u16 + u16::from(has_dyn) + u16::from(with_tls);
+        elf[56..58].copy_from_slice(&phnum.to_le_bytes());
+
+        let place = |elf: &mut Vec<u8>, at: usize, data: &[u8]| {
+            if elf.len() < at + data.len() {
+                elf.resize(at + data.len(), 0);
+            }
+            elf[at..at + data.len()].copy_from_slice(data);
+        };
+        place(&mut elf, 0x100, &strings);
+
+        if let Some(name_off) = sym_at {
+            let st_value = reloc.expect("symbol").2;
+            let mut sym = alloc::vec![0u8; 24];
+            sym.extend_from_slice(&name_off.to_le_bytes());
+            sym.push(STT_TLS);
+            sym.push(0);
+            sym.extend_from_slice(&1u16.to_le_bytes());
+            sym.extend_from_slice(&st_value.to_le_bytes());
+            sym.extend_from_slice(&0u64.to_le_bytes());
+            place(&mut elf, 0x200, &sym);
+        }
+
+        let mut dyn_len = 0usize;
+        if has_dyn {
+            let mut tags: Vec<(u64, u64)> = Vec::new();
+            for at in &needed_at {
+                tags.push((1, *at));
+            }
+            tags.push((5, 0x100));
+            if reloc.is_some() {
+                tags.push((6, 0x200));
+                tags.push((11, 24));
+                tags.push((4, 0x3C0));
+                tags.push((7, 0x440));
+                tags.push((8, 24));
+                tags.push((9, 24));
+            }
+            tags.push((0, 0));
+            let mut dynamic = Vec::new();
+            for (tag, val) in tags {
+                dynamic.extend_from_slice(&tag.to_le_bytes());
+                dynamic.extend_from_slice(&val.to_le_bytes());
+            }
+            assert!(0x300 + dynamic.len() <= 0x3C0, "dynamic overlaps hash");
+            dyn_len = dynamic.len();
+            place(&mut elf, 0x300, &dynamic);
+        }
+        if reloc.is_some() {
+            let mut hash = Vec::new();
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            hash.extend_from_slice(&2u32.to_le_bytes());
+            hash.extend_from_slice(&1u32.to_le_bytes());
+            hash.extend_from_slice(&0u32.to_le_bytes());
+            hash.extend_from_slice(&0u32.to_le_bytes());
+            place(&mut elf, 0x3C0, &hash);
+            let (typ, addend, _) = reloc.expect("rela");
+            let mut rela = Vec::new();
+            rela.extend_from_slice(&slot.to_le_bytes());
+            rela.extend_from_slice(&((1u64 << 32) | typ).to_le_bytes());
+            rela.extend_from_slice(&addend.to_le_bytes());
+            place(&mut elf, 0x440, &rela);
+            let need = (slot as usize).saturating_add(8);
+            if elf.len() < need {
+                elf.resize(need, 0);
+            }
+        }
+        if stub {
+            // mov rax, fs:[0]
+            // mov [0x400900], rax
+            // mov rbx, [0x400800]
+            // movzx ecx, byte ptr fs:[rbx]
+            // mov [0x400908], rcx
+            // ret
+            let code: &[u8] = &[
+                0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x04, 0x25, 0x00,
+                0x09, 0x40, 0x00, 0x48, 0x8B, 0x1C, 0x25, 0x00, 0x08, 0x40, 0x00, 0x64, 0x0F, 0xB6,
+                0x0B, 0x48, 0x89, 0x0C, 0x25, 0x08, 0x09, 0x40, 0x00, 0xC3,
+            ];
+            place(&mut elf, 0x500, code);
+        }
+        if with_tls {
+            assert!(init.len() as u64 <= memsz);
+            place(&mut elf, 0xC00, init);
+        }
+
+        let len = elf.len() as u64;
+        let put_phdr = |elf: &mut [u8], at: usize, typ: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, mem: u64, align: u64| {
+            let p = &mut elf[at..at + 56];
+            p[0..4].copy_from_slice(&typ.to_le_bytes());
+            p[4..8].copy_from_slice(&flags.to_le_bytes());
+            p[8..16].copy_from_slice(&off.to_le_bytes());
+            p[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            p[24..32].copy_from_slice(&vaddr.to_le_bytes());
+            p[32..40].copy_from_slice(&filesz.to_le_bytes());
+            p[40..48].copy_from_slice(&mem.to_le_bytes());
+            p[48..56].copy_from_slice(&align.to_le_bytes());
+        };
+        put_phdr(&mut elf, 0x40, 1, 7, 0, 0, len, len, 0x1000);
+        let mut at = 0x78;
+        if has_dyn {
+            put_phdr(
+                &mut elf,
+                at,
+                2,
+                6,
+                0x300,
+                0x300,
+                dyn_len as u64,
+                dyn_len as u64,
+                8,
+            );
+            at += 56;
+        }
+        if with_tls {
+            put_phdr(
+                &mut elf,
+                at,
+                7,
+                6,
+                0xC00,
+                0xC00,
+                init.len() as u64,
+                memsz,
+                align,
+            );
+        }
+        elf
+    }
+
+    /// Вариант II: образ перед TCB, первое слово TCB указывает на себя.
+    /// `TPOFF64` = st_value + addend − выровненный размер. Вход читает этот байт через `%fs`.
+    #[test_case]
+    fn main_tls_tpoff_sets_the_fs_base() {
+        serial_print!("test main_tls_tpoff_sets_the_fs_base... ");
+        let init = [0x10u8, 0x21, 0x32, 0x43, 0x54, 0xA5, 0x76, 0x87];
+        let elf = craft_tls(8, 8, &init, Some((18, 5, 0)), &[], true, true, 0x800);
+        let (aspace, img) = crate::memory::with_frame_allocator(|fa| {
+            let aspace = AddressSpace::new_empty(fa).expect("as");
+            let l4 = aspace.lock().l4;
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(USER_STACK_TOP - USER_STACK_SIZE),
+                VirtAddr::new(USER_STACK_TOP - 1),
+                fa,
+                USER_FLAGS,
+            )
+            .expect("stack");
+            let argv = alloc::vec![String::from("t")];
+            let envp: Vec<String> = Vec::new();
+            let img = load_elf_image(
+                l4,
+                &elf,
+                &argv,
+                &envp,
+                USER_STACK_TOP,
+                fa,
+                Cred::root(),
+                "/tls",
+                "/",
+            )
+            .expect("load");
+            (aspace, img)
+        });
+        let l4 = aspace.lock().l4;
+        let tp = img.fs_base;
+        assert_eq!(tp, TLS_BASE + 8);
+        assert_eq!(read_u64(l4, 0x400800), (-3i64) as u64);
+        assert_eq!(read_bytes(l4, TLS_BASE, 8).as_slice(), &init);
+        assert_eq!(read_u64(l4, tp), tp);
+        call_tls_entry(l4, img.entry, tp);
+        assert_eq!(read_u64(l4, 0x400900), tp, "fs:0 is the tcb");
+        assert_eq!(read_u64(l4, 0x400908), 0xA5, "fs:(tpoff) is the image byte");
+        let task = finish_task(aspace, img, "tls").expect("task");
+        assert_eq!(task.fs_base, tp);
+        drop(task);
+
+        let narrow = [0x3Cu8, 0x11, 0x22, 0x33];
+        let wide = craft_tls(4, 16, &narrow, Some((23, 0, 0)), &[], true, false, 0x800);
+        crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(USER_STACK_TOP - USER_STACK_SIZE),
+                VirtAddr::new(USER_STACK_TOP - 1),
+                fa,
+                USER_FLAGS,
+            )
+            .expect("stack");
+            let argv = alloc::vec![String::from("t")];
+            let envp: Vec<String> = Vec::new();
+            let img = load_elf_image(
+                l4,
+                &wide,
+                &argv,
+                &envp,
+                USER_STACK_TOP,
+                fa,
+                Cred::root(),
+                "/tls",
+                "/",
+            )
+            .expect("align 16");
+            assert_eq!(img.fs_base, TLS_BASE + 16);
+            let slot = read_bytes(l4, 0x400800, 4);
+            let slot = i32::from_le_bytes(slot.as_slice().try_into().unwrap());
+            assert_eq!(slot, -16);
+            let mem = read_bytes(l4, TLS_BASE, 16);
+            assert_eq!(&mem[..4], &narrow);
+            assert!(mem[4..].iter().all(|b| *b == 0));
+            assert_eq!(read_u64(l4, img.fs_base), img.fs_base);
+            free_user_space(l4, fa);
+        });
+
+        let plain = craft_dyn(&[], &[], &[], false, false, None);
+        crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            map_range_zeroed(
+                l4,
+                VirtAddr::new(USER_STACK_TOP - USER_STACK_SIZE),
+                VirtAddr::new(USER_STACK_TOP - 1),
+                fa,
+                USER_FLAGS,
+            )
+            .expect("stack");
+            let argv = alloc::vec![String::from("t")];
+            let envp: Vec<String> = Vec::new();
+            let img = load_elf_image(
+                l4,
+                &plain,
+                &argv,
+                &envp,
+                USER_STACK_TOP,
+                fa,
+                Cred::root(),
+                "/tls",
+                "/",
+            )
+            .expect("no tls");
+            assert_eq!(img.fs_base, 0);
+            free_user_space(l4, fa);
+        });
+
+        let gd = craft_tls(8, 8, &init, Some((19, 0, 0)), &[], true, false, 0x800);
+        assert!(link_with(gd.as_slice(), |_| None).is_none(), "tlsgd");
+        let gottpoff = craft_tls(8, 8, &init, Some((22, 0, 0)), &[], true, false, 0x800);
+        assert!(link_with(gottpoff.as_slice(), |_| None).is_none(), "gottpoff");
+        let bare = craft_tls(8, 8, &init, Some((18, 0, 0)), &[], false, false, 0x800);
+        assert!(link_with(bare.as_slice(), |_| None).is_none(), "tpoff without pt_tls");
+        let inside = craft_tls(8, 8, &init, Some((18, 0, 0)), &[], true, false, 0xC00);
+        assert!(link_with(inside.as_slice(), |_| None).is_none(), "reloc in the template");
+
+        let lib = craft_tls(8, 8, &[0xAB], None, &[], true, false, 0);
+        let main = craft_dyn(&["libtls.so"], &[], &[], false, false, None);
+        assert!(
+            link_with(main.as_slice(), |path| {
+                if path == "/lib/libtls.so" {
+                    Some(lib.clone())
+                } else {
+                    None
+                }
+            })
+            .is_none(),
+            "library tls"
+        );
+        let interp = craft_tls(8, 8, &[0xAB], None, &[], true, false, 0);
+        let main = craft_dyn(&[], &[], &[], false, false, Some("/bin/ld.so"));
+        assert!(
+            link_with(main.as_slice(), |path| {
+                if path == "/bin/ld.so" {
+                    Some(interp.clone())
+                } else {
+                    None
+                }
+            })
+            .is_none(),
+            "interpreter tls"
+        );
+
+        let main = craft_tls(8, 8, &init, Some((18, 0, 0)), &["libplain.so"], true, false, 0x800);
+        let lib = craft_dyn(&[], &[], &[], false, false, None);
+        let linked = link_with(main.as_slice(), |path| {
+            if path == "/lib/libplain.so" {
+                Some(lib.clone())
+            } else {
+                None
+            }
+        })
+        .expect("plain library");
+        assert!(linked.objs[0].parsed.tls.is_some());
+        assert!(linked.objs[1].parsed.tls.is_none());
+        assert_eq!(linked.objs[0].parsed.relative[0].tpoff, 8);
+        assert_eq!(linked.objs[0].parsed.relative[0].addend, 0);
+        assert!(linked.objs[0].parsed.relative[0].preempt.is_none());
         serial_println!("[ok]");
     }
 }

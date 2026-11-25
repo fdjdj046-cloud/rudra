@@ -13,6 +13,8 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use core::sync::atomic::AtomicUsize;
 use spin::Mutex;
 
 const SOCKS: usize = 16;
@@ -192,6 +194,15 @@ static LINK: Mutex<Link> = Mutex::new(Link {
 /// Тест подменяет карту. В бою здесь `None`, кадр уходит в virtio.
 static TX: Mutex<Option<Vec<Vec<u8>>>> = Mutex::new(None);
 static ND_BUSY: AtomicBool = AtomicBool::new(false);
+/// Пока удержан, тик таймера не забирает повтор. Принудительный вызов теста — да.
+#[cfg(test)]
+static RTX_HOLD: AtomicBool = AtomicBool::new(false);
+/// Сколько входов `retransmit` уже прошли проверку удержания.
+#[cfg(test)]
+static RTX_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// Истина только на время `retransmit_forced`: удержание его не глушит.
+#[cfg(test)]
+static RTX_FORCE: AtomicBool = AtomicBool::new(false);
 
 struct NdGuard;
 impl Drop for NdGuard {
@@ -1911,10 +1922,64 @@ fn ingest_tcp(src: &[u8; 16], dst: &[u8; 16], segment: &[u8]) {
 
 /// Повтор неподтверждённого. Восемь тихих RTO рвут сокет.
 pub fn retransmit() {
+    #[cfg(test)]
+    if !rtx_enter() {
+        return;
+    }
+    retransmit_segments();
+    #[cfg(test)]
+    {
+        RTX_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn rtx_enter() -> bool {
+    if RTX_HOLD.load(Ordering::SeqCst) {
+        return false;
+    }
+    RTX_DEPTH.fetch_add(1, Ordering::SeqCst);
+    if RTX_HOLD.load(Ordering::SeqCst) {
+        RTX_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+fn rtx_hold(on: bool) {
+    RTX_HOLD.store(on, Ordering::SeqCst);
+}
+
+/// Ждать, пока вход, уже прошедший проверку, допишет кадр. Новые тики держатся.
+#[cfg(test)]
+fn rtx_wait_idle() {
+    let start = crate::time::monotonic_ns();
+    while RTX_DEPTH.load(Ordering::SeqCst) != 0 {
+        if crate::time::monotonic_ns().saturating_sub(start) > 50_000_000 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Повтор этого CPU. Удержание тика не действует.
+#[cfg(test)]
+fn retransmit_forced() {
+    RTX_FORCE.store(true, Ordering::SeqCst);
+    retransmit_segments();
+    RTX_FORCE.store(false, Ordering::SeqCst);
+}
+
+fn retransmit_segments() {
     let now = crate::time::monotonic_ns();
     let mut jobs: Vec<WireOut> = Vec::new();
     with_tcp(|tab| {
         for s in tab.iter_mut().flatten() {
+            #[cfg(test)]
+            if RTX_HOLD.load(Ordering::SeqCst) && !RTX_FORCE.load(Ordering::SeqCst) {
+                continue;
+            }
             if !s.wire || !s.estab || s.unacked.is_empty() {
                 continue;
             }
@@ -2317,16 +2382,32 @@ mod tests {
         assert_eq!(&data[0][74..], b"xy");
         assert_eq!(data[0][67] & TH_PSH, TH_PSH);
         assert!(sum_ok(&data[0], 6));
-        // Захват раньше нулевого штампа: тик другого CPU тоже зовёт retransmit
-        // и иначе уносит повтор в карту до начала захвата.
+        // Тик другого CPU забирает повтор между возвратом retransmit и
+        // capture_take: штамп уже обновлён, кадр уходит в карту после взятия.
+        // Удержание отсекает новый тик и уже вошедший разбор. Сосед снова в
+        // кэше, иначе отправка повторного сегмента молча кончается отказом.
+        super::rtx_hold(true);
+        super::rtx_wait_idle();
+        assert_eq!(super::RTX_DEPTH.load(super::Ordering::SeqCst), 0, "rto idle");
+        super::nd_learn(peer, peer_mac);
+        let busy_at = crate::time::monotonic_ns();
+        while super::ND_BUSY.load(super::Ordering::SeqCst) {
+            if crate::time::monotonic_ns().saturating_sub(busy_at) > 50_000_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        assert!(!super::ND_BUSY.load(super::Ordering::SeqCst), "nd idle");
+        assert_eq!(super::nd_cached(&peer), Some(peer_mac), "peer cached");
         super::capture_begin();
         super::with_tcp(|tab| {
             let s = tab[cli].as_mut().unwrap();
             assert_eq!(s.unacked.len(), 1);
             s.unacked[0].2 = 0;
         });
-        super::retransmit();
+        super::retransmit_forced();
         let again = super::capture_take();
+        super::rtx_hold(false);
         assert_eq!(again.len(), 1, "rto resends");
         assert_eq!(&again[0][74..], b"xy");
         assert!(sum_ok(&again[0], 6));
