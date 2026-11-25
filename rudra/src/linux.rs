@@ -34,6 +34,11 @@
 //! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
 //! `fsync` и `fdatasync` пишут грязный образ файла и оставляют его в fd.
 //! Канал, сокет, консоль и epoll — `EINVAL`. `flock` — успех без блокировки.
+//! `F_SETFL` хранит `O_APPEND` у файла и `O_NONBLOCK` у описания. Чужой бит —
+//! `EINVAL` до поиска fd. `O_APPEND` на канале, сокете, консоли, каталоге и
+//! epoll — `EINVAL`. Канал с `O_NONBLOCK` отдаёт `EAGAIN`, когда читать нечего
+//! или писать некуда. `pipe2` принимает `O_NONBLOCK` и `O_CLOEXEC`. Пустая
+//! консоль с этим флагом — `EAGAIN`. `epoll_wait` ждёт по своему таймауту.
 //! `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
@@ -99,19 +104,23 @@ fn copy_from_user(addr: u64, len: usize) -> Option<Vec<u8>> {
 /// Дескриптор открытого файла задачи.
 #[derive(Clone)]
 pub enum Fd {
-    /// Консоль: fd 0 — клавиатура (блокирующий read), fd 1/2 — вывод.
-    Console { writable: bool },
+    /// Консоль: fd 0 — клавиатура, fd 1/2 — вывод. Без `O_NONBLOCK` чтение
+    /// ждёт байт. С флагом пустая очередь — `EAGAIN`.
+    Console { writable: bool, nonblock: bool },
     /// Файл RFS2. Запись буферизуется в `dirty` и сбрасывается при close
     /// (create-or-replace целиком). accmode: 0 = RDONLY, 1 = WRONLY, 2 = RDWR.
+    /// `O_NONBLOCK` только сообщается: чтение файла не ждёт.
     File {
         name: String,
         offset: u64,
         accmode: u8,
         append: bool,
+        nonblock: bool,
         dirty: Option<Vec<u8>>,
     },
     /// Каталог (синтетический): читается через getdents64.
-    Dir { prefix: String, idx: usize },
+    /// `O_NONBLOCK` только сообщается: getdents не ждёт.
+    Dir { prefix: String, idx: usize, nonblock: bool },
     /// Канал pipe.
     Pipe { id: usize, writable: bool },
     /// UDP-сокет `AF_INET`. `id` — слот в `net`.
@@ -130,7 +139,10 @@ pub enum Fd {
 
 impl Fd {
     pub fn console(writable: bool) -> Fd {
-        Fd::Console { writable }
+        Fd::Console {
+            writable,
+            nonblock: false,
+        }
     }
 
     /// Копия для fork (pipe-канал: +1 ссылка на конец).
@@ -270,6 +282,10 @@ struct PipeChan {
     len: usize,
     readers: usize,
     writers: usize,
+    /// `O_NONBLOCK` конца чтения. Общий для dup этого конца.
+    read_nb: bool,
+    /// `O_NONBLOCK` конца записи. Общий для dup этого конца.
+    write_nb: bool,
 }
 
 static PIPES: Mutex<Vec<Option<PipeChan>>> = Mutex::new(Vec::new());
@@ -285,17 +301,23 @@ fn pipe_chan_add_ref(id: usize, writable: bool) {
     }
 }
 
-fn new_pipe(cloexec: bool) -> (u64, u64) {
-    let mut pipes = PIPES.lock();
-    let chan = PipeChan {
-        ring: Box::new([0u8; PIPE_CAP]),
-        head: 0,
-        len: 0,
-        readers: 1,
-        writers: 1,
+fn new_pipe(cloexec: bool, nonblock: bool) -> (u64, u64) {
+    let id = {
+        let mut pipes = PIPES.lock();
+        let chan = PipeChan {
+            ring: Box::new([0u8; PIPE_CAP]),
+            head: 0,
+            len: 0,
+            readers: 1,
+            writers: 1,
+            read_nb: nonblock,
+            write_nb: nonblock,
+        };
+        let id = pipes.len();
+        pipes.push(Some(chan));
+        id
     };
-    let id = pipes.len();
-    pipes.push(Some(chan));
+    // Канал уже в таблице. Лок отпускаем до fd: F_GETFL берёт fd, потом канал.
     let r = with_current_fds(|fds| {
         let mut r = Some(Fd::Pipe { id, writable: false });
         let rfd = alloc_fd(&mut r, fds, cloexec);
@@ -310,8 +332,11 @@ fn new_pipe(cloexec: bool) -> (u64, u64) {
 }
 
 fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     loop {
-        let (n, writers) = {
+        let (n, writers, nb) = {
             let mut pipes = PIPES.lock();
             match pipes.get_mut(id).and_then(|p| p.as_mut()) {
                 Some(p) if p.len > 0 => {
@@ -321,9 +346,9 @@ fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
                         p.head = (p.head + 1) % PIPE_CAP;
                     }
                     p.len -= n;
-                    (n, p.writers)
+                    (n, p.writers, p.read_nb)
                 }
-                Some(p) => (0, p.writers),
+                Some(p) => (0, p.writers, p.read_nb),
                 None => return EPIPE,
             }
         };
@@ -333,6 +358,9 @@ fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
         if writers == 0 {
             return 0; // EOF
         }
+        if nb {
+            return EAGAIN;
+        }
         if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
             return EINTR;
         }
@@ -341,12 +369,15 @@ fn pipe_read(id: usize, buf: &mut [u8]) -> u64 {
 }
 
 fn pipe_write(id: usize, buf: &[u8]) -> u64 {
+    if buf.is_empty() {
+        return 0;
+    }
     let mut done = 0;
     while done < buf.len() {
-        let (space, readers) = {
+        let (space, readers, nb) = {
             let mut pipes = PIPES.lock();
             match pipes.get_mut(id).and_then(|p| p.as_mut()) {
-                Some(p) => (PIPE_CAP - p.len, p.readers),
+                Some(p) => (PIPE_CAP - p.len, p.readers, p.write_nb),
                 None => return EPIPE,
             }
         };
@@ -354,6 +385,9 @@ fn pipe_write(id: usize, buf: &[u8]) -> u64 {
             return EPIPE;
         }
         if space == 0 {
+            if nb {
+                return if done == 0 { EAGAIN } else { done as u64 };
+            }
             if crate::signal::pending_interrupts() && !crate::signal::keep_waiting() {
                 return if done == 0 { EINTR } else { done as u64 };
             }
@@ -1930,7 +1964,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // Определяем вид fd коротко под локом, читаем без удержания лока
     // (консоль/pipe блокируются — их ждущие циклы не должны держать таблицу).
     enum Kind {
-        Console,
+        Console(bool),
         Pipe(usize),
         Udp,
         Tcp(usize),
@@ -1941,7 +1975,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         Bad(u64),
     }
     let kind = with_current_fds(|fds| match fds.get_mut(fd as usize).and_then(|x| x.as_mut()) {
-        Some(Fd::Console { writable: false }) => Kind::Console,
+        Some(Fd::Console { writable: false, nonblock }) => Kind::Console(*nonblock),
         Some(Fd::Udp { .. }) => Kind::Udp,
         Some(Fd::Tcp { id }) => Kind::Tcp(*id),
         Some(Fd::Udp6 { .. }) => Kind::Udp6,
@@ -1963,7 +1997,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         Ok(Kind::Udp) | Ok(Kind::Udp6) | Ok(Kind::Nl) => sys_recvfrom(fd, buf, len, 0, 0, 0),
         Ok(Kind::Tcp(id)) => tcp_read(id, buf, len, 0, 0),
         Ok(Kind::Tcp6(id)) => tcp6_read(id, buf, len, 0, 0),
-        Ok(Kind::Console) => console_read(buf, len),
+        Ok(Kind::Console(nonblock)) => console_read(buf, len, nonblock),
         Ok(Kind::Pipe(id)) => {
             let mut tmp = alloc::vec![0u8; len as usize];
             let n = pipe_read(id, &mut tmp);
@@ -2015,9 +2049,16 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 
 /// Упрощённое чтение консоли: побайтово из очереди клавиатуры.
 /// Сигнал это чтение не прерывает: здесь блокируется строка шелла.
-fn console_read(buf: u64, len: u64) -> u64 {
+fn console_read(buf: u64, len: u64, nonblock: bool) -> u64 {
     for i in 0..len {
-        let b = console_read_byte();
+        let b = if nonblock {
+            match crate::input::with_input(|q| q.pop()) {
+                Some(b) => b,
+                None => return if i == 0 { EAGAIN } else { i },
+            }
+        } else {
+            console_read_byte()
+        };
         if !u_write(buf + i, &[b]) {
             return if i == 0 { EFAULT } else { i };
         }
@@ -2045,7 +2086,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         Bad,
     }
     let kind = with_current_fds(|fds| match fds.get_mut(fd as usize).and_then(|x| x.as_mut()) {
-        Some(Fd::Console { writable: true }) => Kind::Console,
+        Some(Fd::Console { writable: true, .. }) => Kind::Console,
         Some(Fd::Pipe { id, writable: true }) => Kind::Pipe(*id),
         Some(Fd::Udp { id }) => Kind::Udp(*id),
         Some(Fd::Tcp { id }) => Kind::Tcp(*id),
@@ -2148,6 +2189,7 @@ fn sys_fsync(fd: u64) -> u64 {
             offset: 0,
             accmode: 1,
             append: false,
+            nonblock: false,
             dirty: Some(data),
         }),
         FsyncSnap::Clean => 0,
@@ -2278,6 +2320,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
     const O_CREAT: u64 = 0x40;
     const O_TRUNC: u64 = 0x200;
     const O_APPEND: u64 = 0x400;
+    const O_NONBLOCK: u64 = 0x800;
     const O_DIRECTORY: u64 = 0x10000;
     const O_CLOEXEC: u64 = 0x80000;
 
@@ -2322,7 +2365,11 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
 
     if is_dir {
         if want_dir || accmode == 0 {
-            let mut slot = Some(Fd::Dir { prefix: canon, idx: 0 });
+            let mut slot = Some(Fd::Dir {
+                prefix: canon,
+                idx: 0,
+                nonblock: flags & O_NONBLOCK != 0,
+            });
             return with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)).unwrap_or(EMFILE);
         }
         return EISDIR;
@@ -2356,6 +2403,7 @@ fn sys_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
         offset: 0,
         accmode: accmode as u8,
         append: flags & O_APPEND != 0,
+        nonblock: flags & O_NONBLOCK != 0,
         dirty,
     });
     with_current_fds(|fds| alloc_fd(&mut slot, fds, cloexec)).unwrap_or(EMFILE)
@@ -2788,6 +2836,162 @@ fn dup_at_least(fds: &mut Fds, slot: &mut Option<Fd>, min: u64, cloexec: bool) -
     i
 }
 
+fn pipe_end_nonblock(id: usize, writable: bool) -> bool {
+    let pipes = PIPES.lock();
+    pipes
+        .get(id)
+        .and_then(|p| p.as_ref())
+        .map(|p| if writable { p.write_nb } else { p.read_nb })
+        .unwrap_or(false)
+}
+
+fn pipe_set_nonblock(id: usize, writable: bool, on: bool) -> u64 {
+    let mut pipes = PIPES.lock();
+    let Some(p) = pipes.get_mut(id).and_then(|p| p.as_mut()) else {
+        return EBADF;
+    };
+    if writable {
+        p.write_nb = on;
+    } else {
+        p.read_nb = on;
+    }
+    0
+}
+
+fn epoll_nonblock(id: usize) -> bool {
+    with_epolls(|tab| {
+        tab.get(id)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.nonblock)
+            .unwrap_or(false)
+    })
+}
+
+fn epoll_set_nonblock(id: usize, on: bool) -> u64 {
+    with_epolls(|tab| {
+        let Some(set) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return EBADF;
+        };
+        set.nonblock = on;
+        0
+    })
+}
+
+/// Куда дописать `O_NONBLOCK`, если он не лежит прямо в `Fd`.
+enum FlFollow {
+    Done,
+    Pipe(usize, bool),
+    Udp(usize),
+    Tcp(usize),
+    Udp6(usize),
+    Tcp6(usize),
+    Nl(usize),
+    Epoll(usize),
+    Reject(u64),
+}
+
+/// `O_ACCMODE` не пишется. `O_APPEND` — только файл. Остальное отвергает
+/// вызывающий ещё до поиска fd.
+fn apply_setfl(f: &mut Fd, append: bool, nonblock: bool) -> FlFollow {
+    match f {
+        Fd::File {
+            append: slot,
+            nonblock: nb,
+            ..
+        } => {
+            *slot = append;
+            *nb = nonblock;
+            FlFollow::Done
+        }
+        _ if append => FlFollow::Reject(EINVAL),
+        Fd::Dir { nonblock: nb, .. } => {
+            *nb = nonblock;
+            FlFollow::Done
+        }
+        Fd::Console { nonblock: nb, .. } => {
+            *nb = nonblock;
+            FlFollow::Done
+        }
+        Fd::Pipe { id, writable } => FlFollow::Pipe(*id, *writable),
+        Fd::Udp { id } => FlFollow::Udp(*id),
+        Fd::Tcp { id } => FlFollow::Tcp(*id),
+        Fd::Udp6 { id } => FlFollow::Udp6(*id),
+        Fd::Tcp6 { id } => FlFollow::Tcp6(*id),
+        Fd::Nl { id } => FlFollow::Nl(*id),
+        Fd::Epoll { id } => FlFollow::Epoll(*id),
+    }
+}
+
+fn fd_status_flags(f: &Fd) -> u64 {
+    match f {
+        Fd::File {
+            accmode,
+            append,
+            nonblock,
+            ..
+        } => {
+            (*accmode as u64)
+                | if *append { 0x400 } else { 0 }
+                | if *nonblock { 0x800 } else { 0 }
+        }
+        Fd::Dir { nonblock, .. } => {
+            if *nonblock {
+                0x800
+            } else {
+                0
+            }
+        }
+        Fd::Console { writable, nonblock } => {
+            *writable as u64 | if *nonblock { 0x800 } else { 0 }
+        }
+        Fd::Pipe { id, writable } => {
+            *writable as u64 | if pipe_end_nonblock(*id, *writable) { 0x800 } else { 0 }
+        }
+        Fd::Udp { id } => 2 | if crate::net::udp_nonblock(*id) { 0x800 } else { 0 },
+        Fd::Tcp { id } => 1 | if crate::net::tcp_nonblock(*id) { 0x800 } else { 0 },
+        Fd::Udp6 { id } => 2 | if crate::net6::udp_nonblock(*id) { 0x800 } else { 0 },
+        Fd::Tcp6 { id } => 1 | if crate::net6::tcp_nonblock(*id) { 0x800 } else { 0 },
+        Fd::Nl { id } => {
+            crate::netlink::sock_type(*id).unwrap_or(0) as u64
+                | if crate::netlink::nonblock(*id) { 0x800 } else { 0 }
+        }
+        Fd::Epoll { id } => 2 | if epoll_nonblock(*id) { 0x800 } else { 0 },
+    }
+}
+
+fn sys_setfl(fd: u64, append: bool, nonblock: bool) -> u64 {
+    let follow = match with_fd(fd, |f| apply_setfl(f, append, nonblock)) {
+        Ok(follow) => follow,
+        Err(e) => return e,
+    };
+    match follow {
+        FlFollow::Done => 0,
+        FlFollow::Reject(e) => e,
+        FlFollow::Pipe(id, writable) => pipe_set_nonblock(id, writable, nonblock),
+        FlFollow::Udp(id) => match crate::net::udp_set_nonblock(id, nonblock) {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        },
+        FlFollow::Tcp(id) => match crate::net::tcp_set_nonblock(id, nonblock) {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        },
+        FlFollow::Udp6(id) => match crate::net6::udp_set_nonblock(id, nonblock) {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        },
+        FlFollow::Tcp6(id) => match crate::net6::tcp_set_nonblock(id, nonblock) {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        },
+        FlFollow::Nl(id) => match crate::netlink::set_nonblock(id, nonblock) {
+            Ok(()) => 0,
+            Err(e) => neg_err(e),
+        },
+        FlFollow::Epoll(id) => epoll_set_nonblock(id, nonblock),
+    }
+}
+
 fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     match cmd {
         0 | 1030 => {
@@ -2824,35 +3028,25 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             0
         })
         .unwrap_or(EBADF),
-        3 => {
-            // F_GETFL: accmode в младших битах
-            with_fd(fd, |f| match f {
-                Fd::File { accmode, append, .. } => {
-                    (*accmode as u64) | if *append { 0x400 } else { 0 }
-                }
-                Fd::Dir { .. } => 0,
-                Fd::Console { writable } => *writable as u64,
-                Fd::Pipe { writable, .. } => *writable as u64,
-                Fd::Udp { id } => 2 | if crate::net::udp_nonblock(*id) { 0x800 } else { 0 },
-                Fd::Tcp { id } => 1 | if crate::net::tcp_nonblock(*id) { 0x800 } else { 0 },
-                Fd::Udp6 { id } => 2 | if crate::net6::udp_nonblock(*id) { 0x800 } else { 0 },
-                Fd::Tcp6 { id } => 1 | if crate::net6::tcp_nonblock(*id) { 0x800 } else { 0 },
-                Fd::Nl { id } => {
-                    crate::netlink::sock_type(*id).unwrap_or(0) as u64
-                        | if crate::netlink::nonblock(*id) { 0x800 } else { 0 }
-                }
-                Fd::Epoll { .. } => 2,
-            })
-            .unwrap_or(EBADF)
+        3 => with_fd(fd, |f| fd_status_flags(f)).unwrap_or(EBADF), // F_GETFL
+        4 => {
+            // F_SETFL. Чужой бит — до поиска fd. O_ACCMODE программы игнорируют:
+            // обычный ход это GETFL | O_NONBLOCK.
+            const O_ACCMODE: u64 = 3;
+            const O_APPEND: u64 = 0x400;
+            const O_NONBLOCK: u64 = 0x800;
+            if arg & !(O_ACCMODE | O_APPEND | O_NONBLOCK) != 0 {
+                return EINVAL;
+            }
+            sys_setfl(fd, arg & O_APPEND != 0, arg & O_NONBLOCK != 0)
         }
-        4 => 0, // F_SETFL
         _ => 0,
     }
 }
 
 fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
     let r = with_fd(fd, |f| match f {
-        Fd::Dir { prefix, idx } => {
+        Fd::Dir { prefix, idx, .. } => {
             let names = crate::fs::list_dir(prefix);
             let is_root = prefix == "/";
             let mut written = 0u64;
@@ -2896,15 +3090,16 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> u64 {
 }
 
 fn sys_pipe(fds_ptr: u64, flags: u64) -> u64 {
+    const O_NONBLOCK: u64 = 0x800;
     const O_CLOEXEC: u64 = 0x80000;
     if fds_ptr == 0 {
         return EFAULT;
     }
-    // O_NONBLOCK у канала нет: не делаем вид, что флаг принят.
-    if flags & !O_CLOEXEC != 0 {
+    // Чужой бит — EINVAL. O_NONBLOCK ставится обоим концам.
+    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
         return EINVAL;
     }
-    let (r, w) = new_pipe(flags & O_CLOEXEC != 0);
+    let (r, w) = new_pipe(flags & O_CLOEXEC != 0, flags & O_NONBLOCK != 0);
     let mut raw = [0u8; 8];
     raw[0..4].copy_from_slice(&(r as u32).to_le_bytes());
     raw[4..8].copy_from_slice(&(w as u32).to_le_bytes());
@@ -2974,7 +3169,7 @@ fn ready_locked(fds: &[Option<Fd>], fd: u64, events: i16, depth: u8) -> i16 {
     };
     let mut revents = 0i16;
     match f {
-        Fd::Console { writable } => {
+        Fd::Console { writable, .. } => {
             if !writable && events & POLLIN != 0 && crate::input::with_input(|q| q.len() > 0) {
                 revents |= POLLIN;
             }
@@ -3093,6 +3288,8 @@ struct EpollSet {
     /// Последняя наблюдавшаяся готовность по слоту: для EPOLLET доставляем
     /// только фронт 0 → готово.
     last: [u32; EPOLL_MAX_ITEMS],
+    /// `O_NONBLOCK` описания. `epoll_wait` его не смотрит.
+    nonblock: bool,
 }
 
 static EPOLLS: Mutex<Vec<Option<EpollSet>>> = Mutex::new(Vec::new());
@@ -3119,6 +3316,7 @@ fn epoll_alloc() -> Result<usize, u64> {
             refs: 1,
             items: [None; EPOLL_MAX_ITEMS],
             last: [0; EPOLL_MAX_ITEMS],
+            nonblock: false,
         };
         if let Some(i) = tab.iter().position(|s| s.is_none()) {
             tab[i] = Some(set);
@@ -3325,6 +3523,7 @@ fn epoll_wait_core(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> 
     }
     let max = max as usize;
     // Таймаут — int в младших 32 битах: userspace кладёт -1 через mov r10d.
+    // O_NONBLOCK описания сюда не входит: срок задаёт этот аргумент.
     let t = timeout as i32;
     if t < -1 {
         return EINVAL;
@@ -3860,7 +4059,7 @@ mod tests {
         fds.set_cloexec(0, true);
         fds.set_cloexec(1, true);
         let prev = place_dup(&mut fds, 1, Fd::console(false), true);
-        assert!(matches!(prev, Some(Fd::Console { writable: true })));
+        assert!(matches!(prev, Some(Fd::Console { writable: true, .. })));
         assert!(fds.is_cloexec(0));
         assert!(fds.is_cloexec(1));
         // Флаги 0 сбрасывают бит нового номера. Бит источника остаётся.
@@ -3883,6 +4082,8 @@ mod tests {
                 len: 0,
                 readers: 1,
                 writers: 1,
+                read_nb: false,
+                write_nb: false,
             }));
             pipes.len() - 1
         };
@@ -3930,6 +4131,7 @@ mod tests {
             fsync_of(&Fd::Dir {
                 prefix: "/".into(),
                 idx: 0,
+                nonblock: false,
             }),
             0
         );
@@ -3938,6 +4140,7 @@ mod tests {
             offset: 0,
             accmode: 0,
             append: false,
+            nonblock: false,
             dirty: None,
         };
         assert_eq!(fsync_of(&clean), 0);
@@ -3948,6 +4151,7 @@ mod tests {
             offset: 3,
             accmode: 1,
             append: false,
+            nonblock: false,
             dirty: Some(alloc::vec![b'n', b'e', b'w', b'-', b'b', b'y', b't', b'e', b's']),
         };
         assert_eq!(fsync_of(&dirty), 0);
@@ -3959,6 +4163,197 @@ mod tests {
         let n = crate::fs::read_path(b"/fsync-proof.txt", &mut buf) as usize;
         assert_eq!(&buf[..n], b"new-bytes");
         assert!(crate::fs::delete_path(b"/fsync-proof.txt"));
+        crate::serial_println!("[ok]");
+    }
+
+    fn push_test_pipe(read_nb: bool, write_nb: bool) -> usize {
+        let mut pipes = PIPES.lock();
+        pipes.push(Some(PipeChan {
+            ring: Box::new([0u8; PIPE_CAP]),
+            head: 0,
+            len: 0,
+            readers: 1,
+            writers: 1,
+            read_nb,
+            write_nb,
+        }));
+        pipes.len() - 1
+    }
+
+    #[test_case]
+    fn fsetfl_stores_nonblock_and_a_pipe_returns_eagain() {
+        crate::serial_print!("test fsetfl_stores_nonblock_and_a_pipe_returns_eagain... ");
+        // Чужой бит — EINVAL до поиска fd. Раннер — не задача.
+        assert_eq!(sys_fcntl(0, 4, 0x4000), EINVAL);
+        assert_eq!(sys_fcntl(7, 4, 0x800 | 0x4000), EINVAL);
+        assert_eq!(sys_pipe(1, 0x800 | 1), EINVAL);
+        assert_eq!(sys_pipe(1, 0x1000), EINVAL);
+        // Верная маска доходит до таблицы.
+        assert_eq!(sys_fcntl(0, 4, 0), EPERM);
+        assert_eq!(sys_fcntl(0, 4, 0x800), EPERM);
+        assert_eq!(sys_fcntl(0, 4, 0x400), EPERM);
+        assert_eq!(sys_fcntl(0, 4, 3 | 0x400 | 0x800), EPERM);
+        // Незнакомая команда fcntl по-прежнему успех без действия.
+        assert_eq!(sys_fcntl(0, 99, 0x800), 0);
+
+        let mut file = Fd::File {
+            name: "/unused".into(),
+            offset: 0,
+            accmode: 2,
+            append: false,
+            nonblock: false,
+            dirty: None,
+        };
+        assert_eq!(fd_status_flags(&file), 2);
+        assert!(matches!(apply_setfl(&mut file, true, true), FlFollow::Done));
+        assert_eq!(fd_status_flags(&file), 2 | 0x400 | 0x800);
+        assert!(matches!(apply_setfl(&mut file, false, false), FlFollow::Done));
+        assert_eq!(fd_status_flags(&file), 2);
+
+        let mut dir = Fd::Dir {
+            prefix: "/".into(),
+            idx: 0,
+            nonblock: false,
+        };
+        assert!(matches!(apply_setfl(&mut dir, true, true), FlFollow::Reject(e) if e == EINVAL));
+        assert_eq!(fd_status_flags(&dir), 0);
+        assert!(matches!(apply_setfl(&mut dir, false, true), FlFollow::Done));
+        assert_eq!(fd_status_flags(&dir), 0x800);
+
+        let mut con = Fd::console(false);
+        assert!(matches!(
+            apply_setfl(&mut con, true, false),
+            FlFollow::Reject(e) if e == EINVAL
+        ));
+        assert_eq!(fd_status_flags(&con), 0);
+        assert!(matches!(apply_setfl(&mut con, false, true), FlFollow::Done));
+        assert_eq!(fd_status_flags(&con), 0x800);
+        let mut out = Fd::console(true);
+        assert!(matches!(apply_setfl(&mut out, false, true), FlFollow::Done));
+        assert_eq!(fd_status_flags(&out), 1 | 0x800);
+        while crate::input::with_input(|q| q.pop()).is_some() {}
+        assert_eq!(console_read(0x1000, 1, true), EAGAIN);
+
+        let id = push_test_pipe(false, false);
+        let mut pend = Fd::Pipe { id, writable: true };
+        assert!(matches!(
+            apply_setfl(&mut pend, true, true),
+            FlFollow::Reject(e) if e == EINVAL
+        ));
+        assert!(!pipe_end_nonblock(id, true));
+        assert!(matches!(
+            apply_setfl(&mut pend, false, true),
+            FlFollow::Pipe(got, true) if got == id
+        ));
+        assert_eq!(pipe_set_nonblock(id, true, true), 0);
+        assert!(pipe_end_nonblock(id, true));
+        assert!(!pipe_end_nonblock(id, false));
+        assert_eq!(fd_status_flags(&pend), 1 | 0x800);
+        {
+            let mut pipes = PIPES.lock();
+            pipes[id].as_mut().unwrap().len = PIPE_CAP;
+        }
+        assert_eq!(pipe_write(id, b"xy"), EAGAIN);
+        assert_eq!(pipe_set_nonblock(id, false, true), 0);
+        {
+            let mut pipes = PIPES.lock();
+            let p = pipes[id].as_mut().unwrap();
+            p.len = 0;
+            p.head = 0;
+        }
+        let mut got = [0u8; 4];
+        assert_eq!(pipe_read(id, &mut got), EAGAIN);
+        assert_eq!(pipe_write(id, b"ab"), 2);
+        assert_eq!(pipe_read(id, &mut got), 2);
+        assert_eq!(&got[..2], b"ab");
+        assert_eq!(pipe_read(id, &mut got), EAGAIN);
+        {
+            let mut pipes = PIPES.lock();
+            pipes[id].as_mut().unwrap().len = PIPE_CAP - 1;
+        }
+        assert_eq!(pipe_write(id, b"zz"), 1);
+        assert_eq!(pipe_write(id, b"q"), EAGAIN);
+        {
+            let mut pipes = PIPES.lock();
+            let p = pipes[id].as_mut().unwrap();
+            p.len = 0;
+            p.writers = 0;
+        }
+        assert_eq!(pipe_read(id, &mut got), 0);
+        {
+            let mut pipes = PIPES.lock();
+            pipes[id].as_mut().unwrap().readers = 0;
+        }
+        assert_eq!(pipe_write(id, b"q"), EPIPE);
+        pipe_close_end(id, false);
+        pipe_close_end(id, true);
+        assert!(PIPES.lock()[id].is_none());
+
+        // Блокирующий канал с местом не отдаёт EAGAIN. Пустой read не зовём.
+        let idb = push_test_pipe(false, false);
+        assert_eq!(pipe_write(idb, b"ab"), 2);
+        let mut block = [0u8; 2];
+        assert_eq!(pipe_read(idb, &mut block), 2);
+        assert_eq!(&block, b"ab");
+        assert!(!pipe_end_nonblock(idb, false));
+        assert!(!pipe_end_nonblock(idb, true));
+        pipe_close_end(idb, false);
+        pipe_close_end(idb, true);
+
+        let uid = crate::net::udp_open(false).expect("udp");
+        let mut ufd = Fd::Udp { id: uid };
+        assert!(matches!(apply_setfl(&mut ufd, false, true), FlFollow::Udp(got) if got == uid));
+        assert!(crate::net::udp_set_nonblock(uid, true).is_ok());
+        assert!(crate::net::udp_nonblock(uid));
+        assert_eq!(fd_status_flags(&ufd), 2 | 0x800);
+        assert!(matches!(apply_setfl(&mut ufd, true, true), FlFollow::Reject(e) if e == EINVAL));
+        assert!(crate::net::udp_nonblock(uid));
+        assert!(crate::net::udp_set_nonblock(64, true).is_err());
+        crate::net::udp_close(uid);
+
+        let tid = crate::net::tcp_open(false).expect("tcp");
+        let mut tfd = Fd::Tcp { id: tid };
+        assert!(matches!(apply_setfl(&mut tfd, false, true), FlFollow::Tcp(got) if got == tid));
+        assert!(crate::net::tcp_set_nonblock(tid, true).is_ok());
+        assert_eq!(fd_status_flags(&tfd), 1 | 0x800);
+        crate::net::tcp_set_nonblock(tid, false).expect("clear");
+        assert!(!crate::net::tcp_nonblock(tid));
+        crate::net::tcp_close(tid);
+
+        let u6 = crate::net6::udp_open(false).expect("udp6");
+        let mut u6fd = Fd::Udp6 { id: u6 };
+        assert!(matches!(apply_setfl(&mut u6fd, false, true), FlFollow::Udp6(got) if got == u6));
+        assert!(crate::net6::udp_set_nonblock(u6, true).is_ok());
+        assert_eq!(fd_status_flags(&u6fd), 2 | 0x800);
+        crate::net6::udp_close(u6);
+
+        let t6 = crate::net6::tcp_open(false).expect("tcp6");
+        let mut t6fd = Fd::Tcp6 { id: t6 };
+        assert!(matches!(apply_setfl(&mut t6fd, false, true), FlFollow::Tcp6(got) if got == t6));
+        assert!(crate::net6::tcp_set_nonblock(t6, true).is_ok());
+        assert_eq!(fd_status_flags(&t6fd), 1 | 0x800);
+        crate::net6::tcp_close(t6);
+
+        let nid = crate::netlink::open(2, 0, false).expect("nl");
+        let mut nfd = Fd::Nl { id: nid };
+        assert!(matches!(apply_setfl(&mut nfd, false, true), FlFollow::Nl(got) if got == nid));
+        assert!(crate::netlink::set_nonblock(nid, true).is_ok());
+        assert!(crate::netlink::nonblock(nid));
+        assert_eq!(fd_status_flags(&nfd), 2 | 0x800);
+        crate::netlink::close(nid);
+
+        let eid = epoll_alloc().expect("ep");
+        let mut ep = Fd::Epoll { id: eid };
+        assert_eq!(fd_status_flags(&ep), 2);
+        assert!(matches!(apply_setfl(&mut ep, true, true), FlFollow::Reject(e) if e == EINVAL));
+        assert_eq!(fd_status_flags(&ep), 2);
+        assert!(matches!(apply_setfl(&mut ep, false, true), FlFollow::Epoll(got) if got == eid));
+        assert_eq!(epoll_set_nonblock(eid, true), 0);
+        assert_eq!(fd_status_flags(&ep), 2 | 0x800);
+        assert_eq!(epoll_set_nonblock(eid, false), 0);
+        assert_eq!(fd_status_flags(&ep), 2);
+        epoll_decref(eid);
+
         crate::serial_println!("[ok]");
     }
 }

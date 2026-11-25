@@ -787,6 +787,16 @@ pub fn udp_nonblock(id: usize) -> bool {
     })
 }
 
+pub fn udp_set_nonblock(id: usize, on: bool) -> Result<(), i32> {
+    with_udp(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        s.nonblock = on;
+        Ok(())
+    })
+}
+
 pub fn udp_pending(id: usize) -> bool {
     crate::net::pump();
     with_udp(|tab| {

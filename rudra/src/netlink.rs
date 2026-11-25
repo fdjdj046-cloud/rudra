@@ -24,6 +24,7 @@ pub const REQ_MAX: usize = 4096;
 
 pub const EAGAIN: i32 = 11;
 pub const EBADF: i32 = 9;
+pub const EFAULT: i32 = 14;
 pub const ENODEV: i32 = 19;
 pub const EINVAL: i32 = 22;
 pub const ENFILE: i32 = 23;
@@ -167,6 +168,16 @@ pub fn nonblock(id: usize) -> bool {
             .and_then(|s| s.as_ref())
             .map(|s| s.nonblock)
             .unwrap_or(false)
+    })
+}
+
+pub fn set_nonblock(id: usize, on: bool) -> Result<(), i32> {
+    with_tab(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        s.nonblock = on;
+        Ok(())
     })
 }
 

@@ -165,6 +165,16 @@ pub fn udp_nonblock(id: usize) -> bool {
     with_socks(|tab| tab.get(id).and_then(|s| s.as_ref()).map(|s| s.nonblock).unwrap_or(false))
 }
 
+pub fn udp_set_nonblock(id: usize, on: bool) -> Result<(), i32> {
+    with_socks(|tab| {
+        let Some(s) = tab.get_mut(id).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        s.nonblock = on;
+        Ok(())
+    })
+}
+
 pub fn udp_pending(id: usize) -> bool {
     pump();
     with_socks(|tab| {
