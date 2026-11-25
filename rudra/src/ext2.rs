@@ -4,7 +4,7 @@
 //! Отдельный диск, у которого суперблок в байте 1024, тоже монтируется.
 //! ext2: одна группа, блоки до 4096, inode 128 или 256, прямой и один косвенный
 //! блок. ext4 монтируется только на чтение, если в incompat нет ничего, кроме
-//! filetype, extents, flex_bg, 64bit и metadata_csum_seed. Дескриптор группы — `s_desc_size`
+//! filetype, extents, flex_bg, 64bit, metadata_csum_seed и RECOVER. Дескриптор группы — `s_desc_size`
 //! (степень двойки от 64 до размера блока), номер inode-таблицы собирается
 //! из младшей и старшей половин. Число блоков тоже 64-битное. Дерево extent
 //! (корень в inode, глубина до 5) отдаёт физический блок до 48 бит; дыра и
@@ -13,8 +13,10 @@
 //! (меньше 60 байт и без блоков) лежит в `i_block`. `metadata_csum` проверяется
 //! crc32c (суперблок, дескриптор группы, inode, блок каталога, блок extent).
 //! Старый `gdt_csum` без `metadata_csum` проверяет дескриптор группы crc16.
-//! Запись такого тома — `EROFS`. Журнал не проигрывается (флаг RECOVER
-//! отвергает монтирование). `RFS2` остаётся recovery, если суперблок не подошёл.
+//! Запись такого тома — `EROFS`. Журнал с `RECOVER` проигрывается в память
+//! и диск не меняет: суперблок jbd2 v2, revoke, 64bit и csum v3. `s_start == 0`
+//! значит, что журнал чистый. Иной журнал отвергает монтирование. `RFS2`
+//! остаётся recovery, если суперблок не подошёл.
 
 use alloc::string::String;
 use alloc::vec;
@@ -27,6 +29,8 @@ use crate::fs::{parent, FsError};
 pub const EMBED_OFF: u64 = 16 * 1024 * 1024;
 
 const FILETYPE: u32 = 0x2;
+/// ext4 `EXT4_FEATURE_INCOMPAT_RECOVER`. Журнал есть и его надо проиграть.
+const RECOVER: u32 = 0x4;
 const BIT64: u32 = 0x80;
 /// Зерно crc32c лежит в суперблоке (`s_checksum_seed`), а не считается из UUID.
 const CSUM_SEED: u32 = 0x2000;
@@ -75,6 +79,9 @@ struct Vol {
     ib: Vec<u8>,
     sb: Vec<u8>,
     gd: Vec<u8>,
+    /// Блоки журнала, перекрывшие диск в памяти. Ключ — номер блока ФС.
+    /// Пусто, если журнала нет или он чистый. На диск это не пишется.
+    replay: Vec<(u64, Vec<u8>)>,
 }
 
 static EXT2: Mutex<Option<Vol>> = Mutex::new(None);
@@ -104,8 +111,12 @@ pub fn mount() {
             Ok(vol) => {
                 if vol.readonly {
                     crate::serial_println!(
-                        "[ext4] read-only off {:#x} block {} blocks {} inodes {}",
-                        vol.off, vol.block_size, vol.blocks_count, vol.inodes_count
+                        "[ext4] read-only off {:#x} block {} blocks {} inodes {} replay {}",
+                        vol.off,
+                        vol.block_size,
+                        vol.blocks_count,
+                        vol.inodes_count,
+                        vol.replay.len()
                     );
                     *EXT2.lock() = Some(vol);
                     crate::serial_println!("[root] ext4 on virtio-blk");
@@ -415,7 +426,11 @@ impl Vol {
             ib,
             sb,
             gd,
+            replay: Vec::new(),
         };
+        if incompat & RECOVER != 0 {
+            vol.recover_journal()?;
+        }
         if readonly {
             return Ok(vol);
         }
@@ -458,6 +473,14 @@ impl Vol {
         let block = block.into();
         if block >= self.blocks_count || buf.len() < self.block_size {
             return Err(FsError::Io);
+        }
+        if let Ok(i) = self.replay.binary_search_by_key(&block, |e| e.0) {
+            let src = &self.replay[i].1;
+            if src.len() < self.block_size {
+                return Err(FsError::Io);
+            }
+            buf[..self.block_size].copy_from_slice(&src[..self.block_size]);
+            return Ok(());
         }
         let byte = match block.checked_mul(self.block_size as u64) {
             Some(n) => self.off.saturating_add(n),
@@ -575,18 +598,33 @@ impl Vol {
         }
     }
 
+    fn read_group_desc(&self, group: u32) -> Result<Vec<u8>, FsError> {
+        let groups = self.blocks_count.div_ceil(self.blocks_per_group as u64);
+        if group as u64 >= groups {
+            return Err(FsError::Io);
+        }
+        let gdt = if self.block_size <= 1024 {
+            2048u64
+        } else {
+            self.block_size as u64
+        };
+        let byte = gdt + group as u64 * self.desc_size as u64;
+        let block = byte / self.block_size as u64;
+        let inner = (byte % self.block_size as u64) as usize;
+        if inner.saturating_add(self.desc_size) > self.block_size {
+            return Err(FsError::Io);
+        }
+        let mut blk = vec![0u8; self.block_size];
+        self.read_block(block, &mut blk)?;
+        Ok(blk[inner..inner + self.desc_size].to_vec())
+    }
+
     fn inode_table_of(&self, ino: u32) -> Result<u64, FsError> {
         let group = (ino - 1) / self.inodes_per_group;
         if !self.readonly {
             return Ok(self.inode_table);
         }
-        let groups = self.blocks_count.div_ceil(self.blocks_per_group as u64);
-        if group as u64 >= groups {
-            return Err(FsError::Io);
-        }
-        let mut gd = vec![0u8; self.desc_size];
-        let byte = gdt_byte(self.off, self.block_size) + group as u64 * self.desc_size as u64;
-        read_abs(byte, &mut gd)?;
+        let gd = self.read_group_desc(group)?;
         if self.metadata_csum && !gd_csum_ok(self.csum_seed, group, &gd) {
             return Err(FsError::Io);
         }
@@ -594,6 +632,58 @@ impl Vol {
             return Err(FsError::Io);
         }
         gd_inode_table(&gd)
+    }
+
+    /// Проиграть внутренний журнал в `replay`. Диск не пишется, флаг RECOVER
+    /// на диске остаётся. Инода журнала читается до проигрыша: так же делает Linux.
+    fn recover_journal(&mut self) -> Result<(), &'static str> {
+        if self.sb.len() < 0xE4 {
+            return Err("journal");
+        }
+        let inum = get_u32(&self.sb, 0xE0);
+        if inum == 0 || inum > self.inodes_count {
+            return Err("journal");
+        }
+        let inode = self.read_inode(inum).map_err(|_| "journal")?;
+        if self.block_size == 0 {
+            return Err("journal");
+        }
+        let size = inode_bytes(&inode);
+        if size == 0 || size % self.block_size as u64 != 0 {
+            return Err("journal");
+        }
+        let nblocks_u = size / self.block_size as u64;
+        if nblocks_u > u32::MAX as u64 {
+            return Err("journal");
+        }
+        let nblocks = nblocks_u as u32;
+        let bs = self.block_size;
+        let replay = replay_journal_blocks(bs, nblocks, &mut |log| {
+            let phys = self.map_block(inum, &inode, log).map_err(|_| "journal")?;
+            if phys == 0 {
+                return Err("journal");
+            }
+            let mut buf = vec![0u8; bs];
+            self.read_block(phys, &mut buf).map_err(|_| "journal")?;
+            Ok(buf)
+        })?;
+        for (block, data) in &replay {
+            if *block >= self.blocks_count || data.len() != self.block_size {
+                return Err("journal");
+            }
+        }
+        crate::serial_println!("[ext4] journal replay {} blocks", replay.len());
+        self.replay = replay;
+        let gd = self.read_group_desc(0).map_err(|_| "journal")?;
+        if self.metadata_csum && !gd_csum_ok(self.csum_seed, 0, &gd) {
+            return Err("checksum");
+        }
+        if self.gdt_crc16 && !gd_crc16_ok(&self.sb[104..120], 0, &gd) {
+            return Err("checksum");
+        }
+        self.inode_table = gd_inode_table(&gd).map_err(|_| "journal")?;
+        self.gd = gd;
+        Ok(())
     }
 
     fn read_inode(&self, ino: u32) -> Result<Vec<u8>, FsError> {
@@ -1753,13 +1843,534 @@ fn inline_symlink(inode: &[u8]) -> Option<&[u8]> {
     Some(&inode[40..40 + n])
 }
 
+/// Проигрыш jbd2 в память. Функция только читает `read_log` и ничего не пишет.
+///
+/// `s_start == 0` — журнал чисто размонтирован (`jbd2_journal_recover`):
+/// применять нечего. Поддержаны revoke, 64bit и csum v3. v1-сумма, csum v2,
+/// async и fast commit отвергаются, как и ненулевой `s_errno`. Сумма тега
+/// считается по байтам журнала до снятия escape. Revoke с номером `R` гасит
+/// запись транзакции `T`, если не `tid_gt(T, R)`: равные номера тоже гасятся.
+/// Битая сумма внутри зафиксированного диапазона отвергает монтирование.
+/// Более старый commit (метка времени меньше предыдущей) обрывает журнал.
+/// Больше 16 МиБ проигранных блоков или 65536 revoke — отказ, а не обрезка.
+const J_MAGIC: u32 = 0xC03B3998;
+const J_DESCRIPTOR: u32 = 1;
+const J_COMMIT: u32 = 2;
+const J_SUPER_V2: u32 = 4;
+const J_REVOKE: u32 = 5;
+const J_ESCAPE: u32 = 1;
+const J_SAME_UUID: u32 = 2;
+const J_LAST_TAG: u32 = 8;
+const J_FEAT_REVOKE: u32 = 0x1;
+const J_FEAT_64BIT: u32 = 0x2;
+const J_FEAT_CSUM3: u32 = 0x10;
+const J_FEAT_OK: u32 = J_FEAT_REVOKE | J_FEAT_64BIT | J_FEAT_CSUM3;
+const J_MIN_BLOCKS: u32 = 1024;
+const J_REPLAY_MAX: usize = 16 * 1024 * 1024;
+const J_REVOKE_MAX: usize = 65536;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JPass {
+    Scan,
+    Revoke,
+    Replay,
+}
+
+struct Jbd {
+    block_size: usize,
+    maxlen: u32,
+    first: u32,
+    sequence: u32,
+    start: u32,
+    csum: bool,
+    bit64: bool,
+    seed: u32,
+}
+
+fn replay_journal_blocks(
+    block_size: usize,
+    nblocks: u32,
+    read_log: &mut dyn FnMut(u32) -> Result<Vec<u8>, &'static str>,
+) -> Result<Vec<(u64, Vec<u8>)>, &'static str> {
+    if block_size != 1024 && block_size != 2048 && block_size != 4096 {
+        return Err("journal");
+    }
+    let sb = read_log(0)?;
+    if sb.len() != block_size {
+        return Err("journal");
+    }
+    let j = parse_jbd(&sb, block_size, nblocks)?;
+    if j.start == 0 {
+        return Ok(Vec::new());
+    }
+    let end = jbd_pass(
+        &j,
+        JPass::Scan,
+        0,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        read_log,
+    )?;
+    let mut revokes = Vec::new();
+    jbd_pass(
+        &j,
+        JPass::Revoke,
+        end,
+        &mut revokes,
+        &mut Vec::new(),
+        read_log,
+    )?;
+    let mut overlay = Vec::new();
+    jbd_pass(
+        &j,
+        JPass::Replay,
+        end,
+        &mut revokes,
+        &mut overlay,
+        read_log,
+    )?;
+    Ok(overlay)
+}
+
+fn parse_jbd(sb: &[u8], block_size: usize, nblocks: u32) -> Result<Jbd, &'static str> {
+    if sb.len() < 1024 {
+        return Err("journal");
+    }
+    let magic = get_be32(sb, 0).ok_or("journal")?;
+    let kind = get_be32(sb, 4).ok_or("journal")?;
+    if magic != J_MAGIC || kind != J_SUPER_V2 {
+        return Err("journal");
+    }
+    let bsize = get_be32(sb, 0x0C).ok_or("journal")?;
+    if bsize as usize != block_size {
+        return Err("journal");
+    }
+    let maxlen = get_be32(sb, 0x10).ok_or("journal")?;
+    let first = get_be32(sb, 0x14).ok_or("journal")?;
+    let sequence = get_be32(sb, 0x18).ok_or("journal")?;
+    let start = get_be32(sb, 0x1C).ok_or("journal")?;
+    let errno = get_be32(sb, 0x20).ok_or("journal")?;
+    let compat = get_be32(sb, 0x24).ok_or("journal")?;
+    let incompat = get_be32(sb, 0x28).ok_or("journal")?;
+    let ro = get_be32(sb, 0x2C).ok_or("journal")?;
+    if errno != 0 || compat != 0 || ro != 0 || incompat & !J_FEAT_OK != 0 {
+        return Err("journal");
+    }
+    if maxlen < J_MIN_BLOCKS || maxlen > nblocks || first == 0 || first >= maxlen {
+        return Err("journal");
+    }
+    if start != 0 && (start < first || start >= maxlen) {
+        return Err("journal");
+    }
+    let csum = incompat & J_FEAT_CSUM3 != 0;
+    let mut seed = 0u32;
+    if csum {
+        if sb[0x50] != 4 || !j_super_ok(sb) {
+            return Err("journal checksum");
+        }
+        seed = crc32c(!0, &sb[0x30..0x40]);
+    }
+    Ok(Jbd {
+        block_size,
+        maxlen,
+        first,
+        sequence,
+        start,
+        csum,
+        bit64: incompat & J_FEAT_64BIT != 0,
+        seed,
+    })
+}
+
+fn jbd_pass(
+    j: &Jbd,
+    goal: JPass,
+    end_txn: u32,
+    revokes: &mut Vec<(u64, u32)>,
+    overlay: &mut Vec<(u64, Vec<u8>)>,
+    read_log: &mut dyn FnMut(u32) -> Result<Vec<u8>, &'static str>,
+) -> Result<u32, &'static str> {
+    let mut next_id = j.sequence;
+    let mut next_log = j.start;
+    let mut need_time = false;
+    let mut last_time = 0u64;
+    let mut steps = 0u32;
+    let mut overlay_bytes = 0usize;
+    loop {
+        if goal != JPass::Scan && tid_geq(next_id, end_txn) {
+            break;
+        }
+        steps = steps.saturating_add(1);
+        if steps > j.maxlen {
+            return Err("journal");
+        }
+        let buf = read_log(next_log)?;
+        if buf.len() != j.block_size {
+            return Err("journal");
+        }
+        next_log = j_wrap(j, next_log)?;
+        let magic = get_be32(&buf, 0).ok_or("journal")?;
+        if magic != J_MAGIC {
+            break;
+        }
+        let kind = get_be32(&buf, 4).ok_or("journal")?;
+        let seq = get_be32(&buf, 8).ok_or("journal")?;
+        if seq != next_id {
+            break;
+        }
+        match kind {
+            J_DESCRIPTOR => {
+                if j.csum && !j_tail_ok(j.seed, &buf) {
+                    if goal != JPass::Scan {
+                        return Err("journal checksum");
+                    }
+                    need_time = true;
+                }
+                if goal != JPass::Replay {
+                    let n = count_jtags(j, &buf)?;
+                    next_log = j_skip(j, next_log, n)?;
+                    continue;
+                }
+                j_replay_desc(
+                    j,
+                    &buf,
+                    next_id,
+                    &mut next_log,
+                    revokes,
+                    overlay,
+                    &mut overlay_bytes,
+                    read_log,
+                )?;
+            }
+            J_COMMIT => {
+                if goal != JPass::Scan {
+                    next_id = next_id.wrapping_add(1);
+                    continue;
+                }
+                let commit_time = get_be64(&buf, 48).unwrap_or(0);
+                if need_time {
+                    if commit_time >= last_time {
+                        return Err("journal checksum");
+                    }
+                    break;
+                }
+                if j.csum && !j_commit_ok(j.seed, &buf) && !j_commit_partial_ok(j.seed, &buf) {
+                    if commit_time < last_time {
+                        break;
+                    }
+                    return Err("journal checksum");
+                }
+                last_time = commit_time;
+                need_time = false;
+                next_id = next_id.wrapping_add(1);
+            }
+            J_REVOKE => {
+                if goal == JPass::Replay {
+                    continue;
+                }
+                if goal == JPass::Scan && j.csum && !j_tail_ok(j.seed, &buf) {
+                    need_time = true;
+                }
+                j_take_revoke(j, &buf, next_id, revokes, goal == JPass::Revoke)?;
+            }
+            _ => break,
+        }
+    }
+    if goal == JPass::Scan {
+        Ok(next_id)
+    } else if next_id != end_txn {
+        Err("journal")
+    } else {
+        Ok(next_id)
+    }
+}
+
+fn j_replay_desc(
+    j: &Jbd,
+    buf: &[u8],
+    seq: u32,
+    next_log: &mut u32,
+    revokes: &[(u64, u32)],
+    overlay: &mut Vec<(u64, Vec<u8>)>,
+    overlay_bytes: &mut usize,
+    read_log: &mut dyn FnMut(u32) -> Result<Vec<u8>, &'static str>,
+) -> Result<(), &'static str> {
+    j_each_tag(j, buf, |tag, flags| {
+        let fsblock = j_tag_block(tag, j.bit64)?;
+        let at = *next_log;
+        *next_log = j_wrap(j, *next_log)?;
+        let mut data = read_log(at)?;
+        if data.len() != j.block_size {
+            return Err("journal");
+        }
+        if j_revoked(revokes, fsblock, seq) {
+            return Ok(());
+        }
+        if j.csum && !j_tag_ok(j.seed, seq, &data, tag) {
+            return Err("journal checksum");
+        }
+        if flags & J_ESCAPE != 0 {
+            put_be32(&mut data, 0, J_MAGIC);
+        }
+        j_overlay_put(overlay, overlay_bytes, fsblock, data)
+    })
+}
+
+fn j_each_tag(
+    j: &Jbd,
+    buf: &[u8],
+    mut f: impl FnMut(&[u8], u32) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let tb = j_tag_bytes(j);
+    let mut limit = buf.len();
+    if j.csum {
+        limit = limit.saturating_sub(4);
+    }
+    let mut tagp = 12usize;
+    while tagp + tb <= limit {
+        let flags = u32::from(get_be16(buf, tagp + 6).ok_or("journal")?);
+        f(&buf[tagp..tagp + tb], flags)?;
+        tagp += tb;
+        if flags & J_SAME_UUID == 0 {
+            tagp = tagp.saturating_add(16);
+        }
+        if flags & J_LAST_TAG != 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn count_jtags(j: &Jbd, buf: &[u8]) -> Result<u32, &'static str> {
+    let mut n = 0u32;
+    j_each_tag(j, buf, |_, _| {
+        n = n.saturating_add(1);
+        Ok(())
+    })?;
+    Ok(n)
+}
+
+fn j_tag_bytes(j: &Jbd) -> usize {
+    if j.csum {
+        16
+    } else if j.bit64 {
+        12
+    } else {
+        8
+    }
+}
+
+fn j_tag_block(tag: &[u8], bit64: bool) -> Result<u64, &'static str> {
+    let lo = u64::from(get_be32(tag, 0).ok_or("journal")?);
+    if !bit64 {
+        return Ok(lo);
+    }
+    let hi = u64::from(get_be32(tag, 8).ok_or("journal")?);
+    Ok((hi << 32) | lo)
+}
+
+fn j_wrap(j: &Jbd, block: u32) -> Result<u32, &'static str> {
+    let n = block.checked_add(1).ok_or("journal")?;
+    if n >= j.maxlen {
+        if j.first == 0 || j.first >= j.maxlen {
+            return Err("journal");
+        }
+        Ok(j.first)
+    } else {
+        Ok(n)
+    }
+}
+
+fn j_skip(j: &Jbd, mut block: u32, n: u32) -> Result<u32, &'static str> {
+    let mut left = n;
+    while left > 0 {
+        block = j_wrap(j, block)?;
+        left -= 1;
+    }
+    Ok(block)
+}
+
+/// Как Linux `tid_gt`: разность в кольце `u32`, старший бит — «не больше».
+fn tid_gt(x: u32, y: u32) -> bool {
+    x.wrapping_sub(y) as i32 > 0
+}
+
+fn tid_geq(x: u32, y: u32) -> bool {
+    x.wrapping_sub(y) as i32 >= 0
+}
+
+fn j_revoked(table: &[(u64, u32)], block: u64, seq: u32) -> bool {
+    table.iter().any(|(b, s)| *b == block && !tid_gt(seq, *s))
+}
+
+fn j_set_revoke(table: &mut Vec<(u64, u32)>, block: u64, seq: u32) -> Result<(), &'static str> {
+    if let Some(slot) = table.iter_mut().find(|e| e.0 == block) {
+        if tid_gt(seq, slot.1) {
+            slot.1 = seq;
+        }
+        return Ok(());
+    }
+    if table.len() >= J_REVOKE_MAX {
+        return Err("journal");
+    }
+    table.push((block, seq));
+    Ok(())
+}
+
+fn j_take_revoke(
+    j: &Jbd,
+    buf: &[u8],
+    seq: u32,
+    table: &mut Vec<(u64, u32)>,
+    record: bool,
+) -> Result<(), &'static str> {
+    let tail = if j.csum { 4 } else { 0 };
+    let rcount = get_be32(buf, 12).ok_or("journal")? as usize;
+    if rcount > j.block_size.saturating_sub(tail) {
+        return Err("journal");
+    }
+    if !record {
+        return Ok(());
+    }
+    let rec = if j.bit64 { 8 } else { 4 };
+    let mut off = 16usize;
+    while off + rec <= rcount {
+        let block = if rec == 4 {
+            u64::from(get_be32(buf, off).ok_or("journal")?)
+        } else {
+            get_be64(buf, off).ok_or("journal")?
+        };
+        off += rec;
+        j_set_revoke(table, block, seq)?;
+    }
+    Ok(())
+}
+
+fn j_overlay_put(
+    map: &mut Vec<(u64, Vec<u8>)>,
+    used: &mut usize,
+    block: u64,
+    data: Vec<u8>,
+) -> Result<(), &'static str> {
+    match map.binary_search_by_key(&block, |e| e.0) {
+        Ok(i) => map[i].1 = data,
+        Err(i) => {
+            if used.saturating_add(data.len()) > J_REPLAY_MAX {
+                return Err("journal");
+            }
+            *used += data.len();
+            map.insert(i, (block, data));
+        }
+    }
+    Ok(())
+}
+
+fn j_super_ok(sb: &[u8]) -> bool {
+    if sb.len() < 1024 {
+        return false;
+    }
+    let provided = match get_be32(sb, 0xFC) {
+        Some(v) => v,
+        None => return false,
+    };
+    let mut tmp = sb[..1024].to_vec();
+    tmp[0xFC..0x100].fill(0);
+    crc32c(!0, &tmp) == provided
+}
+
+fn j_tail_ok(seed: u32, buf: &[u8]) -> bool {
+    if buf.len() < 4 {
+        return false;
+    }
+    let n = buf.len();
+    let provided = match get_be32(buf, n - 4) {
+        Some(v) => v,
+        None => return false,
+    };
+    let mut tmp = buf.to_vec();
+    tmp[n - 4..].fill(0);
+    crc32c(seed, &tmp) == provided
+}
+
+fn j_commit_ok(seed: u32, buf: &[u8]) -> bool {
+    if buf.len() < 20 {
+        return false;
+    }
+    let provided = match get_be32(buf, 16) {
+        Some(v) => v,
+        None => return false,
+    };
+    let mut tmp = buf.to_vec();
+    tmp[16..20].fill(0);
+    crc32c(seed, &tmp) == provided
+}
+
+fn j_commit_partial_ok(seed: u32, buf: &[u8]) -> bool {
+    if buf.len() < 60 {
+        return false;
+    }
+    let provided = match get_be32(buf, 16) {
+        Some(v) => v,
+        None => return false,
+    };
+    let mut tmp = vec![0u8; buf.len()];
+    tmp[..60].copy_from_slice(&buf[..60]);
+    tmp[16..20].fill(0);
+    crc32c(seed, &tmp) == provided
+}
+
+fn j_tag_ok(seed: u32, seq: u32, data: &[u8], tag: &[u8]) -> bool {
+    let provided = match get_be32(tag, 12) {
+        Some(v) => v,
+        None => return false,
+    };
+    let c = crc32c(seed, &seq.to_be_bytes());
+    crc32c(c, data) == provided
+}
+
+fn get_be16(buf: &[u8], off: usize) -> Option<u16> {
+    let end = off.checked_add(2)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some(u16::from_be_bytes([buf[off], buf[off + 1]]))
+}
+
+fn get_be32(buf: &[u8], off: usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+    ]))
+}
+
+fn get_be64(buf: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    if end > buf.len() {
+        return None;
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&buf[off..end]);
+    Some(u64::from_be_bytes(raw))
+}
+
+fn put_be32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
 /// `Ok(true)` — монтировать только на чтение. `Ok(false)` — обычный ext2.
-/// Журнал с RECOVER, meta_bg, encrypt и прочие incompat отвергаются.
+/// `RECOVER` принимается только вместе с extents: журнал проигрывается в память.
+/// meta_bg, encrypt и прочие incompat отвергаются.
 /// `64bit` и `metadata_csum_seed` принимаются только вместе с extents.
 fn features(incompat: u32, ro: u32) -> Result<bool, &'static str> {
     const EXTENTS: u32 = 0x40;
     const FLEX_BG: u32 = 0x200;
-    const OK: u32 = FILETYPE | EXTENTS | FLEX_BG | BIT64 | CSUM_SEED;
+    const OK: u32 = FILETYPE | EXTENTS | FLEX_BG | BIT64 | CSUM_SEED | RECOVER;
     // sparse_super, large_file, huge_file, gdt_csum, dir_nlink, extra_isize,
     // metadata_csum. crc32c проверяет open, если стоит metadata_csum.
     // gdt_csum без metadata_csum проверяет дескриптор crc16.
@@ -1768,7 +2379,7 @@ fn features(incompat: u32, ro: u32) -> Result<bool, &'static str> {
         return Err("incompat feature");
     }
     let extents = incompat & EXTENTS != 0;
-    if (incompat & (FLEX_BG | BIT64 | CSUM_SEED)) != 0 && !extents {
+    if (incompat & (FLEX_BG | BIT64 | CSUM_SEED | RECOVER)) != 0 && !extents {
         return Err("incompat feature");
     }
     if extents {
@@ -2004,7 +2615,12 @@ mod tests {
         let mke2fs = FILETYPE | 0x40 | 0x200 | BIT64 | CSUM_SEED;
         let mke2fs_ro = 0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x400;
         assert_eq!(features(mke2fs, mke2fs_ro).unwrap(), true);
-        assert!(features(0x40 | 0x4, 0).is_err(), "journal needs recovery");
+        assert_eq!(
+            features(0x40 | RECOVER, 0).unwrap(),
+            true,
+            "journal recovers read-only"
+        );
+        assert!(features(RECOVER, 0).is_err(), "recover without extents");
         assert!(features(BIT64, 0).is_err(), "64bit without extents");
         assert!(features(CSUM_SEED, 0).is_err(), "csum seed without extents");
         assert!(features(0x200, 0).is_err(), "flex_bg without extents");
@@ -2032,6 +2648,431 @@ mod tests {
         put_u32(&mut inode, 32, HUGE_FL);
         put_u32(&mut inode, 108, 2);
         assert_eq!(inode_bytes(&inode), (2u64 << 32) | 0x1000);
+        serial_println!("[ok]");
+    }
+
+    fn replay_parts(parts: &[(u32, Vec<u8>)]) -> Result<Vec<(u64, Vec<u8>)>, &'static str> {
+        replay_journal_blocks(1024, J_MIN_BLOCKS, &mut |i| {
+            match parts.iter().find(|(n, _)| *n == i) {
+                Some((_, b)) => Ok(b.clone()),
+                None => Err("missing"),
+            }
+        })
+    }
+
+    fn jbd_super(
+        start: u32,
+        seq: u32,
+        incompat: u32,
+        compat: u32,
+        errno: u32,
+        csum: bool,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        put_be32(&mut b, 0, J_MAGIC);
+        put_be32(&mut b, 4, J_SUPER_V2);
+        put_be32(&mut b, 0x0C, 1024);
+        put_be32(&mut b, 0x10, J_MIN_BLOCKS);
+        put_be32(&mut b, 0x14, 1);
+        put_be32(&mut b, 0x18, seq);
+        put_be32(&mut b, 0x1C, start);
+        put_be32(&mut b, 0x20, errno);
+        put_be32(&mut b, 0x24, compat);
+        put_be32(&mut b, 0x28, incompat);
+        b[0x30..0x40].copy_from_slice(b"rudra-journal-uu");
+        if csum {
+            b[0x50] = 4;
+            let sum = crc32c(!0, &b[..1024]);
+            put_be32(&mut b, 0xFC, sum);
+        }
+        b
+    }
+
+    fn fill(byte: u8) -> Vec<u8> {
+        vec![byte; 1024]
+    }
+
+    fn descr_plain(seq: u32, block: u32, flags: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        put_be32(&mut b, 0, J_MAGIC);
+        put_be32(&mut b, 4, J_DESCRIPTOR);
+        put_be32(&mut b, 8, seq);
+        put_be32(&mut b, 12, block);
+        b[18..20].copy_from_slice(&flags.to_be_bytes());
+        b
+    }
+
+    fn commit_block(seq: u32, time: u64, seed: Option<u32>) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        put_be32(&mut b, 0, J_MAGIC);
+        put_be32(&mut b, 4, J_COMMIT);
+        put_be32(&mut b, 8, seq);
+        b[48..56].copy_from_slice(&time.to_be_bytes());
+        if let Some(seed) = seed {
+            let sum = crc32c(seed, &b);
+            put_be32(&mut b, 16, sum);
+        }
+        b
+    }
+
+    fn revoke_block(seq: u32, blocks: &[u32]) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        put_be32(&mut b, 0, J_MAGIC);
+        put_be32(&mut b, 4, J_REVOKE);
+        put_be32(&mut b, 8, seq);
+        let mut off = 16usize;
+        for blk in blocks {
+            put_be32(&mut b, off, *blk);
+            off += 4;
+        }
+        put_be32(&mut b, 12, off as u32);
+        b
+    }
+
+    fn descr_csum(seq: u32, block: u64, flags: u32, tag_sum: u32, seed: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        put_be32(&mut b, 0, J_MAGIC);
+        put_be32(&mut b, 4, J_DESCRIPTOR);
+        put_be32(&mut b, 8, seq);
+        put_be32(&mut b, 12, block as u32);
+        put_be32(&mut b, 16, flags);
+        put_be32(&mut b, 20, (block >> 32) as u32);
+        put_be32(&mut b, 24, tag_sum);
+        let sum = crc32c(seed, &b);
+        let tail = b.len() - 4;
+        put_be32(&mut b, tail, sum);
+        b
+    }
+
+    fn tag_sum(seed: u32, seq: u32, data: &[u8]) -> u32 {
+        crc32c(crc32c(seed, &seq.to_be_bytes()), data)
+    }
+
+    fn one(map: &[(u64, Vec<u8>)], block: u64) -> &[u8] {
+        map.iter().find(|e| e.0 == block).expect("block").1.as_slice()
+    }
+
+    #[test_case]
+    fn journal_replay_applies_only_a_committed_block() {
+        serial_print!("test journal_replay_applies_only_a_committed_block... ");
+        let feat = J_FEAT_REVOKE;
+        let sb = jbd_super(1, 1, feat, 0, 0, false);
+        let data = fill(0x5A);
+        // scan читает блок после commit. Нулевой блок кончает журнал, дыра — ошибка ввода.
+        let committed = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 40, J_LAST_TAG as u16)),
+            (2, data.clone()),
+            (3, commit_block(1, 10, None)),
+            (4, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(one(&committed, 40), data.as_slice());
+
+        let open_end = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 40, J_LAST_TAG as u16)),
+            (2, data.clone()),
+            (3, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert!(open_end.is_empty(), "no commit means nothing applied");
+        assert!(
+            replay_parts(&[
+                (0, sb.clone()),
+                (1, descr_plain(1, 40, J_LAST_TAG as u16)),
+                (2, data.clone()),
+            ])
+            .is_err(),
+            "a missing log block is an IO error"
+        );
+
+        let mut two = descr_plain(1, 3, 0);
+        put_be32(&mut two, 36, 4);
+        let both = (J_SAME_UUID | J_LAST_TAG) as u16;
+        two[42..44].copy_from_slice(&both.to_be_bytes());
+        let pair = replay_parts(&[
+            (0, sb.clone()),
+            (1, two),
+            (2, fill(0x31)),
+            (3, fill(0x32)),
+            (4, commit_block(1, 4, None)),
+            (5, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(pair.len(), 2, "uuid is not a log block");
+        assert_eq!(one(&pair, 3)[0], 0x31);
+        assert_eq!(one(&pair, 4)[0], 0x32);
+
+        let newer = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 6, J_LAST_TAG as u16)),
+            (2, fill(0x11)),
+            (3, commit_block(1, 1, None)),
+            (4, descr_plain(2, 6, J_LAST_TAG as u16)),
+            (5, fill(0x22)),
+            (6, commit_block(2, 2, None)),
+            (7, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(newer.len(), 1);
+        assert_eq!(one(&newer, 6)[0], 0x22);
+
+        let tail = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 4, J_LAST_TAG as u16)),
+            (2, fill(0x11)),
+            (3, commit_block(1, 1, None)),
+            (4, descr_plain(2, 4, J_LAST_TAG as u16)),
+            (5, fill(0x22)),
+            (6, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(one(&tail, 4)[0], 0x11, "uncommitted tail is dropped");
+
+        let wrong_seq = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 4, J_LAST_TAG as u16)),
+            (2, fill(0x11)),
+            (3, commit_block(2, 1, None)),
+        ])
+        .unwrap();
+        assert!(wrong_seq.is_empty(), "commit sequence must match");
+
+        let same = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 15, J_LAST_TAG as u16)),
+            (2, fill(0xAB)),
+            (3, revoke_block(1, &[15])),
+            (4, commit_block(1, 3, None)),
+            (5, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert!(same.is_empty(), "revoke in the same transaction drops the write");
+
+        let later = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 15, J_LAST_TAG as u16)),
+            (2, fill(0xAB)),
+            (3, revoke_block(1, &[15])),
+            (4, commit_block(1, 3, None)),
+            (5, descr_plain(2, 15, J_LAST_TAG as u16)),
+            (6, fill(0xCD)),
+            (7, commit_block(2, 4, None)),
+            (8, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(one(&later, 15)[0], 0xCD, "a write after revoke stays");
+
+        let dropped = replay_parts(&[
+            (0, sb.clone()),
+            (1, descr_plain(1, 21, J_LAST_TAG as u16)),
+            (2, fill(0x11)),
+            (3, commit_block(1, 1, None)),
+            (4, revoke_block(2, &[21])),
+            (5, commit_block(2, 2, None)),
+            (6, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert!(dropped.is_empty(), "later revoke drops the earlier write");
+
+        let wrapped = replay_parts(&[
+            (0, jbd_super(1023, 1, feat, 0, 0, false)),
+            (1023, descr_plain(1, 7, J_LAST_TAG as u16)),
+            (1, fill(0x11)),
+            (2, commit_block(1, 8, None)),
+            (3, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(one(&wrapped, 7)[0], 0x11, "log wraps to s_first");
+
+        let wide = (1u64 << 32) | 9;
+        let high = replay_parts(&[
+            (0, jbd_super(1, 1, feat | J_FEAT_64BIT, 0, 0, false)),
+            (1, {
+                let mut b = vec![0u8; 1024];
+                put_be32(&mut b, 0, J_MAGIC);
+                put_be32(&mut b, 4, J_DESCRIPTOR);
+                put_be32(&mut b, 8, 1);
+                put_be32(&mut b, 12, wide as u32);
+                b[18..20].copy_from_slice(&(J_LAST_TAG as u16).to_be_bytes());
+                put_be32(&mut b, 20, (wide >> 32) as u32);
+                b
+            }),
+            (2, fill(0x44)),
+            (3, commit_block(1, 1, None)),
+            (4, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(one(&high, wide)[0], 0x44, "64bit tag keeps the high half");
+        let mut revoked_wide = replay_parts(&[
+            (0, jbd_super(1, 1, feat | J_FEAT_64BIT, 0, 0, false)),
+            (1, {
+                let mut b = vec![0u8; 1024];
+                put_be32(&mut b, 0, J_MAGIC);
+                put_be32(&mut b, 4, J_DESCRIPTOR);
+                put_be32(&mut b, 8, 1);
+                put_be32(&mut b, 12, wide as u32);
+                b[18..20].copy_from_slice(&(J_LAST_TAG as u16).to_be_bytes());
+                put_be32(&mut b, 20, (wide >> 32) as u32);
+                b
+            }),
+            (2, fill(0x44)),
+            (3, commit_block(1, 1, None)),
+            (4, {
+                let mut b = vec![0u8; 1024];
+                put_be32(&mut b, 0, J_MAGIC);
+                put_be32(&mut b, 4, J_REVOKE);
+                put_be32(&mut b, 8, 2);
+                b[16..24].copy_from_slice(&wide.to_be_bytes());
+                put_be32(&mut b, 12, 24);
+                b
+            }),
+            (5, commit_block(2, 2, None)),
+            (6, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert!(revoked_wide.is_empty(), "64bit revoke matches the full block");
+        revoked_wide.clear();
+
+        let seed = crc32c(!0, b"rudra-journal-uu");
+        let csum_feat = feat | J_FEAT_CSUM3;
+        let mut escaped = fill(0x22);
+        escaped[..4].fill(0);
+        let escape_flags = J_ESCAPE | J_LAST_TAG;
+        let escaped_log = replay_parts(&[
+            (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+            (
+                1,
+                descr_csum(1, 12, escape_flags, tag_sum(seed, 1, &escaped), seed),
+            ),
+            (2, escaped.clone()),
+            (3, commit_block(1, 9, Some(seed))),
+            (4, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(&one(&escaped_log, 12)[..4], &J_MAGIC.to_be_bytes());
+        assert!(one(&escaped_log, 12)[4..].iter().all(|b| *b == 0x22));
+
+        let payload = fill(0x77);
+        let partial = {
+            let mut header = vec![0u8; 1024];
+            put_be32(&mut header, 0, J_MAGIC);
+            put_be32(&mut header, 4, J_COMMIT);
+            put_be32(&mut header, 8, 1);
+            header[48..56].copy_from_slice(&9u64.to_be_bytes());
+            let sum = crc32c(seed, &header);
+            let mut b = vec![0xFFu8; 1024];
+            b[..60].copy_from_slice(&header[..60]);
+            put_be32(&mut b, 16, sum);
+            b
+        };
+        let partial_log = replay_parts(&[
+            (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+            (1, descr_csum(1, 8, J_LAST_TAG, tag_sum(seed, 1, &payload), seed)),
+            (2, payload.clone()),
+            (3, partial),
+            (4, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert_eq!(one(&partial_log, 8), payload.as_slice(), "partial commit counts");
+
+        assert!(
+            replay_parts(&[
+                (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+                (1, descr_csum(1, 8, J_LAST_TAG, 0xDEAD, seed)),
+                (2, payload.clone()),
+                (3, commit_block(1, 9, Some(seed))),
+                (4, vec![0u8; 1024]),
+            ])
+            .is_err(),
+            "bad tag checksum refuses"
+        );
+        let revoked_bad = replay_parts(&[
+            (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+            (1, descr_csum(1, 8, J_LAST_TAG, 0xDEAD, seed)),
+            (2, payload.clone()),
+            (3, {
+                let mut b = revoke_block(1, &[8]);
+                let sum = crc32c(seed, &b);
+                let tail = b.len() - 4;
+                put_be32(&mut b, tail, sum);
+                b
+            }),
+            (4, commit_block(1, 9, Some(seed))),
+            (5, vec![0u8; 1024]),
+        ])
+        .unwrap();
+        assert!(
+            revoked_bad.is_empty(),
+            "revoked block skips the tag checksum"
+        );
+
+        let mut bad_tail = descr_csum(2, 4, J_LAST_TAG, tag_sum(seed, 2, &payload), seed);
+        let last = bad_tail.len() - 1;
+        bad_tail[last] ^= 0xFF;
+        assert!(
+            replay_parts(&[
+                (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+                (1, descr_csum(1, 4, J_LAST_TAG, tag_sum(seed, 1, &fill(0x11)), seed)),
+                (2, fill(0x11)),
+                (3, commit_block(1, 5000, Some(seed))),
+                (4, bad_tail.clone()),
+                (5, payload.clone()),
+                (6, commit_block(2, 6000, Some(seed))),
+            ])
+            .is_err(),
+            "newer commit after a bad descriptor refuses"
+        );
+        let stale = replay_parts(&[
+            (0, jbd_super(1, 1, csum_feat, 0, 0, true)),
+            (1, descr_csum(1, 4, J_LAST_TAG, tag_sum(seed, 1, &fill(0x11)), seed)),
+            (2, fill(0x11)),
+            (3, commit_block(1, 5000, Some(seed))),
+            (4, bad_tail),
+            (5, payload.clone()),
+            (6, commit_block(2, 1, Some(seed))),
+        ])
+        .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(one(&stale, 4)[0], 0x11, "older commit time ends the log");
+
+        let mut reads = 0u32;
+        let clean = jbd_super(0, 1, csum_feat, 0, 0, true);
+        let empty = replay_journal_blocks(1024, J_MIN_BLOCKS, &mut |i| {
+            reads += 1;
+            if i == 0 {
+                Ok(clean.clone())
+            } else {
+                Err("missing")
+            }
+        })
+        .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(reads, 1, "clean journal reads only the superblock");
+        let mut flipped = clean.clone();
+        flipped[0xFC] ^= 0xFF;
+        assert!(replay_parts(&[(0, flipped)]).is_err(), "superblock checksum");
+
+        let mut typed = jbd_super(0, 1, csum_feat, 0, 0, false);
+        typed[0x50] = 1;
+        let sum = crc32c(!0, &typed[..1024]);
+        put_be32(&mut typed, 0xFC, sum);
+        assert!(replay_parts(&[(0, typed)]).is_err(), "checksum type");
+        assert!(replay_parts(&[(0, jbd_super(0, 1, 0x20, 0, 0, false))]).is_err(), "fast commit");
+        assert!(replay_parts(&[(0, jbd_super(0, 1, feat, 1, 0, false))]).is_err(), "v1 checksum");
+        assert!(replay_parts(&[(0, jbd_super(0, 1, feat, 0, 5, false))]).is_err(), "s_errno");
+        let mut v1 = jbd_super(0, 1, feat, 0, 0, false);
+        put_be32(&mut v1, 4, 3);
+        assert!(replay_parts(&[(0, v1)]).is_err(), "v1 superblock");
+        let mut short = jbd_super(0, 1, feat, 0, 0, false);
+        put_be32(&mut short, 0x10, 100);
+        assert!(replay_parts(&[(0, short)]).is_err(), "short journal");
+        let mut magic = jbd_super(0, 1, feat, 0, 0, false);
+        put_be32(&mut magic, 0, 0);
+        assert!(replay_parts(&[(0, magic)]).is_err(), "magic");
         serial_println!("[ok]");
     }
 
