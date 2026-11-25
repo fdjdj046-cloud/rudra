@@ -122,7 +122,8 @@ GitHub Actions после тестов ядра собирает образ и �
 | 61 | wait4 |
 | 63 | uname |
 | 72 | fcntl |
-| 73, 74, 75 | flock, fsync, fdatasync: успех |
+| 73 | flock: успех, блокировки нет |
+| 74, 75 | fsync, fdatasync: грязный образ файла пишется и остаётся в fd. Каталог и чистый файл — успех. Канал, сокет, консоль и epoll — `EINVAL` |
 | 76, 77 | truncate / ftruncate только до нуля |
 | 78, 217 | getdents64 |
 | 79, 80 | getcwd, chdir |

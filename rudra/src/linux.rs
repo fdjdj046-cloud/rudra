@@ -32,6 +32,8 @@
 //! Файловый mmap возвращает ENODEV. Анонимный пишет те же биты, что `mprotect`.
 //! `munmap` отдаёт кадр после сброса TLB.
 //! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
+//! `fsync` и `fdatasync` пишут грязный образ файла и оставляют его в fd.
+//! Канал, сокет, консоль и epoll — `EINVAL`. `flock` — успех без блокировки.
 //! `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
 //! `link` копирует байты, `symlink` пишет цель как содержимое файла.
@@ -634,7 +636,8 @@ pub fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, frame: *mut u64) ->
         63 => sys_uname(a1),
         169 => sys_reboot(a1, a2, a3),
         72 => sys_fcntl(a1, a2, a3),
-        73 | 74 | 75 => 0, // flock / fsync / fdatasync
+        73 => 0, // flock: блокировки нет
+        74 | 75 => sys_fsync(a1),
         76 => {
             // truncate
             let Some(path) = task::copy_user_cstr(a1, 256) else { return EFAULT };
@@ -2120,6 +2123,58 @@ fn fd_name(fd: u64) -> Option<String> {
         _ => None,
     })
     .ok().flatten()
+}
+
+/// `fsync` и `fdatasync`. Отдельной метаданной нет, поэтому оба пишут
+/// грязный образ целиком и не очищают буфер: следующий `close` пишет его
+/// снова. Каталог и файл без буфера уже лежат в единственном хранилище.
+/// Канал, сокет, консоль и epoll отвергаются.
+fn sys_fsync(fd: u64) -> u64 {
+    let snap = match with_fd(fd, |f| match f {
+        Fd::File {
+            name,
+            dirty: Some(data),
+            ..
+        } => FsyncSnap::Write(name.clone(), data.clone()),
+        Fd::File { .. } | Fd::Dir { .. } => FsyncSnap::Clean,
+        _ => FsyncSnap::Invalid,
+    }) {
+        Ok(snap) => snap,
+        Err(e) => return e,
+    };
+    match snap {
+        FsyncSnap::Write(name, data) => fsync_of(&Fd::File {
+            name,
+            offset: 0,
+            accmode: 1,
+            append: false,
+            dirty: Some(data),
+        }),
+        FsyncSnap::Clean => 0,
+        FsyncSnap::Invalid => EINVAL,
+    }
+}
+
+enum FsyncSnap {
+    Write(String, Vec<u8>),
+    Clean,
+    Invalid,
+}
+
+/// Та же проверка, что у `sys_fsync`, но без таблицы задачи.
+fn fsync_of(f: &Fd) -> u64 {
+    match f {
+        Fd::File {
+            name,
+            dirty: Some(data),
+            ..
+        } => match crate::fs::write_canon(name, data) {
+            Ok(_) => 0,
+            Err(e) => fs_err(e),
+        },
+        Fd::File { .. } | Fd::Dir { .. } => 0,
+        _ => EINVAL,
+    }
 }
 
 fn sys_close(fd: u64) -> u64 {
@@ -3857,6 +3912,53 @@ mod tests {
         assert_eq!(sys_accept(0, 0, 0, 0x800), EPERM);
         assert_eq!(sys_accept(0, 0, 0, 0x80000), EPERM);
         assert_eq!(sys_accept(0, 0, 0, 0x800 | 0x80000), EPERM);
+        crate::serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn fsync_writes_the_dirty_image_and_rejects_a_pipe() {
+        crate::serial_print!("test fsync_writes_the_dirty_image_and_rejects_a_pipe... ");
+        // Раннер — не задача: номер не разбирается.
+        assert_eq!(sys_fsync(0), EPERM);
+        assert_eq!(sys_fsync(4), EPERM);
+
+        assert_eq!(fsync_of(&Fd::Pipe { id: 0, writable: true }), EINVAL);
+        assert_eq!(fsync_of(&Fd::console(true)), EINVAL);
+        assert_eq!(fsync_of(&Fd::Udp { id: 0 }), EINVAL);
+        assert_eq!(fsync_of(&Fd::Epoll { id: 0 }), EINVAL);
+        assert_eq!(
+            fsync_of(&Fd::Dir {
+                prefix: "/".into(),
+                idx: 0,
+            }),
+            0
+        );
+        let clean = Fd::File {
+            name: "/fsync-clean.txt".into(),
+            offset: 0,
+            accmode: 0,
+            append: false,
+            dirty: None,
+        };
+        assert_eq!(fsync_of(&clean), 0);
+
+        assert!(crate::fs::write_path(b"/fsync-proof.txt", b"old") > 0);
+        let dirty = Fd::File {
+            name: "/fsync-proof.txt".into(),
+            offset: 3,
+            accmode: 1,
+            append: false,
+            dirty: Some(alloc::vec![b'n', b'e', b'w', b'-', b'b', b'y', b't', b'e', b's']),
+        };
+        assert_eq!(fsync_of(&dirty), 0);
+        match &dirty {
+            Fd::File { dirty: Some(data), .. } => assert_eq!(data.as_slice(), b"new-bytes"),
+            _ => panic!("dirty kept"),
+        }
+        let mut buf = [0u8; 16];
+        let n = crate::fs::read_path(b"/fsync-proof.txt", &mut buf) as usize;
+        assert_eq!(&buf[..n], b"new-bytes");
+        assert!(crate::fs::delete_path(b"/fsync-proof.txt"));
         crate::serial_println!("[ok]");
     }
 }

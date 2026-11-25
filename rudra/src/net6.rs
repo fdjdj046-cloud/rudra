@@ -203,6 +203,13 @@ static RTX_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// Истина только на время `retransmit_forced`: удержание его не глушит.
 #[cfg(test)]
 static RTX_FORCE: AtomicBool = AtomicBool::new(false);
+/// Сокет, чей штамп обнуляется в том же захвате таблицы, что и решение о повторе.
+#[cfg(test)]
+static RTX_ZERO_ON: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static RTX_ZERO_ID: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static RTX_JOBS: AtomicUsize = AtomicUsize::new(0);
 
 struct NdGuard;
 impl Drop for NdGuard {
@@ -1975,6 +1982,15 @@ fn retransmit_segments() {
     let now = crate::time::monotonic_ns();
     let mut jobs: Vec<WireOut> = Vec::new();
     with_tcp(|tab| {
+        #[cfg(test)]
+        if RTX_FORCE.load(Ordering::SeqCst) && RTX_ZERO_ON.swap(false, Ordering::SeqCst) {
+            let id = RTX_ZERO_ID.load(Ordering::SeqCst);
+            if let Some(Some(s)) = tab.get_mut(id) {
+                if let Some(seg) = s.unacked.first_mut() {
+                    seg.2 = 0;
+                }
+            }
+        }
         for s in tab.iter_mut().flatten() {
             #[cfg(test)]
             if RTX_HOLD.load(Ordering::SeqCst) && !RTX_FORCE.load(Ordering::SeqCst) {
@@ -2012,6 +2028,10 @@ fn retransmit_segments() {
             });
         }
     });
+    #[cfg(test)]
+    if RTX_FORCE.load(Ordering::SeqCst) {
+        RTX_JOBS.store(jobs.len(), Ordering::SeqCst);
+    }
     for seg in jobs {
         let _ = send_tcp6(
             &seg.src,
@@ -2382,10 +2402,9 @@ mod tests {
         assert_eq!(&data[0][74..], b"xy");
         assert_eq!(data[0][67] & TH_PSH, TH_PSH);
         assert!(sum_ok(&data[0], 6));
-        // Тик другого CPU забирает повтор между возвратом retransmit и
-        // capture_take: штамп уже обновлён, кадр уходит в карту после взятия.
-        // Удержание отсекает новый тик и уже вошедший разбор. Сосед снова в
-        // кэше, иначе отправка повторного сегмента молча кончается отказом.
+        // Тик другого CPU забирает повтор между нулём штампа и разбором:
+        // штамп уже «только что», кадр уходит после capture_take. Ноль и
+        // решение стоят в одном захвате таблицы. Удержание не пускает тик.
         super::rtx_hold(true);
         super::rtx_wait_idle();
         assert_eq!(super::RTX_DEPTH.load(super::Ordering::SeqCst), 0, "rto idle");
@@ -2399,15 +2418,17 @@ mod tests {
         }
         assert!(!super::ND_BUSY.load(super::Ordering::SeqCst), "nd idle");
         assert_eq!(super::nd_cached(&peer), Some(peer_mac), "peer cached");
-        super::capture_begin();
         super::with_tcp(|tab| {
             let s = tab[cli].as_mut().unwrap();
             assert_eq!(s.unacked.len(), 1);
-            s.unacked[0].2 = 0;
         });
+        super::RTX_ZERO_ID.store(cli, super::Ordering::SeqCst);
+        super::RTX_ZERO_ON.store(true, super::Ordering::SeqCst);
+        super::capture_begin();
         super::retransmit_forced();
         let again = super::capture_take();
         super::rtx_hold(false);
+        assert_eq!(super::RTX_JOBS.load(super::Ordering::SeqCst), 1, "rto queued");
         assert_eq!(again.len(), 1, "rto resends");
         assert_eq!(&again[0][74..], b"xy");
         assert!(sum_ok(&again[0], 6));
