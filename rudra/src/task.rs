@@ -4985,8 +4985,9 @@ pub fn sys_brk(addr: u64) -> u64 {
 }
 
 /// sys_mmap: анонимные приватные маппинги из бамп-региона АП.
-pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
-    use crate::linux::{ENOMEM, ENODEV};
+/// `prot` — те же биты, что у `mprotect`. Чужой бит отвергается до выдачи адреса.
+pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
+    use crate::linux::{EINVAL, ENOMEM, ENODEV};
     const MAP_ANONYMOUS: u64 = 0x20;
     const MAP_PRIVATE: u64 = 0x2;
     const MAP_FIXED: u64 = 0x10;
@@ -5000,6 +5001,10 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
     if flags & MAP_PRIVATE == 0 {
         return ENODEV;
     }
+    if prot & !7 != 0 {
+        return EINVAL;
+    }
+    let pte = prot_flags(prot);
     let cur = current_slot();
     if cur < 0 {
         return ENOMEM;
@@ -5035,7 +5040,7 @@ pub fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off: u64
                 VirtAddr::new(base),
                 VirtAddr::new(base + pages * 0x1000 - 1),
                 fa,
-                USER_FLAGS,
+                pte,
             )
         })
     };
@@ -8082,6 +8087,9 @@ mod tests {
         assert_eq!(sys_munmap(0x1001, 0x1000), crate::linux::EINVAL);
         assert_eq!(sys_mprotect(0x1000, 0x1000, 8), crate::linux::EINVAL);
         assert_eq!(sys_munmap(0x1000, 0x1000), crate::linux::EINVAL);
+        // Чужой бит prot — EINVAL до задачи и до выдачи адреса.
+        assert_eq!(sys_mmap(0, 0x1000, 8, 0x22, u64::MAX, 0), crate::linux::EINVAL);
+        assert_eq!(sys_mmap(0, 0x1000, 3, 0x22, u64::MAX, 0), crate::linux::ENOMEM);
 
         const BASE: u64 = 0x5000_0000;
         let (l4, phys) = crate::memory::with_frame_allocator(|fa| {
@@ -8093,8 +8101,30 @@ mod tests {
                 map_zeroed(l4, page, fa, USER_FLAGS).expect("map");
                 phys[i as usize] = leaf_of(l4, va).expect("leaf").0;
             }
+            // Те же биты, что mmap кладёт в PTE: NONE, READ, WRITE, EXEC.
+            for (i, prot) in [0u64, 1, 2, 4].iter().enumerate() {
+                let va = 0x5010_0000 + i as u64 * 0x1000;
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+                map_zeroed(l4, page, fa, prot_flags(*prot)).expect("prot");
+            }
             (l4, phys)
         });
+        for (i, (prot, expect_user, expect_write)) in [
+            (0u64, false, false),
+            (1, true, false),
+            (2, true, true),
+            (4, true, false),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (_, f) = leaf_of(l4, 0x5010_0000 + i as u64 * 0x1000).unwrap();
+            assert!(f.contains(PageTableFlags::PRESENT), "prot {prot}");
+            assert_eq!(f.contains(PageTableFlags::USER_ACCESSIBLE), *expect_user);
+            assert_eq!(f.contains(PageTableFlags::WRITABLE), *expect_write);
+            assert!(!f.contains(PageTableFlags::NO_EXECUTE));
+        }
+        assert!(unmap_user(l4, 0x5010_0000, 0x5010_4000).is_ok());
 
         assert_eq!(
             protect_user(l4, BASE + 0x2000, BASE + 0x4000, 1),

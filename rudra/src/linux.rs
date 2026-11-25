@@ -26,7 +26,8 @@
 //! `dup3` (292) — это `dup2` плюс флаг: только `O_CLOEXEC`, иначе `EINVAL`
 //! до поиска fd. `old == new` у `dup3` — `EINVAL`. Вытесненный номер
 //! закрывается как `close`, включая сброс буфера файла.
-//! Файловый mmap возвращает ENODEV. `munmap` отдаёт кадр после сброса TLB.
+//! Файловый mmap возвращает ENODEV. Анонимный пишет те же биты, что `mprotect`.
+//! `munmap` отдаёт кадр после сброса TLB.
 //! `mprotect` пишет present/user/writable и не ставит NX. `madvise` кадр не отдаёт.
 //! `futex WAIT/WAKE` будит ждущих.
 //! `sched_setaffinity` хранит маску целиком. x2APIC есть.
