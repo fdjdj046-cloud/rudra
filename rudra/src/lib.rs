@@ -21,6 +21,7 @@ pub mod interrupts;
 pub mod linux;
 pub mod memory;
 pub mod net;
+pub mod net6;
 pub mod pci;
 pub mod serial;
 pub mod signal;

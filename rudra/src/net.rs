@@ -4,7 +4,7 @@
 //! и принимается: так QEMU отдаёт DHCP.
 //! Датаграмма длиннее 4096 байт — `EMSGSIZE`. В провод уходит не больше
 //! 1472. `SO_REUSEADDR` и `SO_BROADCAST` хранятся на сокете.
-//! IPv6 и netlink нет.
+//! IPv6 — `net6`, только петля `::1`. Netlink нет.
 
 use alloc::vec;
 use alloc::vec::Vec;
