@@ -247,7 +247,8 @@ fn rd64(b: &[u8], off: usize) -> u64 {
 /// Граница `.dynsym` — `nchain` из `DT_HASH`, а если его нет — число символов
 /// из `DT_GNU_HASH`. Без обеих таблиц символьная релокация отвергается.
 /// Версия символа — `DT_VERSYM` и имя из `DT_VERDEF` или `DT_VERNEED`.
-/// `DT_REL` отвергается. `R_X86_64_IRELATIVE` и определённый
+/// `DT_REL` — те же типы, что `DT_RELA`, шаг 16: addend уже лежит в слоте.
+/// `R_X86_64_IRELATIVE` и определённый
 /// `STT_GNU_IFUNC` (в `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`) не пишутся
 /// здесь: их резолвер вызовет стартовая страница до входа в программу.
 /// `R_X86_64_COPY` копирует байты после обычных релокаций и до IFUNC.
@@ -800,6 +801,7 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     const DT_SYMENT: u64 = 11;
     const DT_REL: u64 = 17;
     const DT_RELSZ: u64 = 18;
+    const DT_RELENT: u64 = 19;
     const DT_PLTREL: u64 = 20;
     const DT_JMPREL: u64 = 23;
     const DT_SONAME: u64 = 14;
@@ -849,6 +851,8 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
     let mut flags_1 = 0u64;
     let mut rel_addr = 0u64;
     let mut rel_sz = 0u64;
+    let mut rel_ent = 16u64;
+    let mut saw_relent = false;
     let mut jmprel = 0u64;
     let mut pltrelsz = 0u64;
     let mut pltrel = 0u64;
@@ -916,6 +920,9 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             rel_addr = val;
         } else if tag == DT_RELSZ {
             rel_sz = val;
+        } else if tag == DT_RELENT {
+            rel_ent = val;
+            saw_relent = true;
         } else if tag == DT_PLTREL {
             pltrel = val;
         } else if tag == DT_JMPREL {
@@ -929,11 +936,14 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
             saw_relrent = true;
         }
     }
-    // REL (не RELA) не применяется. Молча пропустить — значит оставить нули.
-    if rel_addr != 0 || rel_sz != 0 {
+    // DT_REL: шаг 16, addend в слоте. Один из адреса и размера — отказ.
+    if saw_relent && rel_ent != 16 {
         return None;
     }
-    if jmprel != 0 && (pltrel != DT_RELA || pltrelsz == 0) {
+    if (rel_addr == 0) != (rel_sz == 0) || (rel_sz != 0 && rel_sz % 16 != 0) {
+        return None;
+    }
+    if jmprel != 0 && pltrel != DT_RELA && pltrel != DT_REL {
         return None;
     }
     let strtab_off = if saw_strtab {
@@ -1001,43 +1011,52 @@ fn parse_relative(elf: &[u8], segs: &[LoadSeg], dynamic: &[u8]) -> Option<Parsed
         verneed_addr,
         verneednum,
     )?;
-    let mut tables: Vec<(u64, u64)> = Vec::new();
+    let mut tables: Vec<(u64, u64, u64)> = Vec::new();
+    if rel_sz != 0 {
+        tables.push((rel_addr, rel_sz, 16));
+    }
     if saw_rela && rela_sz != 0 {
         if rela_ent != 24 || rela_sz % 24 != 0 {
             return None;
         }
-        tables.push((rela_addr, rela_sz));
+        tables.push((rela_addr, rela_sz, 24));
     }
     if jmprel != 0 {
-        if pltrel != DT_RELA || pltrelsz == 0 || pltrelsz % 24 != 0 {
+        let stride = if pltrel == DT_REL { 16 } else { 24 };
+        if pltrelsz == 0 || pltrelsz % stride != 0 {
             return None;
         }
-        tables.push((jmprel, pltrelsz));
+        tables.push((jmprel, pltrelsz, stride));
     }
-    let total: u64 = tables.iter().map(|(_, sz)| *sz).fold(0, |a, b| a.saturating_add(b));
+    let total: u64 = tables.iter().map(|(_, sz, _)| *sz).fold(0, |a, b| a.saturating_add(b));
     if total > 8192 * 24 {
         return None;
     }
     let mut out = Vec::new();
-    for (addr, sz) in tables {
+    for (addr, sz, stride) in tables {
         let start = vaddr_file_off(segs, addr)? as usize;
         let end = start.checked_add(sz as usize)?;
         if end > elf.len() {
             return None;
         }
+        let step = stride as usize;
         let from_jmp = jmprel != 0 && addr == jmprel;
         let mut jmp_at = 0u64;
         let mut at = start;
-        while at + 24 <= end {
+        while at + step <= end {
             let entry_off = jmp_at;
             if from_jmp {
-                jmp_at += 24;
+                jmp_at += stride;
             }
             let offset = rd64(elf, at);
             let info = rd64(elf, at + 8);
-            let mut addend = rd64(elf, at + 16);
+            let mut addend = if stride == 24 {
+                rd64(elf, at + 16)
+            } else {
+                rel_place_addend(elf, segs, offset)?
+            };
             let typ = info & 0xffff_ffff;
-            at += 24;
+            at += step;
             if typ == 0 {
                 continue;
             }
@@ -1378,6 +1397,29 @@ fn vaddr_file_off(segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
         }
     }
     None
+}
+
+/// Addend записи `DT_REL`: восемь байт по адресу слота в файле.
+/// Адреса в файле нет — ноль (BSS). Восемь байт не влезают в файл — отказ.
+fn rel_place_addend(elf: &[u8], segs: &[LoadSeg], vaddr: u64) -> Option<u64> {
+    for seg in segs {
+        if vaddr < seg.vaddr || seg.file_size == 0 {
+            continue;
+        }
+        let delta = vaddr - seg.vaddr;
+        if delta >= seg.file_size {
+            continue;
+        }
+        if delta.checked_add(8)? > seg.file_size {
+            return None;
+        }
+        let off = (seg.offset.checked_add(delta)?) as usize;
+        if off.checked_add(8)? > elf.len() {
+            return None;
+        }
+        return Some(rd64(elf, off));
+    }
+    Some(0)
 }
 
 fn load_bias(img: &ElfParsed, interpreter: bool) -> u64 {
@@ -6403,8 +6445,71 @@ mod tests {
     #[test_case]
     fn dt_rel_is_refused() {
         serial_print!("test dt_rel_is_refused... ");
+        // Адрес 1 и размер 8: это не таблица из записей по 16 байт.
         let elf = craft_dyn(&[], &[], &[], false, true, None);
         assert!(parse_elf64(&elf).is_none());
+        serial_println!("[ok]");
+    }
+
+    /// `DT_REL`: addend читается из слота, не из записи. `B + A` как у RELA.
+    /// `DT_JMPREL` с `DT_PLTREL == DT_REL` — записи по 16 байт.
+    #[test_case]
+    fn dt_rel_reads_the_addend_from_the_slot() {
+        serial_print!("test dt_rel_reads_the_addend_from_the_slot... ");
+        let mut elf = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut elf, 17, 0x440);
+        add_dyn(&mut elf, 18, 16);
+        let mut ent = [0u8; 16];
+        ent[0..8].copy_from_slice(&0x800u64.to_le_bytes());
+        ent[8..16].copy_from_slice(&8u64.to_le_bytes());
+        plant(&mut elf, 0x440, &ent);
+        put_u64(&mut elf, 0x800, 0x11);
+        let linked = link_with(elf.as_slice(), |_| None).expect("rel");
+        assert_eq!(linked.objs[0].parsed.relative.len(), 1);
+        assert_eq!(linked.objs[0].parsed.relative[0].addend, 0x11);
+        assert!(linked.objs[0].parsed.relative[0].sym.is_none());
+        let bias = linked.objs[0].bias;
+        let got = crate::memory::with_frame_allocator(|fa| {
+            let l4 = alloc_l4(fa).expect("l4");
+            let obj = &linked.objs[0];
+            map_and_copy(l4, &obj.bytes, &obj.parsed.segments, obj.bias, fa).expect("map");
+            apply_relative(l4, &obj.parsed.relative, obj.bias).expect("apply");
+            let v = read_u64(l4, bias + 0x800);
+            free_user_space(l4, fa);
+            v
+        });
+        assert_eq!(got, 0x11 + bias);
+
+        let mut bad_step = elf.clone();
+        add_dyn(&mut bad_step, 19, 24);
+        assert!(parse_elf64(&bad_step).is_none());
+        let mut only_addr = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut only_addr, 17, 0x440);
+        assert!(parse_elf64(&only_addr).is_none());
+
+        let mut bss = craft_dyn(&[], &[], &[], false, false, None);
+        add_dyn(&mut bss, 17, 0x440);
+        add_dyn(&mut bss, 18, 16);
+        let mut ent = [0u8; 16];
+        ent[0..8].copy_from_slice(&0x1_0000u64.to_le_bytes());
+        ent[8..16].copy_from_slice(&8u64.to_le_bytes());
+        plant(&mut bss, 0x440, &ent);
+        let parsed = parse_elf64(&bss).expect("bss");
+        assert_eq!(parsed.relative[0].addend, 0);
+
+        let mut jmp = craft_dyn(&[], &[("foo", 1, 0x100, 0x12)], &[], false, false, None);
+        add_dyn(&mut jmp, 23, 0x440);
+        add_dyn(&mut jmp, 2, 16);
+        add_dyn(&mut jmp, 20, 17);
+        let mut ent = [0u8; 16];
+        ent[0..8].copy_from_slice(&0x480u64.to_le_bytes());
+        ent[8..16].copy_from_slice(&((1u64 << 32) | 7).to_le_bytes());
+        plant(&mut jmp, 0x440, &ent);
+        let parsed = parse_elf64(&jmp).expect("jmprel");
+        let slot = &parsed.relative[0];
+        assert_eq!(slot.sym, Some(0x100));
+        assert_eq!(slot.addend, 0);
+        assert_eq!(slot.jmprel_off, Some(0));
         serial_println!("[ok]");
     }
 
